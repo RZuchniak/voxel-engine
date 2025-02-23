@@ -1,10 +1,10 @@
 use raylib::consts::*;
-use raylib::ffi::{LoadMaterialDefault, Mesh, UploadMesh};
+use raylib::ffi::{rlEnableBackfaceCulling, LoadMaterialDefault, Mesh, UploadMesh};
 use raylib::prelude::*;
 use std::ptr;
 
 pub const CHUNK_SIZE: usize = 16;
-pub const BLOCK_SIZE: usize = 1;
+pub const BLOCK_SIZE: usize = 2;
 
 #[derive(Default, Debug)]
 pub struct RustMesh {
@@ -12,7 +12,7 @@ pub struct RustMesh {
     vertices: Vec<f32>,
     texcoords: Vec<f32>,
     normals: Vec<f32>,
-    tangents: Vec<f32>,
+    //tangents: Vec<f32>,
     colors: Vec<u8>,
     indices: Vec<u16>,
 }
@@ -26,7 +26,8 @@ impl RustMesh {
             texcoords: self.texcoords.as_mut_ptr(),
             texcoords2: ptr::null_mut(), // Not used in this example
             normals: self.normals.as_mut_ptr(),
-            tangents: self.tangents.as_mut_ptr(),
+            tangents: ptr::null_mut(),
+            //tangents: self.tangents.as_mut_ptr(),
             colors: self.colors.as_mut_ptr(),
             indices: self.indices.as_mut_ptr(),
             animVertices: ptr::null_mut(), // Not used in this example
@@ -92,34 +93,35 @@ impl Block {
         let world_x = x as f32 + (CHUNK_SIZE as f32 * chunk_location.x as f32);
         let world_y = y as f32 + (CHUNK_SIZE as f32 * chunk_location.y as f32);
         let world_z = z as f32 + (CHUNK_SIZE as f32 * chunk_location.z as f32);
+        let difference: f32 = BLOCK_SIZE as f32 / 2.0;
 
         rust_mesh.vertices.extend_from_slice(&[
             // Front face
-            world_x - 0.5,
-            world_y - 0.5,
-            world_z + 0.5, // 0
-            world_x + 0.5,
-            world_y - 0.5,
-            world_z + 0.5, // 1
-            world_x + 0.5,
-            world_y + 0.5,
-            world_z + 0.5, // 2
-            world_x - 0.5,
-            world_y + 0.5,
-            world_z + 0.5, // 3
+            world_x - difference,
+            world_y - difference,
+            world_z + difference, // 0
+            world_x + difference,
+            world_y - difference,
+            world_z + difference, // 1
+            world_x + difference,
+            world_y + difference,
+            world_z + difference, // 2
+            world_x - difference,
+            world_y + difference,
+            world_z + difference, // 3
             // Back face
-            world_x - 0.5,
-            world_y - 0.5,
-            world_z - 0.5, // 4
-            world_x + 0.5,
-            world_y - 0.5,
-            world_z - 0.5, // 5
-            world_x + 0.5,
-            world_y + 0.5,
-            world_z - 0.5, // 6
-            world_x - 0.5,
-            world_y + 0.5,
-            world_z - 0.5, // 7
+            world_x - difference,
+            world_y - difference,
+            world_z - difference, // 4
+            world_x + difference,
+            world_y - difference,
+            world_z - difference, // 5
+            world_x + difference,
+            world_y + difference,
+            world_z - difference, // 6
+            world_x - difference,
+            world_y + difference,
+            world_z - difference, // 7
         ]);
 
         // Texture coordinates (mapped for each vertex)
@@ -134,15 +136,15 @@ impl Block {
             0.0, 0.0, // 7
         ]);
 
-        // Normals (one normal per vertex, pointing outwards)
-        rust_mesh.normals.extend_from_slice(&[
-            0.0, 0.0, 1.0, // Front face normals
-            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, // Back face normals
-            0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0,
-        ]);
+        //// Normals (one normal per vertex, pointing outwards)
+        //rust_mesh.normals.extend_from_slice(&[
+        //    0.0, 0.0, 1.0, // Front face normals
+        //    0.0, 0.0, 1.0, // Back face normals
+        //    0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+        //]);
 
         // Tangents (set to zero or calculate for advanced lighting)
-        rust_mesh.tangents.extend_from_slice(&[0.0; 8 * 4]); // 4 floats per tangent, 8 vertices
+        //rust_mesh.tangents.extend_from_slice(&[0.0; 8 * 4]); // 4 floats per tangent, 8 vertices
 
         // Colors (RGBA - white)
         rust_mesh.colors.extend_from_slice(&[
@@ -200,15 +202,15 @@ impl Chunk {
     }
 
     pub fn create_mesh(&self) -> RustMesh {
-        let mut vertex_count = 0;
         let mut rust_mesh = RustMesh::default();
 
-        let expected_faces = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE * 6; // 6 faces per block max
-        rust_mesh.vertices = Vec::with_capacity(expected_faces * 24); // 4 vertices * 3 coordinates
-        rust_mesh.normals = Vec::with_capacity(expected_faces * 24);
-        rust_mesh.texcoords = Vec::with_capacity(expected_faces * 16); // 4 vertices * 2 coordinates
-        rust_mesh.indices = Vec::with_capacity(expected_faces * 12); // 6 indices per face
-        rust_mesh.colors = vec![255; expected_faces * 32]; // 4 vertices * 4 colors (RGBA)
+        let expected_blocks = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; //
+        rust_mesh.vertices = Vec::with_capacity(expected_blocks * 8 * 3); // 4 vertices * 3 coordinates
+        rust_mesh.normals = Vec::with_capacity(expected_blocks); // Placeholder to prevent any seg faults
+        rust_mesh.texcoords = Vec::with_capacity(expected_blocks * 16); // 4 vertices * 2 coordinates
+        rust_mesh.indices = Vec::with_capacity(expected_blocks * 36); // 6 indices per face
+        //rust_mesh.tangents = Vec::with_capacity(expected_blocks * 24);
+        rust_mesh.colors = vec![255; expected_blocks * 32]; // 4 vertices * 4 colors (RGBA)
 
         // create some big vector here to store all vertices?
         for x in 0..CHUNK_SIZE {
