@@ -209,7 +209,7 @@ impl Chunk {
         rust_mesh.normals = Vec::with_capacity(expected_blocks); // Placeholder to prevent any seg faults
         rust_mesh.texcoords = Vec::with_capacity(expected_blocks * 16); // 4 vertices * 2 coordinates
         rust_mesh.indices = Vec::with_capacity(expected_blocks * 36); // 6 indices per face
-        //rust_mesh.tangents = Vec::with_capacity(expected_blocks * 24);
+                                                                      //rust_mesh.tangents = Vec::with_capacity(expected_blocks * 24);
         rust_mesh.colors = vec![255; expected_blocks * 32]; // 4 vertices * 4 colors (RGBA)
 
         // create some big vector here to store all vertices?
@@ -230,6 +230,7 @@ impl Chunk {
 }
 
 fn main() {
+    // Give chunks a mesh attribute
     let (mut rl, thread) = raylib::init().size(1280, 960).title("Voxel Engine").build();
 
     let mut camera = Camera3D::perspective(
@@ -239,15 +240,28 @@ fn main() {
         45.0,
     );
 
+    let mut new_chunks: Vec<Chunk> = Vec::new();
+    let mut old_chunks: Vec<Chunk> = Vec::new();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut meshes: Vec<Mesh> = Vec::new();
     let chunk: Chunk = Chunk::new(Position { x: 0, y: 0, z: 0 });
-    let mut rust_mesh1 = chunk.create_mesh();
-    let mesh = rust_mesh1.upload_to_gpu();
+    let chunk2: Chunk = Chunk::new(Position { x: 1, y: 0, z: 0 });
+    let chunk3: Chunk = Chunk::new(Position { x: 0, y: 0, z: 1 });
+    //chunks.push(chunk);
+    //chunks.push(chunk2);
+    //chunks.push(chunk3);
 
     let material = unsafe { LoadMaterialDefault() };
 
     rl.disable_cursor();
 
     while !rl.window_should_close() {
+        for new_chunks in chunks.iter() {
+            let mut rust_mesh = chunk.create_mesh();
+            let mesh = rust_mesh.upload_to_gpu();
+            meshes.push(mesh);
+        }
+
         if rl.is_key_down(KeyboardKey::KEY_SPACE) {
             camera.position.y += 15.0 * rl.get_frame_time();
             camera.target.y += 15.0 * rl.get_frame_time();
@@ -255,6 +269,9 @@ fn main() {
         if rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT) {
             camera.position.y -= 15.0 * rl.get_frame_time();
             camera.target.y -= 15.0 * rl.get_frame_time();
+        }
+        if rl.is_key_pressed(KeyboardKey::KEY_R) {
+            new_chunks.push(Chunk::new(Position { x: 0, y: 0, z: 0 }));
         }
 
         rl.update_camera(&mut camera, CameraMode::CAMERA_FIRST_PERSON);
@@ -269,7 +286,12 @@ fn main() {
             mode3d.draw_grid(100, 5.0);
 
             unsafe {
-                raylib::ffi::DrawMesh(mesh, material, Matrix::identity().into());
+                for mesh in meshes.iter() {
+                    raylib::ffi::DrawMesh(*mesh, material, Matrix::identity().into());
+                }
+                for chunk in old_chunks {
+                    raylib::ffi::UnloadMesh
+                }
             }
         }
         d.draw_fps(10, 10);
