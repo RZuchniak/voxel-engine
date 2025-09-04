@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+wgpu = { version = "26.0.1" }
 bytemuck = "1.23.2"
 env_logger = "0.11.8"
 pollster = "0.4.0"
-wgpu = "26.0.1"
 winit = "0.30.12"
