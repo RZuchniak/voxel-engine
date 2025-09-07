@@ -77,10 +77,7 @@ struct State {
 impl State {
     async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
@@ -99,21 +96,13 @@ impl State {
             .await
             .unwrap();
 
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
+            format: wgpu::TextureFormat::Bgra8Unorm,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -139,8 +128,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                // buffers: &[Vertex::LAYOUT]
-                buffers: &[],
+                buffers: &[Vertex::LAYOUT],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -153,10 +141,7 @@ impl State {
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -192,7 +177,6 @@ impl State {
     }
 
     fn render(&mut self) {
-        self.window.request_redraw();
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(err) => {
@@ -218,7 +202,7 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
                 })],
@@ -227,11 +211,10 @@ impl State {
                 occlusion_query_set: None,
             });
 
+            render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.set_pipeline(&self.render_pipeline);
-            //render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
-            render_pass.draw(0..3, 0..1);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         self.queue.submit(Some(encoder.finish()));
