@@ -3,9 +3,7 @@ use std::sync::Arc;
 use pollster::FutureExt;
 use std::borrow::Cow;
 use wgpu::{
-    FragmentState,
-    util::{BufferInitDescriptor, DeviceExt},
-    wgc::pipeline,
+    util::{BufferInitDescriptor, DeviceExt}, wgc::{id::markers::BindGroupLayout, pipeline}, BindGroup, FragmentState
 };
 use winit::{
     application::ApplicationHandler,
@@ -14,6 +12,14 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+
+#[rustfmt::skip]
+pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
+    cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
+    cgmath::Vector4::new(0.0, 1.0, 0.0, 0.0),
+    cgmath::Vector4::new(0.0, 0.0, 0.5, 0.0),
+    cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
+);
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,6 +45,47 @@ impl Vertex {
             },
         ],
     };
+}
+
+struct Camera {
+    position: cgmath::Point3<f32>,
+    target: cgmath::Point3<f32>,
+    up: cgmath::Vector3<f32>,
+    aspect_ratio: f32,
+    fov: f32,
+    znear: f32,
+    zfar: f32,
+}
+
+impl Camera {
+    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
+        let view = cgmath::Matrix4::look_at_rh(self.position, self.target, self.up);
+        let proj = cgmath::perspective(
+            cgmath::Deg(self.fov),
+            self.aspect_ratio,
+            self.znear,
+            self.zfar,
+        );
+        proj * view * OPENGL_TO_WGPU_MATRIX
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Uniform_Camera {
+    fields: [[f32; 4]; 4],
+}
+
+impl Uniform_Camera {
+    fn new() -> Self {
+        Self {
+            fields: [[0.0; 4]; 4],
+        }
+    }
+
+    fn update(&mut self, camera: &Camera) {
+        self.fields = camera.build_view_projection_matrix().into();
+    }
 }
 
 const VERTICES: &[Vertex] = &[
@@ -72,6 +119,7 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    camera: Camera,
 }
 
 impl State {
@@ -107,12 +155,21 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        surface.configure(&device, &config);
+        let camera = Camera {
+            position: (0.0, 0.0, 0.0).into(),
+            target: (1.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect_ratio: config.width as f32 / config.height as f32,
+            fov: 90.0,
+            znear: 0.1,
+            zfar: 100.0,
+        };
 
-        // Shader
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("square.wgsl"))),
+        let mut camera_uniform = Uniform_Camera::new();
+        camera_uniform.update(&camera);
+
+        let camera_bind_group_layout = device.create_bind_group_layout(BindGroupLayout{
+
         });
 
         // Bind group can be used once you have a camera to render the 3D scene since you can use that data in the wgsl shader
@@ -120,6 +177,14 @@ impl State {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[],
             push_constant_ranges: &[],
+        });
+
+        surface.configure(&device, &config);
+
+        // Shader
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("square.wgsl"))),
         });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -173,6 +238,7 @@ impl State {
             index_buffer,
             render_pipeline,
             num_indices,
+            camera,
         };
     }
 
