@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use bytemuck::Zeroable;
 use pollster::FutureExt;
 use std::borrow::Cow;
 use wgpu::{
-    util::{BufferInitDescriptor, DeviceExt}, wgc::{id::markers::BindGroupLayout, pipeline}, BindGroup, FragmentState
+    BindGroup, FragmentState,
+    util::{BufferInitDescriptor, DeviceExt},
+    wgc::{binding_model::BindGroupLayoutDescriptor, id::markers::BindGroupLayout, pipeline},
 };
 use winit::{
     application::ApplicationHandler,
@@ -24,7 +27,7 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
-    position: [f32; 2],
+    position: [f32; 3],
     color: [f32; 3],
 }
 
@@ -36,10 +39,10 @@ impl Vertex {
             wgpu::VertexAttribute {
                 offset: 0,
                 shader_location: 0,
-                format: wgpu::VertexFormat::Float32x2,
+                format: wgpu::VertexFormat::Float32x3,
             },
             wgpu::VertexAttribute {
-                offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 shader_location: 1,
                 format: wgpu::VertexFormat::Float32x3,
             },
@@ -71,7 +74,7 @@ impl Camera {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct Uniform_Camera {
     fields: [[f32; 4]; 4],
 }
@@ -90,25 +93,59 @@ impl Uniform_Camera {
 
 const VERTICES: &[Vertex] = &[
     Vertex {
-        position: [-0.25, 0.25],
+        position: [1.0, 1.0, 1.0],
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        position: [0.25, 0.25],
+        position: [1.0, 1.0, 0.0],
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        position: [-0.25, -0.25],
+        position: [1.0, 0.0, 1.0],
+        color: [0.0, 1.0, 0.0],
+    },
+    Vertex {
+        position: [1.0, 0.0, 0.0],
+        color: [0.0, 1.0, 0.0],
+    },
+    Vertex {
+        position: [0.0, 1.0, 1.0],
+        color: [0.0, 0.0, 1.0],
+    },
+    Vertex {
+        position: [0.0, 1.0, 0.0],
+        color: [0.0, 0.0, 1.0],
+    },
+    Vertex {
+        position: [0.0, 0.0, 1.0],
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        position: [0.25, -0.25],
+        position: [0.0, 0.0, 0.0],
         color: [1.0, 0.0, 0.0],
     },
 ];
 
-const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
-
+const INDICES: &[u16] = &[
+    // Front face (facing positive Z)
+    4, 5, 6, // Triangle 1
+    5, 7, 6, // Triangle 2
+    // Back face (facing negative Z)
+    1, 0, 3, // Triangle 1
+    0, 2, 3, // Triangle 2
+    // Right face (facing positive X)
+    0, 1, 4, // Triangle 1
+    1, 5, 4, // Triangle 2
+    // Left face (facing negative X)
+    6, 7, 2, // Triangle 1
+    7, 3, 2, // Triangle 2
+    // Top face (facing positive Y)
+    0, 4, 1, // Triangle 1
+    4, 5, 1, // Triangle 2
+    // Bottom face (facing negative Y)
+    2, 3, 6, // Triangle 1
+    3, 7, 6, // Triangle 2
+];
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -120,6 +157,9 @@ struct State {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     camera: Camera,
+    camera_uniform: Uniform_Camera,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
 }
 
 impl State {
@@ -156,8 +196,8 @@ impl State {
         };
 
         let camera = Camera {
-            position: (0.0, 0.0, 0.0).into(),
-            target: (1.0, 0.0, 0.0).into(),
+            position: (3.0, 0.0, 0.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
             up: cgmath::Vector3::unit_y(),
             aspect_ratio: config.width as f32 / config.height as f32,
             fov: 90.0,
@@ -168,14 +208,40 @@ impl State {
         let mut camera_uniform = Uniform_Camera::new();
         camera_uniform.update(&camera);
 
-        let camera_bind_group_layout = device.create_bind_group_layout(BindGroupLayout{
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Camera Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Camera Bind Group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
         });
 
         // Bind group can be used once you have a camera to render the 3D scene since you can use that data in the wgsl shader
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&camera_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -239,6 +305,9 @@ impl State {
             render_pipeline,
             num_indices,
             camera,
+            camera_uniform,
+            camera_buffer,
+            camera_bind_group,
         };
     }
 
@@ -278,6 +347,7 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
