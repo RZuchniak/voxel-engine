@@ -107,44 +107,48 @@ const VERTICES: &[Vertex] = &[
     Vertex {
         position: [1.0, 0.0, 0.0],
         color: [0.0, 1.0, 0.0],
-    },
-    Vertex {
-        position: [0.0, 1.0, 1.0],
-        color: [0.0, 0.0, 1.0],
-    },
-    Vertex {
-        position: [0.0, 1.0, 0.0],
-        color: [0.0, 0.0, 1.0],
-    },
-    Vertex {
-        position: [0.0, 0.0, 1.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [0.0, 0.0, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
+    }, // Vertex {
+       //     position: [1.0, 0.0, 0.0],
+       //     color: [0.0, 1.0, 0.0],
+       // },
+       // Vertex {
+       //     position: [0.0, 1.0, 1.0],
+       //     color: [0.0, 0.0, 1.0],
+       // },
+       // Vertex {
+       //     position: [0.0, 1.0, 0.0],
+       //     color: [0.0, 0.0, 1.0],
+       // },
+       // Vertex {
+       //     position: [0.0, 0.0, 1.0],
+       //     color: [1.0, 0.0, 0.0],
+       // },
+       // Vertex {
+       //     position: [0.0, 0.0, 0.0],
+       //     color: [1.0, 0.0, 0.0],
+       // },
 ];
 
 const INDICES: &[u16] = &[
-    // Front face (facing positive Z)
-    4, 5, 6, // Triangle 1
-    5, 7, 6, // Triangle 2
-    // Back face (facing negative Z)
-    1, 0, 3, // Triangle 1
-    0, 2, 3, // Triangle 2
-    // Right face (facing positive X)
-    0, 1, 4, // Triangle 1
-    1, 5, 4, // Triangle 2
-    // Left face (facing negative X)
-    6, 7, 2, // Triangle 1
-    7, 3, 2, // Triangle 2
-    // Top face (facing positive Y)
-    0, 4, 1, // Triangle 1
-    4, 5, 1, // Triangle 2
-    // Bottom face (facing negative Y)
-    2, 3, 6, // Triangle 1
-    3, 7, 6, // Triangle 2
+    0, 1, 2, 1, 2,
+    3, // // Front face (facing positive Z)
+      // 4, 5, 6, // Triangle 1
+      // 5, 7, 6, // Triangle 2
+      // // Back face (facing negative Z)
+      // 1, 0, 3, // Triangle 1
+      // 0, 2, 3, // Triangle 2
+      // // Right face (facing positive X)
+      // 0, 1, 4, // Triangle 1
+      // 1, 5, 4, // Triangle 2
+      // // Left face (facing negative X)
+      // 6, 7, 2, // Triangle 1
+      // 7, 3, 2, // Triangle 2
+      // // Top face (facing positive Y)
+      // 0, 4, 1, // Triangle 1
+      // 4, 5, 1, // Triangle 2
+      // // Bottom face (facing negative Y)
+      // 2, 3, 6, // Triangle 1
+      // 3, 7, 6, // Triangle 2
 ];
 struct State {
     window: Arc<Window>,
@@ -196,11 +200,11 @@ impl State {
         };
 
         let camera = Camera {
-            position: (3.0, 0.0, 0.0).into(),
+            position: (5.0, 0.0, 0.0).into(),
             target: (0.0, 0.0, 0.0).into(),
             up: cgmath::Vector3::unit_y(),
             aspect_ratio: config.width as f32 / config.height as f32,
-            fov: 90.0,
+            fov: 30.0,
             znear: 0.1,
             zfar: 100.0,
         };
@@ -311,7 +315,17 @@ impl State {
         };
     }
 
+    fn update(&mut self) {
+        self.camera_uniform.update(&self.camera);
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
+    }
+
     fn render(&mut self) {
+        println!("Rendering");
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(err) => {
@@ -385,9 +399,34 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(state) = self.state.as_mut() {
+                    state.update();
                     state.render();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state,
+                        physical_key: keyCode,
+                        ..
+                    },
+                ..
+            } => match keyCode {
+                PhysicalKey::Code(KeyCode::KeyW) => {
+                    self.state.as_mut().unwrap().camera.position.x -= 0.1;
+                    println!("Key W pressed");
+                }
+                PhysicalKey::Code(KeyCode::KeyS) => {
+                    self.state.as_mut().unwrap().camera.position.y -= 0.1;
+                }
+                PhysicalKey::Code(KeyCode::KeyA) => {
+                    self.state.as_mut().unwrap().camera.position.x -= 0.1;
+                }
+                PhysicalKey::Code(KeyCode::KeyD) => {
+                    self.state.as_mut().unwrap().camera.position.x += 0.1;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
