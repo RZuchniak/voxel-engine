@@ -16,6 +16,8 @@ use winit::{
     window::{Window, WindowId},
 };
 
+mod camera;
+
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
     cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
@@ -50,29 +52,6 @@ impl Vertex {
     };
 }
 
-struct Camera {
-    position: cgmath::Point3<f32>,
-    target: cgmath::Point3<f32>,
-    up: cgmath::Vector3<f32>,
-    aspect_ratio: f32,
-    fov: f32,
-    znear: f32,
-    zfar: f32,
-}
-
-impl Camera {
-    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
-        let view = cgmath::Matrix4::look_at_rh(self.position, self.target, self.up);
-        let proj = cgmath::perspective(
-            cgmath::Deg(self.fov),
-            self.aspect_ratio,
-            self.znear,
-            self.zfar,
-        );
-        proj * view * OPENGL_TO_WGPU_MATRIX
-    }
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct Uniform_Camera {
@@ -86,14 +65,30 @@ impl Uniform_Camera {
         }
     }
 
-    fn update(&mut self, camera: &Camera) {
+    fn update(&mut self, camera: &camera::Camera) {
         self.fields = camera.build_view_projection_matrix().into();
     }
 }
 
 const VERTICES: &[Vertex] = &[
     Vertex {
-        position: [1.0, 1.0, 1.0],
+        position: [0.0, 0.0, 0.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [1.0, 0.0, 0.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [1.0, 0.0, 1.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [0.0, 0.0, 1.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [0.0, 1.0, 0.0],
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
@@ -101,54 +96,34 @@ const VERTICES: &[Vertex] = &[
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        position: [1.0, 0.0, 1.0],
-        color: [0.0, 1.0, 0.0],
+        position: [1.0, 1.0, 1.0],
+        color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        position: [1.0, 0.0, 0.0],
-        color: [0.0, 1.0, 0.0],
-    }, // Vertex {
-       //     position: [1.0, 0.0, 0.0],
-       //     color: [0.0, 1.0, 0.0],
-       // },
-       // Vertex {
-       //     position: [0.0, 1.0, 1.0],
-       //     color: [0.0, 0.0, 1.0],
-       // },
-       // Vertex {
-       //     position: [0.0, 1.0, 0.0],
-       //     color: [0.0, 0.0, 1.0],
-       // },
-       // Vertex {
-       //     position: [0.0, 0.0, 1.0],
-       //     color: [1.0, 0.0, 0.0],
-       // },
-       // Vertex {
-       //     position: [0.0, 0.0, 0.0],
-       //     color: [1.0, 0.0, 0.0],
-       // },
+        position: [0.0, 1.0, 1.0],
+        color: [1.0, 0.0, 0.0],
+    },
 ];
 
 const INDICES: &[u16] = &[
-    0, 1, 2, 1, 2,
-    3, // // Front face (facing positive Z)
-      // 4, 5, 6, // Triangle 1
-      // 5, 7, 6, // Triangle 2
-      // // Back face (facing negative Z)
-      // 1, 0, 3, // Triangle 1
-      // 0, 2, 3, // Triangle 2
-      // // Right face (facing positive X)
-      // 0, 1, 4, // Triangle 1
-      // 1, 5, 4, // Triangle 2
-      // // Left face (facing negative X)
-      // 6, 7, 2, // Triangle 1
-      // 7, 3, 2, // Triangle 2
-      // // Top face (facing positive Y)
-      // 0, 4, 1, // Triangle 1
-      // 4, 5, 1, // Triangle 2
-      // // Bottom face (facing negative Y)
-      // 2, 3, 6, // Triangle 1
-      // 3, 7, 6, // Triangle 2
+    // // Bottom face (facing negative Y)
+    0, 1, 2, // Triangle 1
+    2, 3, 0, // Triangle 2
+    // // Top face (facing positive Y)
+    4, 7, 6, // Triangle 1
+    6, 5, 4, // Triangle 2
+    // // Right face (facing positive Z)
+    2, 6, 7, // Triangle 1
+    7, 3, 2, // Triangle 2
+    // // Left face (facing negative Z)
+    0, 4, 5, // Triangle 1
+    5, 1, 0, // Triangle 2
+    // // Front face (facing negative X)
+    0, 3, 7, // Triangle 1
+    7, 4, 0, // Triangle 2
+    // // Bottom face (facing positive X)
+    1, 5, 6, // Triangle 1
+    6, 2, 1, // Triangle 2
 ];
 struct State {
     window: Arc<Window>,
@@ -160,10 +135,11 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    camera: Camera,
+    camera: camera::Camera,
     camera_uniform: Uniform_Camera,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    camera_controller: camera::Controller,
 }
 
 impl State {
@@ -183,6 +159,7 @@ impl State {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::POLYGON_MODE_LINE,
                 ..Default::default()
             })
             .await
@@ -199,15 +176,8 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        let camera = Camera {
-            position: (5.0, 0.0, 0.0).into(),
-            target: (0.0, 0.0, 0.0).into(),
-            up: cgmath::Vector3::unit_y(),
-            aspect_ratio: config.width as f32 / config.height as f32,
-            fov: 30.0,
-            znear: 0.1,
-            zfar: 100.0,
-        };
+        let camera =
+            camera::Camera::new(config.width as f32 / config.height as f32, 45.0, 0.1, 100.0);
 
         let mut camera_uniform = Uniform_Camera::new();
         camera_uniform.update(&camera);
@@ -276,7 +246,10 @@ impl State {
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
-            primitive: wgpu::PrimitiveState::default(),
+            primitive: wgpu::PrimitiveState {
+                polygon_mode: wgpu::PolygonMode::Fill,
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -298,6 +271,8 @@ impl State {
 
         let num_indices = INDICES.len() as u32;
 
+        let camera_controller = camera::Controller::new(1.0, 0.25);
+
         return Self {
             window,
             surface: surface,
@@ -312,6 +287,7 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            camera_controller,
         };
     }
 
@@ -325,7 +301,6 @@ impl State {
     }
 
     fn render(&mut self) {
-        println!("Rendering");
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(err) => {
@@ -399,7 +374,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(state) = self.state.as_mut() {
+                    state.camera_controller.update(0.1, &mut state.camera);
                     state.update();
+                    state.window.request_redraw();
                     state.render();
                 }
             }
@@ -413,17 +390,22 @@ impl ApplicationHandler for App {
                 ..
             } => match keyCode {
                 PhysicalKey::Code(KeyCode::KeyW) => {
-                    self.state.as_mut().unwrap().camera.position.x -= 0.1;
-                    println!("Key W pressed");
+                    self.state.as_mut().unwrap().camera_controller.forward = true;
                 }
                 PhysicalKey::Code(KeyCode::KeyS) => {
-                    self.state.as_mut().unwrap().camera.position.y -= 0.1;
+                    self.state.as_mut().unwrap().camera_controller.backward = true;
                 }
                 PhysicalKey::Code(KeyCode::KeyA) => {
-                    self.state.as_mut().unwrap().camera.position.x -= 0.1;
+                    self.state.as_mut().unwrap().camera_controller.left = true;
                 }
                 PhysicalKey::Code(KeyCode::KeyD) => {
-                    self.state.as_mut().unwrap().camera.position.x += 0.1;
+                    self.state.as_mut().unwrap().camera_controller.right = true;
+                }
+                PhysicalKey::Code(KeyCode::Space) => {
+                    self.state.as_mut().unwrap().camera_controller.up = true;
+                }
+                PhysicalKey::Code(KeyCode::ShiftLeft) => {
+                    self.state.as_mut().unwrap().camera_controller.down = true;
                 }
                 _ => {}
             },
@@ -442,5 +424,5 @@ async fn run() {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new();
-    event_loop.run_app(&mut app);
+    let _ = event_loop.run_app(&mut app);
 }
