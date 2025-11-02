@@ -13,7 +13,7 @@ use winit::{
     event::*,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 mod camera;
@@ -147,6 +147,9 @@ impl State {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).unwrap();
+
+        window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+        window.set_cursor_visible(false);
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -388,27 +391,55 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => match keyCode {
-                PhysicalKey::Code(KeyCode::KeyW) => {
-                    self.state.as_mut().unwrap().camera_controller.forward = true;
+            } => {
+                if let Some(state) = self.state.as_mut() {
+                    match keyCode {
+                        PhysicalKey::Code(KeyCode::KeyW) => {
+                            state.camera_controller.forward = true;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyS) => {
+                            state.camera_controller.backward = true;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyA) => {
+                            state.camera_controller.left = true;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyD) => {
+                            state.camera_controller.right = true;
+                        }
+                        PhysicalKey::Code(KeyCode::Space) => {
+                            state.camera_controller.up = true;
+                        }
+                        PhysicalKey::Code(KeyCode::ShiftLeft) => {
+                            state.camera_controller.down = true;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyP) => {
+                            let _ = state.window.set_cursor_grab(CursorGrabMode::None);
+                            state.window.set_cursor_visible(true);
+                        }
+                        _ => {}
+                    }
                 }
-                PhysicalKey::Code(KeyCode::KeyS) => {
-                    self.state.as_mut().unwrap().camera_controller.backward = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if let Some(state) = self.state.as_mut() {
+                    let new_delta = (
+                        delta.0 + state.camera_controller.mouse_delta.0,
+                        delta.1 + state.camera_controller.mouse_delta.1,
+                    );
+                    state.camera_controller.mouse_delta = new_delta;
                 }
-                PhysicalKey::Code(KeyCode::KeyA) => {
-                    self.state.as_mut().unwrap().camera_controller.left = true;
-                }
-                PhysicalKey::Code(KeyCode::KeyD) => {
-                    self.state.as_mut().unwrap().camera_controller.right = true;
-                }
-                PhysicalKey::Code(KeyCode::Space) => {
-                    self.state.as_mut().unwrap().camera_controller.up = true;
-                }
-                PhysicalKey::Code(KeyCode::ShiftLeft) => {
-                    self.state.as_mut().unwrap().camera_controller.down = true;
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
