@@ -141,6 +141,8 @@ struct State {
     camera_bind_group: wgpu::BindGroup,
     camera_controller: camera::Controller,
     is_surface_configured: bool,
+    delta: u128,
+    last_frame_time: std::time::Instant,
 }
 
 impl State {
@@ -275,7 +277,7 @@ impl State {
 
         let num_indices = INDICES.len() as u32;
 
-        let camera_controller = camera::Controller::new(1.0, 0.25);
+        let camera_controller = camera::Controller::new(1, 0.00001);
 
         return Self {
             window,
@@ -293,6 +295,8 @@ impl State {
             camera_bind_group,
             camera_controller,
             is_surface_configured: false,
+            last_frame_time: std::time::Instant::now(),
+            delta: 0,
         };
     }
 
@@ -396,7 +400,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(state) = self.state.as_mut() {
-                    state.camera_controller.update(0.1, &mut state.camera);
+                    let current_time = std::time::Instant::now();
+                    state.delta = current_time
+                        .duration_since(state.last_frame_time)
+                        .as_micros();
+                    state.last_frame_time = current_time;
+                    state
+                        .camera_controller
+                        .update(state.delta, &mut state.camera);
                     state.update();
                     state.window.request_redraw();
                     match state.render() {
@@ -411,8 +422,9 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        state,
+                        state: key_state,
                         physical_key: keyCode,
+                        repeat: false,
                         ..
                     },
                 ..
@@ -420,22 +432,22 @@ impl ApplicationHandler for App {
                 if let Some(state) = self.state.as_mut() {
                     match keyCode {
                         PhysicalKey::Code(KeyCode::KeyW) => {
-                            state.camera_controller.forward = true;
+                            state.camera_controller.forward = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
-                            state.camera_controller.backward = true;
+                            state.camera_controller.backward = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::KeyA) => {
-                            state.camera_controller.left = true;
+                            state.camera_controller.left = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::KeyD) => {
-                            state.camera_controller.right = true;
+                            state.camera_controller.right = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::Space) => {
-                            state.camera_controller.up = true;
+                            state.camera_controller.up = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::ShiftLeft) => {
-                            state.camera_controller.down = true;
+                            state.camera_controller.down = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::KeyP) => {
                             let _ = state.window.set_cursor_grab(CursorGrabMode::None);

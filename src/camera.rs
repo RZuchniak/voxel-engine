@@ -41,7 +41,7 @@ impl Camera {
 }
 
 pub struct Controller {
-    pub speed: f32,
+    pub speed: u128,
     pub sensitivity: f32,
 
     pub forward: bool,
@@ -55,7 +55,7 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub fn new(speed: f32, sensitivity: f32) -> Self {
+    pub fn new(speed: u128, sensitivity: f32) -> Self {
         Self {
             speed,
             sensitivity,
@@ -69,35 +69,29 @@ impl Controller {
         }
     }
 
-    pub fn update(&mut self, delta_time: f32, camera: &mut Camera) {
+    pub fn update(&mut self, delta_time: u128, camera: &mut Camera) {
         let previous = camera.clone();
         let speed = self.speed * delta_time;
-        let sensitivity = self.sensitivity * delta_time;
+        let sensitivity = self.sensitivity * delta_time as f32;
         let diff = previous.target - previous.position;
 
         if self.forward {
-            camera.position += diff * speed;
-            self.forward = false;
+            camera.position += diff * speed as f32 / 10000.0;
         }
         if self.backward {
-            camera.position -= diff * speed;
-            self.backward = false;
+            camera.position -= diff * speed as f32 / 10000.0;
         }
         if self.left {
-            camera.position += diff.cross(previous.up) * speed;
-            self.left = false;
+            camera.position -= diff.cross(previous.up) * speed as f32 / 10000.0;
         }
         if self.right {
-            camera.position -= diff.cross(previous.up) * speed;
-            self.right = false;
+            camera.position += diff.cross(previous.up) * speed as f32 / 10000.0;
         }
         if self.up {
-            camera.position.y += speed * speed;
-            self.up = false;
+            camera.position.y += speed as f32 / 10000.0;
         }
         if self.down {
-            camera.position.y -= speed * speed;
-            self.down = false;
+            camera.position.y -= speed as f32 / 10000.0;
         }
         camera.yaw += self.mouse_delta.0 * sensitivity as f64;
         camera.pitch -= self.mouse_delta.1 * sensitivity as f64;
