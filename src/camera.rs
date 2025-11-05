@@ -27,8 +27,8 @@ impl Camera {
 
     pub fn new(aspect_ratio: f32, fov: f32, znear: f32, zfar: f32) -> Self {
         Self {
-            position: (1.5, 0.5, 0.5).into(),
-            target: (0.5, 0.5, 0.5).into(),
+            position: (-10.5, 0.5, 0.5).into(),
+            target: (-9.5, 0.5, 0.5).into(),
             up: cgmath::Vector3::unit_y(),
             aspect_ratio,
             fov,

@@ -384,13 +384,23 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(WindowAttributes::default().with_title("Voxel Engine"))
+                .create_window(
+                    WindowAttributes::default().with_title("Voxel Engine"), //.with_visible(false),
+                )
                 .unwrap(),
         );
-        self.state = Some(pollster::block_on(State::new(window)));
-        if let Some(state) = &mut self.state {
-            state.window.set_maximized(true);
-        }
+        let mut state = pollster::block_on(State::new(window));
+
+        state.window.set_maximized(true);
+        let size = state.window.inner_size();
+        state.resize(size.width, size.height);
+        state.render().unwrap();
+        let window = Arc::clone(&state.window);
+        // state.queue.on_submitted_work_done(move || {
+        //     window.set_visible(true);
+        //     println!("Window is now visible");
+        // });
+        self.state = Some(state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
