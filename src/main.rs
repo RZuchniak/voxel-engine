@@ -384,7 +384,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(WindowAttributes::default())
+                .create_window(WindowAttributes::default().with_title("Voxel Engine"))
                 .unwrap(),
         );
         self.state = Some(pollster::block_on(State::new(window)));
