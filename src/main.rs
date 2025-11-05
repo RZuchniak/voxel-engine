@@ -13,7 +13,7 @@ use winit::{
     event::*,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Window, WindowId},
+    window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId},
 };
 
 mod camera;
@@ -140,6 +140,7 @@ struct State {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_controller: camera::Controller,
+    is_surface_configured: bool,
 }
 
 impl State {
@@ -291,6 +292,7 @@ impl State {
             camera_buffer,
             camera_bind_group,
             camera_controller,
+            is_surface_configured: false,
         };
     }
 
@@ -303,12 +305,15 @@ impl State {
         );
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        if !self.is_surface_configured {
+            return Err(wgpu::SurfaceError::Lost);
+        }
+
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(err) => {
-                eprintln!("Failed to acquire next texture: {}", err);
-                return;
+                return Err(err);
             }
         };
         let view = frame
@@ -347,6 +352,17 @@ impl State {
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        Ok(())
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.config.width = width;
+            self.config.height = height;
+            self.camera.aspect_ratio = width as f32 / height as f32;
+            self.surface.configure(&self.device, &self.config);
+            self.is_surface_configured = true;
+        }
     }
 }
 
@@ -364,10 +380,13 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes())
+                .create_window(WindowAttributes::default())
                 .unwrap(),
         );
         self.state = Some(pollster::block_on(State::new(window)));
+        if let Some(state) = &mut self.state {
+            state.window.set_maximized(true);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -380,7 +399,13 @@ impl ApplicationHandler for App {
                     state.camera_controller.update(0.1, &mut state.camera);
                     state.update();
                     state.window.request_redraw();
-                    state.render();
+                    match state.render() {
+                        Ok(_) => (),
+                        Err(_) => {
+                            let size = state.window.inner_size();
+                            state.resize(size.width, size.height);
+                        }
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
