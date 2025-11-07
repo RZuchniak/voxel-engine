@@ -385,21 +385,20 @@ impl ApplicationHandler for App {
         let window = Arc::new(
             event_loop
                 .create_window(
-                    WindowAttributes::default().with_title("Voxel Engine"), //.with_visible(false),
+                    WindowAttributes::default()
+                        .with_title("Voxel Engine")
+                        .with_visible(false),
                 )
                 .unwrap(),
         );
         let mut state = pollster::block_on(State::new(window));
-
+        let window = Arc::clone(&state.window);
         state.window.set_maximized(true);
         let size = state.window.inner_size();
         state.resize(size.width, size.height);
+        state.update();
         state.render().unwrap();
-        let window = Arc::clone(&state.window);
-        // state.queue.on_submitted_work_done(move || {
-        //     window.set_visible(true);
-        //     println!("Window is now visible");
-        // });
+        window.set_visible(true);
         self.state = Some(state);
     }
 
