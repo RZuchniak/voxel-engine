@@ -96,11 +96,11 @@ impl Controller {
         camera.yaw += self.mouse_delta.0 * sensitivity as f64;
         camera.pitch -= self.mouse_delta.1 * sensitivity as f64;
 
-        camera.pitch = camera.pitch.clamp(-89.0, 89.0);
+        camera.pitch = camera.pitch.clamp(-1.57, 1.57);
 
         let direction = cgmath::Vector3::new(
             (camera.yaw.cos() * camera.pitch.cos()) as f32,
-            (camera.pitch.sin() as f32) as f32,
+            camera.pitch.sin() as f32,
             (camera.yaw.sin() * camera.pitch.cos()) as f32,
         );
 

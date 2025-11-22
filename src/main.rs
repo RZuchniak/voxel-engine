@@ -445,7 +445,7 @@ impl ApplicationHandler for App {
         );
         let mut state = pollster::block_on(State::new(window));
         let window = Arc::clone(&state.window);
-        state.window.set_maximized(true);
+        //state.window.set_maximized(true);
         let size = state.window.inner_size();
         state.resize(size.width, size.height);
         state.update();
@@ -472,7 +472,9 @@ impl ApplicationHandler for App {
                     state.update();
                     state.window.request_redraw();
                     match state.render() {
-                        Ok(_) => (),
+                        Ok(_) => {
+                            println!("Frame rate: {}", 1.0 / state.delta as f64 * 1000000.0);
+                        }
                         Err(_) => {
                             let size = state.window.inner_size();
                             state.resize(size.width, size.height);
