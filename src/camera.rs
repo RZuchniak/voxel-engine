@@ -76,22 +76,22 @@ impl Controller {
         let diff = previous.target - previous.position;
 
         if self.forward {
-            camera.position += diff * speed as f32 / 10000.0;
+            camera.position += diff * speed as f32 / 100000.0;
         }
         if self.backward {
-            camera.position -= diff * speed as f32 / 10000.0;
+            camera.position -= diff * speed as f32 / 100000.0;
         }
         if self.left {
-            camera.position -= diff.cross(previous.up) * speed as f32 / 10000.0;
+            camera.position -= diff.cross(previous.up) * speed as f32 / 100000.0;
         }
         if self.right {
-            camera.position += diff.cross(previous.up) * speed as f32 / 10000.0;
+            camera.position += diff.cross(previous.up) * speed as f32 / 100000.0;
         }
         if self.up {
-            camera.position.y += speed as f32 / 10000.0;
+            camera.position.y += speed as f32 / 100000.0;
         }
         if self.down {
-            camera.position.y -= speed as f32 / 10000.0;
+            camera.position.y -= speed as f32 / 100000.0;
         }
         camera.yaw += self.mouse_delta.0 * sensitivity as f64;
         camera.pitch -= self.mouse_delta.1 * sensitivity as f64;

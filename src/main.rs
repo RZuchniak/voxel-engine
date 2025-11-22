@@ -7,6 +7,7 @@ use wgpu::{
     BindGroup, FragmentState,
     util::{BufferInitDescriptor, DeviceExt},
     wgc::{binding_model::BindGroupLayoutDescriptor, id::markers::BindGroupLayout, pipeline},
+    wgt::TextureDescriptor,
 };
 use winit::{
     application::ApplicationHandler,
@@ -97,7 +98,7 @@ const VERTICES: &[Vertex] = &[
     },
     Vertex {
         position: [1.0, 1.0, 1.0],
-        color: [1.0, 0.0, 0.0],
+        color: [1.0, 0.0, 1.0],
     },
     Vertex {
         position: [0.0, 1.0, 1.0],
@@ -143,6 +144,7 @@ struct State {
     is_surface_configured: bool,
     delta: u128,
     last_frame_time: std::time::Instant,
+    depth_texture: wgpu::TextureView,
 }
 
 impl State {
@@ -256,7 +258,13 @@ impl State {
                 polygon_mode: wgpu::PolygonMode::Fill,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -274,6 +282,23 @@ impl State {
             contents: bytemuck::cast_slice(INDICES),
             usage: wgpu::BufferUsages::INDEX,
         });
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[wgpu::TextureFormat::Depth32Float],
+        });
+
+        let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let num_indices = INDICES.len() as u32;
 
@@ -297,6 +322,7 @@ impl State {
             is_surface_configured: false,
             last_frame_time: std::time::Instant::now(),
             delta: 0,
+            depth_texture: depth_texture_view,
         };
     }
 
@@ -342,7 +368,14 @@ impl State {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
@@ -365,6 +398,25 @@ impl State {
             self.config.height = height;
             self.camera.aspect_ratio = width as f32 / height as f32;
             self.surface.configure(&self.device, &self.config);
+
+            // Recreate depth texture
+            let size = wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Depth Texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[wgpu::TextureFormat::Depth32Float],
+            });
+            self.depth_texture = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
             self.is_surface_configured = true;
         }
     }
