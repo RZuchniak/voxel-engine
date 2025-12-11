@@ -18,6 +18,7 @@ use winit::{
 };
 
 mod camera;
+mod mesh;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
@@ -69,6 +70,13 @@ impl Uniform_Camera {
     fn update(&mut self, camera: &camera::Camera) {
         self.fields = camera.build_view_projection_matrix().into();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockType {
+    AIR,
+    STONE,
+    GRASS,
 }
 
 const VERTICES: &[Vertex] = &[
@@ -445,7 +453,7 @@ impl ApplicationHandler for App {
         );
         let mut state = pollster::block_on(State::new(window));
         let window = Arc::clone(&state.window);
-        //state.window.set_maximized(true);
+        state.window.set_maximized(true);
         let size = state.window.inner_size();
         state.resize(size.width, size.height);
         state.update();
@@ -473,7 +481,7 @@ impl ApplicationHandler for App {
                     state.window.request_redraw();
                     match state.render() {
                         Ok(_) => {
-                            println!("Frame rate: {}", 1.0 / state.delta as f64 * 1000000.0);
+                            //println!("Frame rate: {}", 1.0 / state.delta as f64 * 1000000.0);
                         }
                         Err(_) => {
                             let size = state.window.inner_size();
