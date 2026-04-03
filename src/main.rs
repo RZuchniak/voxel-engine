@@ -20,6 +20,8 @@ use winit::{
 mod camera;
 mod mesh;
 
+use mesh::Chunk;
+
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
     cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
@@ -79,61 +81,6 @@ enum BlockType {
     GRASS,
 }
 
-const VERTICES: &[Vertex] = &[
-    Vertex {
-        position: [0.0, 0.0, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, 0.0, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, 0.0, 1.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [0.0, 0.0, 1.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [0.0, 1.0, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, 1.0, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, 1.0, 1.0],
-        color: [1.0, 0.0, 1.0],
-    },
-    Vertex {
-        position: [0.0, 1.0, 1.0],
-        color: [1.0, 0.0, 0.0],
-    },
-];
-
-const INDICES: &[u16] = &[
-    // // Bottom face (facing negative Y)
-    0, 1, 2, // Triangle 1
-    2, 3, 0, // Triangle 2
-    // // Top face (facing positive Y)
-    4, 7, 6, // Triangle 1
-    6, 5, 4, // Triangle 2
-    // // Right face (facing positive Z)
-    2, 6, 7, // Triangle 1
-    7, 3, 2, // Triangle 2
-    // // Left face (facing negative Z)
-    0, 4, 5, // Triangle 1
-    5, 1, 0, // Triangle 2
-    // // Front face (facing negative X)
-    0, 3, 7, // Triangle 1
-    7, 4, 0, // Triangle 2
-    // // Bottom face (facing positive X)
-    1, 5, 6, // Triangle 1
-    6, 2, 1, // Triangle 2
-];
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -278,16 +225,21 @@ impl State {
             cache: None,
         });
 
-        // Change this to create_buffer() once you have dynamic data
+        // Build a simple test chunk and generate a greedy-meshed mesh
+        let mut chunk = Chunk::new((0, 0, 0));
+        chunk.generate_test_chunk();
+        chunk.generate_mesh();
+        let mesh_data = chunk.mesh().expect("chunk mesh should exist");
+
         let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
+            contents: bytemuck::cast_slice(mesh_data.vertices()),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
+            contents: bytemuck::cast_slice(mesh_data.indices()),
             usage: wgpu::BufferUsages::INDEX,
         });
 
@@ -308,7 +260,7 @@ impl State {
 
         let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let num_indices = INDICES.len() as u32;
+        let num_indices = mesh_data.indices().len() as u32;
 
         let camera_controller = camera::Controller::new(1, 0.00001);
 
@@ -391,7 +343,7 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
