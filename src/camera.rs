@@ -34,16 +34,21 @@ impl Camera {
     }
 
     pub fn new(aspect_ratio: f32, fov: f32, znear: f32, zfar: f32) -> Self {
+        let position: cgmath::Point3<f32> = (8.0, 100.0, 8.0).into();
+        let target: cgmath::Point3<f32> = (0.0, 76.0, 0.0).into();
+        let look = (target - position).normalize();
+        let yaw = look.z.atan2(look.x) as f64;
+        let pitch = look.y.asin() as f64;
         Self {
-            position: (8.0, 100.0, 8.0).into(),
-            target: (9.0, 100.0, 8.0).into(),
+            position,
+            target,
             up: cgmath::Vector3::unit_y(),
             aspect_ratio,
             fov,
             znear,
             zfar,
-            pitch: 0.0 as f64,
-            yaw: 0.0 as f64,
+            pitch,
+            yaw,
         }
     }
 }

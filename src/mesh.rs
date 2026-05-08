@@ -246,6 +246,7 @@ fn mesh_direction(
                 }
 
                 emit_quad(
+                    world,
                     mesh,
                     dir,
                     primary_axis,
@@ -267,6 +268,7 @@ fn mesh_direction(
 }
 
 fn emit_quad(
+    world: &World,
     mesh: &mut MeshData,
     dir: Direction,
     primary_axis: usize,
@@ -295,155 +297,88 @@ fn emit_quad(
         [base_x + p[0], base_y + p[1], base_z + p[2]]
     };
 
+    // Approximate AO/brightness input inspired by stb_voxel_render's per-vertex lighting.
+    let light = {
+        let wx = base_x as i32 + primary as i32;
+        let wy = base_y as i32 + secondary as i32;
+        let wz = base_z as i32 + tertiary as i32;
+        let mut occluders = 0u32;
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let n = world.block_at(wx + dx, wy + dy, wz + dz);
+            if n.is_opaque() && n.is_full_cube() {
+                occluders += 1;
+            }
+        }
+        let shade = (255u32.saturating_sub(occluders * 28)).max(72);
+        shade
+    };
+    let v = |position: [f32; 3], uv: [f32; 2]| Vertex {
+        position,
+        uv,
+        tex_layer,
+        light,
+    };
+
     let corners: [Vertex; 4] = match dir {
         Direction::XPositive => {
             let px = (primary + 1) as f32;
             [
-                Vertex {
-                    position: pos(px, s0, t0),
-                    uv: [0.0, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(px, s1, t0),
-                    uv: [width as f32, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(px, s1, t1),
-                    uv: [width as f32, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(px, s0, t1),
-                    uv: [0.0, height as f32],
-                    tex_layer,
-                },
+                v(pos(px, s0, t0), [0.0, 0.0]),
+                v(pos(px, s1, t0), [width as f32, 0.0]),
+                v(pos(px, s1, t1), [width as f32, height as f32]),
+                v(pos(px, s0, t1), [0.0, height as f32]),
             ]
         }
         Direction::XNegative => {
             let px = primary as f32;
             [
-                Vertex {
-                    position: pos(px, s0, t0),
-                    uv: [0.0, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(px, s0, t1),
-                    uv: [0.0, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(px, s1, t1),
-                    uv: [width as f32, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(px, s1, t0),
-                    uv: [width as f32, 0.0],
-                    tex_layer,
-                },
+                v(pos(px, s0, t0), [0.0, 0.0]),
+                v(pos(px, s0, t1), [0.0, height as f32]),
+                v(pos(px, s1, t1), [width as f32, height as f32]),
+                v(pos(px, s1, t0), [width as f32, 0.0]),
             ]
         }
         Direction::YPositive => {
             let py = (primary + 1) as f32;
             [
-                Vertex {
-                    position: pos(py, s0, t0),
-                    uv: [0.0, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(py, s1, t0),
-                    uv: [width as f32, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(py, s1, t1),
-                    uv: [width as f32, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(py, s0, t1),
-                    uv: [0.0, height as f32],
-                    tex_layer,
-                },
+                v(pos(py, s0, t0), [0.0, 0.0]),
+                v(pos(py, s1, t0), [width as f32, 0.0]),
+                v(pos(py, s1, t1), [width as f32, height as f32]),
+                v(pos(py, s0, t1), [0.0, height as f32]),
             ]
         }
         Direction::YNegative => {
             let py = primary as f32;
             [
-                Vertex {
-                    position: pos(py, s0, t0),
-                    uv: [0.0, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(py, s0, t1),
-                    uv: [0.0, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(py, s1, t1),
-                    uv: [width as f32, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(py, s1, t0),
-                    uv: [width as f32, 0.0],
-                    tex_layer,
-                },
+                v(pos(py, s0, t0), [0.0, 0.0]),
+                v(pos(py, s0, t1), [0.0, height as f32]),
+                v(pos(py, s1, t1), [width as f32, height as f32]),
+                v(pos(py, s1, t0), [width as f32, 0.0]),
             ]
         }
         Direction::ZPositive => {
             let pz = (primary + 1) as f32;
             [
-                Vertex {
-                    position: pos(pz, s0, t0),
-                    uv: [0.0, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(pz, s1, t0),
-                    uv: [width as f32, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(pz, s1, t1),
-                    uv: [width as f32, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(pz, s0, t1),
-                    uv: [0.0, height as f32],
-                    tex_layer,
-                },
+                v(pos(pz, s0, t0), [0.0, 0.0]),
+                v(pos(pz, s1, t0), [width as f32, 0.0]),
+                v(pos(pz, s1, t1), [width as f32, height as f32]),
+                v(pos(pz, s0, t1), [0.0, height as f32]),
             ]
         }
         Direction::ZNegative => {
             let pz = primary as f32;
             [
-                Vertex {
-                    position: pos(pz, s0, t0),
-                    uv: [0.0, 0.0],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(pz, s0, t1),
-                    uv: [0.0, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(pz, s1, t1),
-                    uv: [width as f32, height as f32],
-                    tex_layer,
-                },
-                Vertex {
-                    position: pos(pz, s1, t0),
-                    uv: [width as f32, 0.0],
-                    tex_layer,
-                },
+                v(pos(pz, s0, t0), [0.0, 0.0]),
+                v(pos(pz, s0, t1), [0.0, height as f32]),
+                v(pos(pz, s1, t1), [width as f32, height as f32]),
+                v(pos(pz, s1, t0), [width as f32, 0.0]),
             ]
         }
     };

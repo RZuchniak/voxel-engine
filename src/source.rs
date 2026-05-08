@@ -1,12 +1,13 @@
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::BufReader,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{collections::HashMap, sync::Mutex};
+use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{fs::File, io::BufReader};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::{Context, anyhow};
+#[cfg(not(target_arch = "wasm32"))]
 use fastanvil::Region;
 use fastnbt::LongArray;
 use serde::Deserialize;
@@ -31,6 +32,7 @@ impl WorldSource for ProceduralSource {
 
 pub struct AnvilSource {
     world_path: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
     region_cache: Mutex<HashMap<(i32, i32), Region<BufReader<File>>>>,
 }
 
@@ -38,10 +40,12 @@ impl AnvilSource {
     pub fn new(world_path: impl AsRef<Path>) -> Self {
         Self {
             world_path: world_path.as_ref().to_path_buf(),
+            #[cfg(not(target_arch = "wasm32"))]
             region_cache: Mutex::new(HashMap::new()),
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn region_mut<'a>(
         &'a self,
         cache: &'a mut HashMap<(i32, i32), Region<BufReader<File>>>,
@@ -67,6 +71,13 @@ impl AnvilSource {
 
 impl WorldSource for AnvilSource {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Ok(World::generate_procedural_chunk(coord));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
         let (cx, cz) = coord;
         let rx = cx.div_euclid(32);
         let rz = cz.div_euclid(32);
@@ -133,6 +144,29 @@ impl WorldSource for AnvilSource {
             }
         }
         Ok(out)
+        }
+    }
+}
+
+pub struct PackedWebSource {
+    fallback: ProceduralSource,
+    _base_url: String,
+}
+
+impl PackedWebSource {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            fallback: ProceduralSource,
+            _base_url: base_url.into(),
+        }
+    }
+}
+
+impl WorldSource for PackedWebSource {
+    fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
+        // Placeholder web path: until chunk fetch/decode is wired, preserve interface
+        // and return deterministic procedural terrain so wasm builds can render.
+        self.fallback.load_chunk(coord)
     }
 }
 
@@ -143,10 +177,20 @@ fn map_block_name(name: &str) -> BlockId {
         | "minecraft:granite"
         | "minecraft:andesite"
         | "minecraft:diorite"
-        | "minecraft:deepslate"
         | "minecraft:tuff"
         | "minecraft:calcite"
         | "minecraft:dripstone_block" => BlockId::STONE,
+        "minecraft:deepslate"
+        | "minecraft:cobbled_deepslate"
+        | "minecraft:polished_deepslate"
+        | "minecraft:deepslate_iron_ore"
+        | "minecraft:deepslate_coal_ore"
+        | "minecraft:deepslate_copper_ore"
+        | "minecraft:deepslate_gold_ore"
+        | "minecraft:deepslate_redstone_ore"
+        | "minecraft:deepslate_lapis_ore"
+        | "minecraft:deepslate_diamond_ore"
+        | "minecraft:deepslate_emerald_ore" => BlockId::DEEPSLATE,
         "minecraft:dirt"
         | "minecraft:coarse_dirt"
         | "minecraft:rooted_dirt"
@@ -155,6 +199,15 @@ fn map_block_name(name: &str) -> BlockId {
         "minecraft:grass_block" => BlockId::GRASS,
         "minecraft:sand" | "minecraft:red_sand" => BlockId::SAND,
         "minecraft:cobblestone" | "minecraft:mossy_cobblestone" => BlockId::COBBLESTONE,
+        "minecraft:iron_ore"
+        | "minecraft:coal_ore"
+        | "minecraft:copper_ore"
+        | "minecraft:gold_ore"
+        | "minecraft:redstone_ore"
+        | "minecraft:lapis_ore"
+        | "minecraft:diamond_ore"
+        | "minecraft:emerald_ore" => BlockId::STONE,
+        "minecraft:gravel" => BlockId::GRAVEL,
         "minecraft:oak_log"
         | "minecraft:spruce_log"
         | "minecraft:birch_log"
@@ -174,7 +227,10 @@ fn map_block_name(name: &str) -> BlockId {
         "minecraft:oak_planks" => BlockId::OAK_PLANKS,
         "minecraft:water" => BlockId::WATER,
         "minecraft:bedrock" => BlockId::BEDROCK,
-        _ => BlockId::AIR,
+        "minecraft:snow_block" => BlockId::SNOW_BLOCK,
+        "minecraft:netherrack" => BlockId::NETHERRACK,
+        "minecraft:end_stone" => BlockId::END_STONE,
+        _ => BlockId::STONE,
     }
 }
 

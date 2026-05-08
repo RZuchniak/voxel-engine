@@ -1,5 +1,7 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 
 pub struct BlockTextureSet {
@@ -16,9 +18,24 @@ pub const TEXTURE_NAMES: &[&str] = &[
     "water",
     "log",
     "leaves",
+    "sand",
+    "cobblestone",
+    "oak_planks",
+    "bedrock",
+    "deepslate",
+    "gravel",
+    "snow",
+    "netherrack",
+    "end_stone",
 ];
 
 fn load_or_fallback_rgba(name: &str, fallback: [u8; 4]) -> Vec<u8> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = name;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     let path = PathBuf::from("assets").join("blocks").join(format!("{name}.png"));
     if path.exists()
         && let Ok(img) = image::open(&path).context("failed to open texture")
@@ -28,6 +45,7 @@ fn load_or_fallback_rgba(name: &str, fallback: [u8; 4]) -> Vec<u8> {
         if w == 16 && h == 16 {
             return rgba.into_raw();
         }
+    }
     }
 
     // Fallback to solid 16x16 color if texture file doesn't exist yet.
@@ -49,6 +67,15 @@ pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> Bloc
             "water" => [45, 95, 220, 255],
             "log" => [110, 85, 58, 255],
             "leaves" => [60, 130, 60, 255],
+            "sand" => [219, 211, 160, 255],
+            "cobblestone" => [113, 113, 113, 255],
+            "oak_planks" => [171, 141, 89, 255],
+            "bedrock" => [69, 69, 69, 255],
+            "deepslate" => [84, 84, 90, 255],
+            "gravel" => [134, 131, 128, 255],
+            "snow" => [236, 240, 246, 255],
+            "netherrack" => [109, 52, 52, 255],
+            "end_stone" => [220, 220, 171, 255],
             _ => [255, 0, 255, 255],
         };
         layers.push(load_or_fallback_rgba(name, fallback));

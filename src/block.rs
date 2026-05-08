@@ -21,6 +21,11 @@ impl BlockId {
     pub const OAK_PLANKS: BlockId = BlockId(8);
     pub const WATER: BlockId = BlockId(9);
     pub const BEDROCK: BlockId = BlockId(10);
+    pub const DEEPSLATE: BlockId = BlockId(11);
+    pub const GRAVEL: BlockId = BlockId(12);
+    pub const SNOW_BLOCK: BlockId = BlockId(13);
+    pub const NETHERRACK: BlockId = BlockId(14);
+    pub const END_STONE: BlockId = BlockId(15);
 
     #[inline]
     pub fn info(self) -> &'static BlockInfo {
@@ -85,7 +90,12 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("cobblestone", true, true, [1, 1, 1]),
     info("oak_log", true, true, [6, 6, 6]),
     info("oak_leaves", true, true, [7, 7, 7]),
-    info("oak_planks", true, true, [2, 2, 2]),
+    info("oak_planks", true, true, [10, 10, 10]),
     info("water", true, false, [5, 5, 5]),
-    info("bedrock", true, true, [1, 1, 1]),
+    info("bedrock", true, true, [11, 11, 11]),
+    info("deepslate", true, true, [12, 12, 12]),
+    info("gravel", true, true, [13, 13, 13]),
+    info("snow_block", true, true, [14, 14, 14]),
+    info("netherrack", true, true, [15, 15, 15]),
+    info("end_stone", true, true, [16, 16, 16]),
 ];

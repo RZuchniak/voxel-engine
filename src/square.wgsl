@@ -1,8 +1,16 @@
 struct CameraUniform {
     view_proj: mat4x4<f32>,
 };
+struct SkyUniform {
+    top_color: vec4<f32>,
+    horizon_color: vec4<f32>,
+    fog_params: vec4<f32>,
+    camera_pos: vec4<f32>,
+};
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
+@group(0) @binding(1)
+var<uniform> sky: SkyUniform;
 @group(1) @binding(0)
 var block_texture: texture_2d_array<f32>;
 @group(1) @binding(1)
@@ -12,13 +20,15 @@ struct VertexInput {
     @location(0) pos: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) tex_layer: u32,
+    @location(3) light: u32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tex_layer: u32,
-    @location(2) ndc_depth: f32,
+    @location(2) world_pos: vec3<f32>,
+    @location(3) light: f32,
 };
 
 @vertex
@@ -29,7 +39,8 @@ model: VertexInput,
     out.clip_position = camera.view_proj * vec4<f32>(model.pos, 1.0);
     out.uv = model.uv;
     out.tex_layer = model.tex_layer;
-    out.ndc_depth = out.clip_position.z / out.clip_position.w;
+    out.world_pos = model.pos;
+    out.light = f32(model.light) / 255.0;
     return out;
 }
 
@@ -37,15 +48,20 @@ model: VertexInput,
 fn fs_main(
     @location(0) uv: vec2<f32>,
     @location(1) tex_layer: u32,
-    @location(2) ndc_depth: f32,
+    @location(2) world_pos: vec3<f32>,
+    @location(3) light: f32,
 ) -> @location(0) vec4<f32> {
     let albedo = textureSample(block_texture, block_sampler, uv, i32(tex_layer));
-    let sky = vec3<f32>(0.49, 0.74, 0.95);
+    let height_lerp = clamp(world_pos.y / 256.0, 0.0, 1.0);
+    let sky_color = mix(sky.horizon_color.rgb, sky.top_color.rgb, height_lerp);
+    let lit_albedo = albedo.rgb * (0.25 + light * 0.75);
 
     // Simple atmospheric fog to smooth far-distance transitions.
-    let fog_start = 0.55;
-    let fog_end = 0.98;
-    let fog = clamp((ndc_depth - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    let rgb = mix(albedo.rgb, sky, fog);
+    let fog_start = sky.fog_params.x;
+    let fog_end = sky.fog_params.y;
+    let fog_strength = sky.fog_params.z;
+    let dist = distance(world_pos, sky.camera_pos.xyz);
+    let fog = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0) * fog_strength;
+    let rgb = mix(lit_albedo, sky_color, fog);
     return vec4<f32>(rgb, albedo.a);
 }
