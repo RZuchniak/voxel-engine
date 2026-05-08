@@ -1,4 +1,4 @@
-use cgmath::{InnerSpace, Matrix4, Vector3};
+use cgmath::InnerSpace;
 
 #[derive(Clone)]
 pub struct Camera {
@@ -14,6 +14,14 @@ pub struct Camera {
 }
 
 impl Camera {
+    pub fn position(&self) -> cgmath::Point3<f32> {
+        self.position
+    }
+
+    pub fn forward(&self) -> cgmath::Vector3<f32> {
+        (self.target - self.position).normalize()
+    }
+
     pub fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
         let view = cgmath::Matrix4::look_at_rh(self.position, self.target, self.up);
         let proj = cgmath::perspective(
@@ -27,8 +35,8 @@ impl Camera {
 
     pub fn new(aspect_ratio: f32, fov: f32, znear: f32, zfar: f32) -> Self {
         Self {
-            position: (-10.5, 0.5, 0.5).into(),
-            target: (-9.5, 0.5, 0.5).into(),
+            position: (8.0, 100.0, 8.0).into(),
+            target: (9.0, 100.0, 8.0).into(),
             up: cgmath::Vector3::unit_y(),
             aspect_ratio,
             fov,
@@ -41,7 +49,7 @@ impl Camera {
 }
 
 pub struct Controller {
-    pub speed: u128,
+    pub speed: f32,
     pub sensitivity: f32,
 
     pub forward: bool,
@@ -55,7 +63,7 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub fn new(speed: u128, sensitivity: f32) -> Self {
+    pub fn new(speed: f32, sensitivity: f32) -> Self {
         Self {
             speed,
             sensitivity,
@@ -71,30 +79,32 @@ impl Controller {
 
     pub fn update(&mut self, delta_time: u128, camera: &mut Camera) {
         let previous = camera.clone();
-        let speed = self.speed * delta_time;
-        let sensitivity = self.sensitivity * delta_time as f32;
+        let delta_seconds = (delta_time as f32 / 1_000_000.0).clamp(0.0, 0.1);
         let diff = previous.target - previous.position;
+        let forward = diff.normalize();
+        let right = forward.cross(previous.up).normalize();
+        let move_step = self.speed * delta_seconds;
 
         if self.forward {
-            camera.position += diff * speed as f32 / 100000.0;
+            camera.position += forward * move_step;
         }
         if self.backward {
-            camera.position -= diff * speed as f32 / 100000.0;
+            camera.position -= forward * move_step;
         }
         if self.left {
-            camera.position -= diff.cross(previous.up) * speed as f32 / 100000.0;
+            camera.position -= right * move_step;
         }
         if self.right {
-            camera.position += diff.cross(previous.up) * speed as f32 / 100000.0;
+            camera.position += right * move_step;
         }
         if self.up {
-            camera.position.y += speed as f32 / 100000.0;
+            camera.position.y += move_step;
         }
         if self.down {
-            camera.position.y -= speed as f32 / 100000.0;
+            camera.position.y -= move_step;
         }
-        camera.yaw += self.mouse_delta.0 * sensitivity as f64;
-        camera.pitch -= self.mouse_delta.1 * sensitivity as f64;
+        camera.yaw += self.mouse_delta.0 * self.sensitivity as f64;
+        camera.pitch -= self.mouse_delta.1 * self.sensitivity as f64;
 
         camera.pitch = camera.pitch.clamp(-1.57, 1.57);
 

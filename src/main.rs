@@ -1,26 +1,34 @@
-use std::sync::Arc;
-
-use bytemuck::Zeroable;
-use pollster::FutureExt;
-use std::borrow::Cow;
-use wgpu::{
-    BindGroup, FragmentState,
-    util::{BufferInitDescriptor, DeviceExt},
-    wgc::{binding_model::BindGroupLayoutDescriptor, id::markers::BindGroupLayout, pipeline},
-    wgt::TextureDescriptor,
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
 };
+
+use cgmath::{EuclideanSpace, InnerSpace};
+use wgpu::{FragmentState, util::DeviceExt};
 use winit::{
     application::ApplicationHandler,
     event::*,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId},
+    window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
 
+mod block;
 mod camera;
 mod mesh;
+mod source;
+mod streamer;
+mod texture;
+mod world;
 
-use mesh::Chunk;
+use source::AnvilSource;
+use streamer::ChunkStreamer;
+use world::{MIN_SECTION_Y, SECTION_SIZE, World};
+
+const LOAD_DISTANCE_CHUNKS: i32 = 8;
+const UNLOAD_MARGIN_CHUNKS: i32 = 2;
+const REMESH_BUDGET_PER_FRAME: usize = 1;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
@@ -34,7 +42,8 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
-    color: [f32; 3],
+    uv: [f32; 2],
+    tex_layer: u32,
 }
 
 impl Vertex {
@@ -50,7 +59,13 @@ impl Vertex {
             wgpu::VertexAttribute {
                 offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 shader_location: 1,
-                format: wgpu::VertexFormat::Float32x3,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 2]>())
+                    as wgpu::BufferAddress,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Uint32,
             },
         ],
     };
@@ -58,11 +73,11 @@ impl Vertex {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-struct Uniform_Camera {
+struct UniformCamera {
     fields: [[f32; 4]; 4],
 }
 
-impl Uniform_Camera {
+impl UniformCamera {
     fn new() -> Self {
         Self {
             fields: [[0.0; 4]; 4],
@@ -74,11 +89,10 @@ impl Uniform_Camera {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockType {
-    AIR,
-    STONE,
-    GRASS,
+struct SectionMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
 }
 
 struct State {
@@ -88,14 +102,18 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    _world: World,
+    streamer: ChunkStreamer,
+    section_meshes: HashMap<(i32, i32, i32), SectionMesh>,
+    remesh_queue: VecDeque<(i32, i32)>,
+    remesh_pending: HashSet<(i32, i32)>,
     camera: camera::Camera,
-    camera_uniform: Uniform_Camera,
+    camera_uniform: UniformCamera,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    texture_bind_group: wgpu::BindGroup,
     camera_controller: camera::Controller,
+    mouse_captured: bool,
     is_surface_configured: bool,
     delta: u128,
     last_frame_time: std::time::Instant,
@@ -103,12 +121,34 @@ struct State {
 }
 
 impl State {
+    fn section_visible(&self, section_coord: (i32, i32, i32)) -> bool {
+        let camera_pos = self.camera.position();
+        let forward = self.camera.forward();
+        let center = cgmath::Vector3::new(
+            section_coord.0 as f32 * SECTION_SIZE as f32 + 8.0,
+            section_coord.1 as f32 + 8.0,
+            section_coord.2 as f32 * SECTION_SIZE as f32 + 8.0,
+        );
+        let to_section = center - camera_pos.to_vec();
+        let dist2 = to_section.magnitude2();
+
+        // Hard distance cap to avoid drawing far sections.
+        let max_distance = (SECTION_SIZE as f32 * 7.5).max(64.0);
+        if dist2 > max_distance * max_distance {
+            return false;
+        }
+
+        // Backface cone-ish culling: keep some leeway to avoid popping near edges.
+        let dir = to_section.normalize();
+        dir.dot(forward) > -0.25
+    }
+
     async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
         window.set_cursor_visible(false);
 
         let adapter = instance
@@ -140,9 +180,9 @@ impl State {
         };
 
         let camera =
-            camera::Camera::new(config.width as f32 / config.height as f32, 45.0, 0.1, 100.0);
+            camera::Camera::new(config.width as f32 / config.height as f32, 45.0, 0.1, 500.0);
 
-        let mut camera_uniform = Uniform_Camera::new();
+        let mut camera_uniform = UniformCamera::new();
         camera_uniform.update(&camera);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -176,9 +216,10 @@ impl State {
         });
 
         // Bind group can be used once you have a camera to render the 3D scene since you can use that data in the wgsl shader
+        let textures = texture::create_block_textures(&device, &queue);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
-            bind_group_layouts: &[&camera_bind_group_layout],
+            bind_group_layouts: &[&camera_bind_group_layout, &textures.bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -225,23 +266,11 @@ impl State {
             cache: None,
         });
 
-        // Build a simple test chunk and generate a greedy-meshed mesh
-        let mut chunk = Chunk::new((0, 0, 0));
-        chunk.generate_test_chunk();
-        chunk.generate_mesh();
-        let mesh_data = chunk.mesh().expect("chunk mesh should exist");
-
-        let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(mesh_data.vertices()),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(mesh_data.indices()),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let world = World::new();
+        let streamer = ChunkStreamer::new(Arc::new(AnvilSource::new("saves/Basic_World")));
+        let section_meshes = HashMap::new();
+        let remesh_queue = VecDeque::new();
+        let remesh_pending = HashSet::new();
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
@@ -260,9 +289,7 @@ impl State {
 
         let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let num_indices = mesh_data.indices().len() as u32;
-
-        let camera_controller = camera::Controller::new(1, 0.00001);
+        let camera_controller = camera::Controller::new(20.0, 0.002);
 
         return Self {
             window,
@@ -270,15 +297,19 @@ impl State {
             device,
             queue,
             config,
-            vertex_buffer,
-            index_buffer,
+            _world: world,
+            streamer,
+            section_meshes,
+            remesh_queue,
+            remesh_pending,
             render_pipeline,
-            num_indices,
             camera,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            texture_bind_group: textures.bind_group,
             camera_controller,
+            mouse_captured: true,
             is_surface_configured: false,
             last_frame_time: std::time::Instant::now(),
             delta: 0,
@@ -287,12 +318,170 @@ impl State {
     }
 
     fn update(&mut self) {
+        self.update_streaming();
         self.camera_uniform.update(&self.camera);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
+    }
+
+    fn update_streaming(&mut self) {
+        let mesh_upload_budget = 5usize;
+        let player_chunk_x = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let player_chunk_z = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
+
+        let mut desired = Vec::new();
+        for dz in -LOAD_DISTANCE_CHUNKS..=LOAD_DISTANCE_CHUNKS {
+            for dx in -LOAD_DISTANCE_CHUNKS..=LOAD_DISTANCE_CHUNKS {
+                let cx = player_chunk_x + dx;
+                let cz = player_chunk_z + dz;
+                let dist2 = dx * dx + dz * dz;
+                desired.push(((cx, cz), dist2));
+            }
+        }
+        desired.sort_by_key(|(_, dist2)| *dist2);
+
+        for (coord, _) in desired.iter().copied() {
+            if !self._world.has_chunk(coord) && !self.streamer.is_in_flight(coord) {
+                self.streamer.request_chunk(coord);
+            }
+        }
+
+        let loaded: Vec<(i32, i32)> = self._world.chunks().map(|c| c.coord()).collect();
+        for coord in loaded {
+            let dx = coord.0 - player_chunk_x;
+            let dz = coord.1 - player_chunk_z;
+            if dx.abs() > LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
+                || dz.abs() > LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
+            {
+                self._world.remove_chunk(coord);
+                self.section_meshes
+                    .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
+            }
+        }
+
+        for meshed in self.streamer.poll_ready(mesh_upload_budget) {
+            let coord = meshed.coord;
+            self._world.insert_chunk(meshed.chunk);
+            self.upload_chunk_meshes(coord, meshed.section_meshes);
+
+            // Rebuild the arriving chunk and orthogonal neighbors so border faces are culled
+            // correctly once adjacent chunks become available.
+            let remesh_targets = [
+                coord,
+                (coord.0 + 1, coord.1),
+                (coord.0 - 1, coord.1),
+                (coord.0, coord.1 + 1),
+                (coord.0, coord.1 - 1),
+            ];
+            for target in remesh_targets {
+                if self._world.has_chunk(target) {
+                    self.enqueue_remesh(target);
+                }
+            }
+        }
+
+        for _ in 0..REMESH_BUDGET_PER_FRAME {
+            let Some(coord) = self.remesh_queue.pop_front() else {
+                break;
+            };
+            self.remesh_pending.remove(&coord);
+            if self._world.has_chunk(coord) {
+                self.rebuild_chunk_meshes(coord);
+            }
+        }
+    }
+
+    fn enqueue_remesh(&mut self, coord: (i32, i32)) {
+        if self.remesh_pending.insert(coord) {
+            self.remesh_queue.push_back(coord);
+        }
+    }
+
+    fn upload_chunk_meshes(&mut self, coord: (i32, i32), section_meshes: Vec<(usize, mesh::MeshData)>) {
+        self.section_meshes
+            .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
+        for (section_index, mesh_data) in section_meshes {
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Section Vertex Buffer"),
+                    contents: bytemuck::cast_slice(mesh_data.vertices()),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let index_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Section Index Buffer"),
+                    contents: bytemuck::cast_slice(mesh_data.indices()),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+            self.section_meshes.insert(
+                (coord.0, section_world_y, coord.1),
+                SectionMesh {
+                    vertex_buffer,
+                    index_buffer,
+                    num_indices: mesh_data.indices().len() as u32,
+                },
+            );
+        }
+    }
+
+    fn rebuild_chunk_meshes(&mut self, coord: (i32, i32)) {
+        self.section_meshes
+            .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
+        let Some(chunk) = self._world.chunk(coord) else {
+            return;
+        };
+
+        let mut rebuilt = Vec::new();
+        for section_index in chunk.populated_section_indices() {
+            let Some(mesh_data) = mesh::mesh_section(&self._world, coord, section_index) else {
+                continue;
+            };
+            rebuilt.push((section_index, mesh_data));
+        }
+
+        for (section_index, mesh_data) in rebuilt {
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Section Vertex Buffer"),
+                    contents: bytemuck::cast_slice(mesh_data.vertices()),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let index_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Section Index Buffer"),
+                    contents: bytemuck::cast_slice(mesh_data.indices()),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+            self.section_meshes.insert(
+                (coord.0, section_world_y, coord.1),
+                SectionMesh {
+                    vertex_buffer,
+                    index_buffer,
+                    num_indices: mesh_data.indices().len() as u32,
+                },
+            );
+        }
+    }
+
+    fn set_mouse_capture(&mut self, captured: bool) {
+        self.mouse_captured = captured;
+        if captured {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::Locked);
+            self.window.set_cursor_visible(false);
+        } else {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+            self.window.set_cursor_visible(true);
+            self.camera_controller.mouse_delta = (0.0, 0.0);
+        }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -323,7 +512,13 @@ impl State {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        // Temporary sky-like clear color while full skybox rendering is not wired.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.49,
+                            g: 0.74,
+                            b: 0.95,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -342,9 +537,16 @@ impl State {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
+            for (coord, section) in &self.section_meshes {
+                if !self.section_visible(*coord) {
+                    continue;
+                }
+                render_pass.set_vertex_buffer(0, section.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(section.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..section.num_indices, 0, 0..1);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -414,7 +616,7 @@ impl ApplicationHandler for App {
         self.state = Some(state);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -446,14 +648,14 @@ impl ApplicationHandler for App {
                 event:
                     KeyEvent {
                         state: key_state,
-                        physical_key: keyCode,
+                        physical_key: key_code,
                         repeat: false,
                         ..
                     },
                 ..
             } => {
                 if let Some(state) = self.state.as_mut() {
-                    match keyCode {
+                    match key_code {
                         PhysicalKey::Code(KeyCode::KeyW) => {
                             state.camera_controller.forward = key_state == ElementState::Pressed;
                         }
@@ -473,8 +675,9 @@ impl ApplicationHandler for App {
                             state.camera_controller.down = key_state == ElementState::Pressed;
                         }
                         PhysicalKey::Code(KeyCode::KeyP) => {
-                            let _ = state.window.set_cursor_grab(CursorGrabMode::None);
-                            state.window.set_cursor_visible(true);
+                            if key_state == ElementState::Pressed {
+                                state.set_mouse_capture(!state.mouse_captured);
+                            }
                         }
                         _ => {}
                     }
@@ -486,13 +689,16 @@ impl ApplicationHandler for App {
 
     fn device_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
-        device_id: DeviceId,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
         event: DeviceEvent,
     ) {
         match event {
             DeviceEvent::MouseMotion { delta } => {
                 if let Some(state) = self.state.as_mut() {
+                    if !state.mouse_captured {
+                        return;
+                    }
                     let new_delta = (
                         delta.0 + state.camera_controller.mouse_delta.0,
                         delta.1 + state.camera_controller.mouse_delta.1,

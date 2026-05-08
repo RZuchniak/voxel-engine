@@ -11,3 +11,10 @@ pollster = "0.4.0"
 winit = "0.30.12"
 anyhow = "1.0.99"
 cgmath = "0.18.0"
+rayon = "1.10.0"
+crossbeam-channel = "0.5.15"
+image = { version = "0.25.5", default-features = false, features = ["png"] }
+fastanvil = "0.32.0"
+fastnbt = "2.6.0"
+flate2 = "1.1.0"
+serde = { version = "1.0.218", features = ["derive"] }
