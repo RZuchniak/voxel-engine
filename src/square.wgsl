@@ -56,12 +56,12 @@ fn fs_main(
     let sky_color = mix(sky.horizon_color.rgb, sky.top_color.rgb, height_lerp);
     let lit_albedo = albedo.rgb * (0.25 + light * 0.75);
 
-    // Simple atmospheric fog to smooth far-distance transitions.
+    // Distance fog: smoothstep so far geometry blends into the sky/horizon.
     let fog_start = sky.fog_params.x;
     let fog_end = sky.fog_params.y;
     let fog_strength = sky.fog_params.z;
     let dist = distance(world_pos, sky.camera_pos.xyz);
-    let fog = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0) * fog_strength;
+    let fog = smoothstep(fog_start, fog_end, dist) * fog_strength;
     let rgb = mix(lit_albedo, sky_color, fog);
     return vec4<f32>(rgb, albedo.a);
 }

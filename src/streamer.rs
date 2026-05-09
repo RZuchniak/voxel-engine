@@ -12,8 +12,9 @@ use crate::{
 
 pub struct MeshedChunk {
     pub coord: (i32, i32),
-    pub chunk: Chunk,
+    pub chunk: Option<Chunk>,
     pub section_meshes: Vec<(usize, MeshData)>,
+    pub is_remesh: bool,
 }
 
 pub struct ChunkStreamer {
@@ -23,6 +24,7 @@ pub struct ChunkStreamer {
     ready_tx: Sender<MeshedChunk>,
     ready_rx: Receiver<MeshedChunk>,
     in_flight: HashSet<(i32, i32)>,
+    remesh_in_flight: HashSet<(i32, i32)>,
     #[cfg(target_arch = "wasm32")]
     pending: Vec<(i32, i32)>,
 }
@@ -42,6 +44,7 @@ impl ChunkStreamer {
             ready_tx,
             ready_rx,
             in_flight: HashSet::new(),
+            remesh_in_flight: HashSet::new(),
             #[cfg(target_arch = "wasm32")]
             pending: Vec::new(),
         }
@@ -78,8 +81,9 @@ impl ChunkStreamer {
 
                 let _ = ready_tx.send(MeshedChunk {
                     coord,
-                    chunk,
+                    chunk: Some(chunk),
                     section_meshes,
+                    is_remesh: false,
                 });
             });
         }
@@ -109,8 +113,55 @@ impl ChunkStreamer {
         }
         MeshedChunk {
             coord,
-            chunk,
+            chunk: Some(chunk),
             section_meshes,
+            is_remesh: false,
+        }
+    }
+
+    pub fn request_remesh(&mut self, coord: (i32, i32), world: World) {
+        if !self.remesh_in_flight.insert(coord) {
+            return;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let ready_tx = self.ready_tx.clone();
+            self.pool.spawn(move || {
+                let mut section_meshes = Vec::new();
+                if let Some(chunk) = world.chunk(coord) {
+                    for section_index in chunk.populated_section_indices() {
+                        if let Some(mesh) = mesh_section(&world, coord, section_index) {
+                            section_meshes.push((section_index, mesh));
+                        }
+                    }
+                }
+
+                let _ = ready_tx.send(MeshedChunk {
+                    coord,
+                    chunk: None,
+                    section_meshes,
+                    is_remesh: true,
+                });
+            });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut section_meshes = Vec::new();
+            if let Some(chunk) = world.chunk(coord) {
+                for section_index in chunk.populated_section_indices() {
+                    if let Some(mesh) = mesh_section(&world, coord, section_index) {
+                        section_meshes.push((section_index, mesh));
+                    }
+                }
+            }
+            let _ = self.ready_tx.send(MeshedChunk {
+                coord,
+                chunk: None,
+                section_meshes,
+                is_remesh: true,
+            });
         }
     }
 
@@ -122,7 +173,11 @@ impl ChunkStreamer {
                 let Ok(chunk) = self.ready_rx.try_recv() else {
                     break;
                 };
-                self.in_flight.remove(&chunk.coord);
+                if chunk.is_remesh {
+                    self.remesh_in_flight.remove(&chunk.coord);
+                } else {
+                    self.in_flight.remove(&chunk.coord);
+                }
                 out.push(chunk);
             }
             return out;
@@ -145,5 +200,9 @@ impl ChunkStreamer {
 
     pub fn is_in_flight(&self, coord: (i32, i32)) -> bool {
         self.in_flight.contains(&coord)
+    }
+
+    pub fn is_remesh_in_flight(&self, coord: (i32, i32)) -> bool {
+        self.remesh_in_flight.contains(&coord)
     }
 }

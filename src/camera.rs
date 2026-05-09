@@ -85,16 +85,21 @@ impl Controller {
     pub fn update(&mut self, delta_time: u128, camera: &mut Camera) {
         let previous = camera.clone();
         let delta_seconds = (delta_time as f32 / 1_000_000.0).clamp(0.0, 0.1);
-        let diff = previous.target - previous.position;
-        let forward = diff.normalize();
-        let right = forward.cross(previous.up).normalize();
+        // Minecraft-style movement: forward/backward ignores pitch (no Y drift).
+        let horizontal_forward = cgmath::Vector3::new(
+            previous.yaw.cos() as f32,
+            0.0,
+            previous.yaw.sin() as f32,
+        )
+        .normalize();
+        let right = horizontal_forward.cross(previous.up).normalize();
         let move_step = self.speed * delta_seconds;
 
         if self.forward {
-            camera.position += forward * move_step;
+            camera.position += horizontal_forward * move_step;
         }
         if self.backward {
-            camera.position -= forward * move_step;
+            camera.position -= horizontal_forward * move_step;
         }
         if self.left {
             camera.position -= right * move_step;

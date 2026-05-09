@@ -175,6 +175,9 @@ fn mesh_direction(
                 }
 
                 let neighbor = world.block_at(wx + ox, wy + oy, wz + oz);
+                if neighbor == block {
+                    continue;
+                }
                 if neighbor.is_full_cube() && neighbor.is_opaque() {
                     continue;
                 }
@@ -204,6 +207,9 @@ fn mesh_direction(
                         break;
                     }
                     let nneighbor = world.block_at(nwx + ox, nwy + oy, nwz + oz);
+                    if nneighbor == nblock {
+                        break;
+                    }
                     if nneighbor.is_full_cube() && nneighbor.is_opaque() {
                         break;
                     }
@@ -232,6 +238,9 @@ fn mesh_direction(
                             break 'grow;
                         }
                         let nneighbor = world.block_at(nwx + ox, nwy + oy, nwz + oz);
+                        if nneighbor == nblock {
+                            break 'grow;
+                        }
                         if nneighbor.is_full_cube() && nneighbor.is_opaque() {
                             break 'grow;
                         }

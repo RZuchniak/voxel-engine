@@ -17,6 +17,7 @@ fastanvil = "0.32.0"
 fastnbt = "2.6.0"
 flate2 = "1.1.0"
 serde = { version = "1.0.218", features = ["derive"] }
+font8x8 = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.105"

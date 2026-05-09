@@ -226,6 +226,26 @@ fn map_block_name(name: &str) -> BlockId {
         | "minecraft:cherry_leaves" => BlockId::OAK_LEAVES,
         "minecraft:oak_planks" => BlockId::OAK_PLANKS,
         "minecraft:water" => BlockId::WATER,
+        // Underwater plants / thin blocks: render as water volume (no fake stone columns).
+        "minecraft:kelp" | "minecraft:kelp_plant" => BlockId::WATER,
+        "minecraft:seagrass" | "minecraft:tall_seagrass" => BlockId::WATER,
+        "minecraft:sea_pickle" => BlockId::WATER,
+        "minecraft:bubble_column" => BlockId::WATER,
+        "minecraft:tube_coral"
+        | "minecraft:brain_coral"
+        | "minecraft:bubble_coral"
+        | "minecraft:fire_coral"
+        | "minecraft:horn_coral" => BlockId::WATER,
+        "minecraft:tube_coral_fan"
+        | "minecraft:brain_coral_fan"
+        | "minecraft:bubble_coral_fan"
+        | "minecraft:fire_coral_fan"
+        | "minecraft:horn_coral_fan" => BlockId::WATER,
+        "minecraft:tube_coral_wall_fan"
+        | "minecraft:brain_coral_wall_fan"
+        | "minecraft:bubble_coral_wall_fan"
+        | "minecraft:fire_coral_wall_fan"
+        | "minecraft:horn_coral_wall_fan" => BlockId::WATER,
         "minecraft:bedrock" => BlockId::BEDROCK,
         "minecraft:snow_block" => BlockId::SNOW_BLOCK,
         "minecraft:netherrack" => BlockId::NETHERRACK,

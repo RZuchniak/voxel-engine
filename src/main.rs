@@ -23,6 +23,7 @@ mod source;
 mod streamer;
 mod texture;
 mod world;
+mod hud;
 
 #[cfg(not(target_arch = "wasm32"))]
 use source::AnvilSource;
@@ -31,9 +32,18 @@ use source::PackedWebSource;
 use streamer::ChunkStreamer;
 use world::{MIN_SECTION_Y, SECTION_SIZE, World};
 
-const LOAD_DISTANCE_CHUNKS: i32 = 8;
-const UNLOAD_MARGIN_CHUNKS: i32 = 2;
-const REMESH_BUDGET_PER_FRAME: usize = 1;
+const LOAD_DISTANCE_CHUNKS: i32 = 12;
+const UNLOAD_MARGIN_CHUNKS: i32 = 3;
+/// Full chunk mesh refresh (immediate border updates).
+const REMESH_PRIORITY_BUDGET_PER_FRAME: usize = 2;
+/// Neighbor border fixes — spread across frames to avoid Sodium-style spikes.
+const NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 2;
+const MAX_NEW_REQUESTS_PER_FRAME: usize = 6;
+const READY_DRAIN_BUDGET_PER_FRAME: usize = 64;
+const MAX_CHUNK_UPLOADS_PER_FRAME: usize = 4;
+const MAX_UPLOAD_TIME_BUDGET_MS: u128 = 1;
+const MAX_PENDING_READY_CHUNKS: usize = 384;
+const TARGET_FRAME_TIME_US: u128 = 33_333;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
@@ -116,8 +126,9 @@ impl UniformSky {
         Self {
             top_color: [0.42, 0.64, 0.90, 1.0],
             horizon_color: [0.72, 0.84, 0.98, 1.0],
-            // World-space fog distances in block units.
-            fog_params: [160.0, 430.0, 0.22, 0.0],
+            // World-space fog: start (blocks), end (blocks), strength [0,1], unused.
+            // Tuned to ~section draw radius (~240 blocks) so distant chunks fade out.
+            fog_params: [200.0, 400.0, 1.0, 0.0],
             camera_pos: [0.0, 0.0, 0.0, 0.0],
         }
     }
@@ -127,6 +138,8 @@ struct SectionMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    vertex_capacity: u64,
+    index_capacity: u64,
 }
 
 struct State {
@@ -138,9 +151,12 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     _world: World,
     streamer: ChunkStreamer,
+    pending_ready: VecDeque<streamer::MeshedChunk>,
     section_meshes: HashMap<(i32, i32, i32), SectionMesh>,
-    remesh_queue: VecDeque<(i32, i32)>,
-    remesh_pending: HashSet<(i32, i32)>,
+    remesh_priority: VecDeque<(i32, i32)>,
+    remesh_neighbor: VecDeque<(i32, i32)>,
+    remesh_priority_pending: HashSet<(i32, i32)>,
+    remesh_neighbor_pending: HashSet<(i32, i32)>,
     camera: camera::Camera,
     camera_uniform: UniformCamera,
     sky_uniform: UniformSky,
@@ -158,9 +174,123 @@ struct State {
     uploaded_meshes_last_frame: usize,
     profile_accum: u128,
     render_frame_index: u64,
+    hud: hud::HudOverlay,
+    fps_ema: f32,
 }
 
 impl State {
+    #[inline]
+    fn round_mesh_buffer_capacity(need: u64) -> u64 {
+        if need == 0 {
+            return 256;
+        }
+        need.max(256).next_power_of_two()
+    }
+
+    /// High-priority remesh (arriving chunk). Supersedes a pending neighbor job for the same coord.
+    fn enqueue_priority_remesh(&mut self, coord: (i32, i32)) {
+        self.remesh_neighbor.retain(|&c| c != coord);
+        self.remesh_neighbor_pending.remove(&coord);
+        self.remesh_priority.retain(|&c| c != coord);
+        self.remesh_priority.push_back(coord);
+        self.remesh_priority_pending.insert(coord);
+    }
+
+    /// Border updates when a neighbor appears — spread out to cap frame-time spikes.
+    fn enqueue_neighbor_remesh(&mut self, coord: (i32, i32)) {
+        if self.remesh_priority_pending.contains(&coord) {
+            return;
+        }
+        if self.remesh_neighbor_pending.insert(coord) {
+            self.remesh_neighbor.push_back(coord);
+        }
+    }
+
+    fn dispatch_remesh_job(&mut self, coord: (i32, i32)) {
+        if self.streamer.is_remesh_in_flight(coord) || !self._world.has_chunk(coord) {
+            return;
+        }
+
+        let mut local_world = World::new();
+        for c in [
+            coord,
+            (coord.0 + 1, coord.1),
+            (coord.0 - 1, coord.1),
+            (coord.0, coord.1 + 1),
+            (coord.0, coord.1 - 1),
+        ] {
+            if let Some(chunk) = self._world.chunk(c).cloned() {
+                local_world.insert_chunk(chunk);
+            }
+        }
+        self.streamer.request_remesh(coord, local_world);
+    }
+
+    fn write_section_mesh(&mut self, key: (i32, i32, i32), mesh_data: &mesh::MeshData) {
+        let v_len = (mesh_data.vertices().len() * std::mem::size_of::<Vertex>()) as u64;
+        let i_len = (mesh_data.indices().len() * std::mem::size_of::<u32>()) as u64;
+        let v_slice = bytemuck::cast_slice(mesh_data.vertices());
+        let i_slice = bytemuck::cast_slice(mesh_data.indices());
+        let num_indices = mesh_data.indices().len() as u32;
+
+        let reuse = self.section_meshes.remove(&key);
+        if let Some(existing) = reuse {
+            if existing.vertex_capacity >= v_len && existing.index_capacity >= i_len {
+                self.queue.write_buffer(&existing.vertex_buffer, 0, v_slice);
+                self.queue.write_buffer(&existing.index_buffer, 0, i_slice);
+                self.section_meshes.insert(
+                    key,
+                    SectionMesh {
+                        num_indices,
+                        ..existing
+                    },
+                );
+                return;
+            }
+        }
+
+        let v_cap = Self::round_mesh_buffer_capacity(v_len);
+        let i_cap = Self::round_mesh_buffer_capacity(i_len);
+
+        let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Section Vertex Buffer"),
+            size: v_cap,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&vertex_buffer, 0, v_slice);
+
+        let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Section Index Buffer"),
+            size: i_cap,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&index_buffer, 0, i_slice);
+
+        self.section_meshes.insert(
+            key,
+            SectionMesh {
+                vertex_buffer,
+                index_buffer,
+                num_indices,
+                vertex_capacity: v_cap,
+                index_capacity: i_cap,
+            },
+        );
+    }
+
+    fn chunk_within_keep_distance(
+        coord: (i32, i32),
+        player_chunk_x: i32,
+        player_chunk_z: i32,
+    ) -> bool {
+        let dx = coord.0 - player_chunk_x;
+        let dz = coord.1 - player_chunk_z;
+        dx.abs() <= LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
+            && dz.abs() <= LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
+    }
+
     fn section_detail_ring(&self, section_coord: (i32, i32, i32)) -> u8 {
         let camera_pos = self.camera.position();
         let center = cgmath::Vector3::new(
@@ -168,8 +298,8 @@ impl State {
             section_coord.1 as f32 + 8.0,
             section_coord.2 as f32 * SECTION_SIZE as f32 + 8.0,
         );
-        let dist = (center - camera_pos.to_vec()).magnitude();
-        let chunk_dist = dist / SECTION_SIZE as f32;
+        let horizontal = cgmath::Vector2::new(center.x - camera_pos.x, center.z - camera_pos.z);
+        let chunk_dist = horizontal.magnitude() / SECTION_SIZE as f32;
         if chunk_dist <= 7.5 {
             0 // near
         } else if chunk_dist <= 11.5 {
@@ -190,9 +320,10 @@ impl State {
             section_coord.2 as f32 * SECTION_SIZE as f32 + 8.0,
         );
         let to_section = center - camera_pos.to_vec();
-        let dist2 = to_section.magnitude2();
+        let horizontal = cgmath::Vector2::new(to_section.x, to_section.z);
+        let dist2 = horizontal.magnitude2();
 
-        // Hard distance cap to avoid drawing far sections.
+        // Hard horizontal distance cap to keep render distance independent of camera height.
         let max_distance = SECTION_SIZE as f32 * 15.0;
         if dist2 > max_distance * max_distance {
             return false;
@@ -362,6 +493,8 @@ impl State {
             cache: None,
         });
 
+        let hud = hud::HudOverlay::new(&device, config.format);
+
         let world = World::new();
         #[cfg(not(target_arch = "wasm32"))]
         let world_source: Arc<dyn source::WorldSource> =
@@ -369,9 +502,12 @@ impl State {
         #[cfg(target_arch = "wasm32")]
         let world_source: Arc<dyn source::WorldSource> = Arc::new(PackedWebSource::new("world"));
         let streamer = ChunkStreamer::new(world_source);
+        let pending_ready = VecDeque::new();
         let section_meshes = HashMap::new();
-        let remesh_queue = VecDeque::new();
-        let remesh_pending = HashSet::new();
+        let remesh_priority = VecDeque::new();
+        let remesh_neighbor = VecDeque::new();
+        let remesh_priority_pending = HashSet::new();
+        let remesh_neighbor_pending = HashSet::new();
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
@@ -400,9 +536,12 @@ impl State {
             config,
             _world: world,
             streamer,
+            pending_ready,
             section_meshes,
-            remesh_queue,
-            remesh_pending,
+            remesh_priority,
+            remesh_neighbor,
+            remesh_priority_pending,
+            remesh_neighbor_pending,
             render_pipeline,
             camera,
             camera_uniform,
@@ -421,11 +560,23 @@ impl State {
             uploaded_meshes_last_frame: 0,
             profile_accum: 0,
             render_frame_index: 0,
+            hud,
+            fps_ema: 0.0,
         };
     }
 
     fn update(&mut self) {
         self.update_streaming();
+        let inst_fps = if self.delta > 0 {
+            1_000_000.0 / self.delta as f32
+        } else {
+            self.fps_ema
+        };
+        if self.fps_ema <= 0.0 {
+            self.fps_ema = inst_fps;
+        } else {
+            self.fps_ema = self.fps_ema * 0.92 + inst_fps * 0.08;
+        }
         self.camera_uniform.update(&self.camera);
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -449,9 +600,9 @@ impl State {
     }
 
     fn update_streaming(&mut self) {
-        let mesh_upload_budget = 10usize;
         let player_chunk_x = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let player_chunk_z = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let forward = self.camera.forward();
 
         let mut desired = Vec::new();
         for dz in -LOAD_DISTANCE_CHUNKS..=LOAD_DISTANCE_CHUNKS {
@@ -459,140 +610,144 @@ impl State {
                 let cx = player_chunk_x + dx;
                 let cz = player_chunk_z + dz;
                 let dist2 = dx * dx + dz * dz;
-                desired.push(((cx, cz), dist2));
+                let to_chunk = cgmath::Vector3::new(dx as f32, 0.0, dz as f32);
+                let facing_score = if dist2 == 0 {
+                    1.0
+                } else {
+                    to_chunk.normalize().dot(forward)
+                };
+                desired.push(((cx, cz), dist2, facing_score));
             }
         }
-        desired.sort_by_key(|(_, dist2)| *dist2);
+        desired.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
 
-        for (coord, _) in desired.iter().copied() {
+        let mut request_budget = MAX_NEW_REQUESTS_PER_FRAME;
+        for (coord, _, _) in desired.iter().copied() {
             if !self._world.has_chunk(coord) && !self.streamer.is_in_flight(coord) {
                 self.streamer.request_chunk(coord);
-            }
-        }
-
-        let loaded: Vec<(i32, i32)> = self._world.chunks().map(|c| c.coord()).collect();
-        for coord in loaded {
-            let dx = coord.0 - player_chunk_x;
-            let dz = coord.1 - player_chunk_z;
-            if dx.abs() > LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
-                || dz.abs() > LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
-            {
-                self._world.remove_chunk(coord);
-                self.section_meshes
-                    .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
-            }
-        }
-
-        let ready = self.streamer.poll_ready(mesh_upload_budget);
-        self.uploaded_meshes_last_frame = ready.len();
-        for meshed in ready {
-            let coord = meshed.coord;
-            self._world.insert_chunk(meshed.chunk);
-            self.upload_chunk_meshes(coord, meshed.section_meshes);
-
-            // Rebuild the arriving chunk and orthogonal neighbors so border faces are culled
-            // correctly once adjacent chunks become available.
-            let remesh_targets = [
-                coord,
-                (coord.0 + 1, coord.1),
-                (coord.0 - 1, coord.1),
-                (coord.0, coord.1 + 1),
-                (coord.0, coord.1 - 1),
-            ];
-            for target in remesh_targets {
-                if self._world.has_chunk(target) {
-                    self.enqueue_remesh(target);
+                request_budget -= 1;
+                if request_budget == 0 {
+                    break;
                 }
             }
         }
 
-        // More aggressive remesh while close chunks are changing, gentler farther away.
-        for _ in 0..(REMESH_BUDGET_PER_FRAME + 1) {
-            let Some(coord) = self.remesh_queue.pop_front() else {
-                break;
-            };
-            self.remesh_pending.remove(&coord);
-            if self._world.has_chunk(coord) {
-                self.rebuild_chunk_meshes(coord);
+        self.pending_ready
+            .retain(|meshed| Self::chunk_within_keep_distance(meshed.coord, player_chunk_x, player_chunk_z));
+
+        let loaded: Vec<(i32, i32)> = self._world.chunks().map(|c| c.coord()).collect();
+        for coord in loaded {
+            if !Self::chunk_within_keep_distance(coord, player_chunk_x, player_chunk_z) {
+                self._world.remove_chunk(coord);
+                self.section_meshes
+                    .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
+                self.pending_ready.retain(|meshed| meshed.coord != coord);
             }
         }
-    }
 
-    fn enqueue_remesh(&mut self, coord: (i32, i32)) {
-        if self.remesh_pending.insert(coord) {
-            self.remesh_queue.push_back(coord);
+        let ready = self.streamer.poll_ready(READY_DRAIN_BUDGET_PER_FRAME);
+        for meshed in ready {
+            if Self::chunk_within_keep_distance(meshed.coord, player_chunk_x, player_chunk_z) {
+                self.pending_ready.push_back(meshed);
+            }
+        }
+        while self.pending_ready.len() > MAX_PENDING_READY_CHUNKS {
+            self.pending_ready.pop_back();
+        }
+
+        let frame_over = self.delta.saturating_sub(TARGET_FRAME_TIME_US);
+        let upload_budget_dynamic = if frame_over > 10_000 {
+            2
+        } else if frame_over > 5_000 {
+            3
+        } else {
+            MAX_CHUNK_UPLOADS_PER_FRAME
+        };
+        let upload_time_budget_dynamic = if frame_over > 10_000 {
+            1
+        } else {
+            MAX_UPLOAD_TIME_BUDGET_MS
+        };
+
+        let upload_start = std::time::Instant::now();
+        let mut uploaded_this_frame = 0usize;
+        while uploaded_this_frame < upload_budget_dynamic
+            && upload_start.elapsed().as_millis() < upload_time_budget_dynamic
+        {
+            let Some(meshed) = self.pending_ready.pop_front() else {
+                break;
+            };
+            let coord = meshed.coord;
+            if !Self::chunk_within_keep_distance(coord, player_chunk_x, player_chunk_z) {
+                continue;
+            }
+            if let Some(chunk) = meshed.chunk {
+                self._world.insert_chunk(chunk);
+            }
+            self.upload_chunk_meshes(coord, meshed.section_meshes);
+            uploaded_this_frame += 1;
+
+            if !meshed.is_remesh {
+                // Rebuild the arriving chunk and orthogonal neighbors so border faces are culled
+                // correctly once adjacent chunks become available.
+                self.enqueue_priority_remesh(coord);
+                let neighbors = [
+                    (coord.0 + 1, coord.1),
+                    (coord.0 - 1, coord.1),
+                    (coord.0, coord.1 + 1),
+                    (coord.0, coord.1 - 1),
+                ];
+                for target in neighbors {
+                    if self._world.has_chunk(target) {
+                        self.enqueue_neighbor_remesh(target);
+                    }
+                }
+            }
+        }
+        self.uploaded_meshes_last_frame = uploaded_this_frame;
+
+        let extra_priority = if uploaded_this_frame > 0 { 1 } else { 0 };
+        let remesh_slowdown = if frame_over > 10_000 { 1 } else { 0 };
+        let pri_budget = (REMESH_PRIORITY_BUDGET_PER_FRAME + extra_priority).saturating_sub(remesh_slowdown);
+        for _ in 0..pri_budget {
+            let Some(coord) = self.remesh_priority.pop_front() else {
+                break;
+            };
+            self.remesh_priority_pending.remove(&coord);
+            self.dispatch_remesh_job(coord);
+        }
+        let neighbor_budget = NEIGHBOR_REMESH_BUDGET_PER_FRAME.saturating_sub(remesh_slowdown);
+        for _ in 0..neighbor_budget {
+            let Some(coord) = self.remesh_neighbor.pop_front() else {
+                break;
+            };
+            self.remesh_neighbor_pending.remove(&coord);
+            self.dispatch_remesh_job(coord);
         }
     }
 
     fn upload_chunk_meshes(&mut self, coord: (i32, i32), section_meshes: Vec<(usize, mesh::MeshData)>) {
-        self.section_meshes
-            .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
+        let mut incoming_keys: HashSet<(i32, i32, i32)> = HashSet::new();
+        for (section_index, _) in &section_meshes {
+            let section_world_y = (*section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+            incoming_keys.insert((coord.0, section_world_y, coord.1));
+        }
+
+        self.section_meshes.retain(|key, _| {
+            if key.0 == coord.0 && key.2 == coord.1 {
+                incoming_keys.contains(key)
+            } else {
+                true
+            }
+        });
+
         for (section_index, mesh_data) in section_meshes {
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Section Vertex Buffer"),
-                    contents: bytemuck::cast_slice(mesh_data.vertices()),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Section Index Buffer"),
-                    contents: bytemuck::cast_slice(mesh_data.indices()),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
             let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
-            self.section_meshes.insert(
-                (coord.0, section_world_y, coord.1),
-                SectionMesh {
-                    vertex_buffer,
-                    index_buffer,
-                    num_indices: mesh_data.indices().len() as u32,
-                },
-            );
-        }
-    }
-
-    fn rebuild_chunk_meshes(&mut self, coord: (i32, i32)) {
-        self.section_meshes
-            .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
-        let Some(chunk) = self._world.chunk(coord) else {
-            return;
-        };
-
-        let mut rebuilt = Vec::new();
-        for section_index in chunk.populated_section_indices() {
-            let Some(mesh_data) = mesh::mesh_section(&self._world, coord, section_index) else {
-                continue;
-            };
-            rebuilt.push((section_index, mesh_data));
-        }
-
-        for (section_index, mesh_data) in rebuilt {
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Section Vertex Buffer"),
-                    contents: bytemuck::cast_slice(mesh_data.vertices()),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Section Index Buffer"),
-                    contents: bytemuck::cast_slice(mesh_data.indices()),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
-            self.section_meshes.insert(
-                (coord.0, section_world_y, coord.1),
-                SectionMesh {
-                    vertex_buffer,
-                    index_buffer,
-                    num_indices: mesh_data.indices().len() as u32,
-                },
-            );
+            let key = (coord.0, section_world_y, coord.1);
+            self.write_section_mesh(key, &mesh_data);
         }
     }
 
@@ -677,6 +832,40 @@ impl State {
             }
         }
 
+        let stream_blocks = LOAD_DISTANCE_CHUNKS * SECTION_SIZE as i32;
+        let section_cull_blocks = (SECTION_SIZE as f32 * 15.0) as i32;
+        let hud_text = format!(
+            "FPS: {:.0}\nChunks loaded: {}\nVisible sections: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {} blocks\nMesh upload queue: {}",
+            self.fps_ema,
+            self._world.chunks().count(),
+            self.visible_sections_last_frame,
+            LOAD_DISTANCE_CHUNKS,
+            stream_blocks,
+            section_cull_blocks,
+            self.pending_ready.len(),
+        );
+        self.hud
+            .prepare(&self.queue, &hud_text, self.config.width, self.config.height);
+
+        {
+            let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hud pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.hud.render(&mut hud_pass);
+        }
+
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
@@ -708,6 +897,7 @@ impl State {
             self.depth_texture = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
             self.is_surface_configured = true;
+            self.hud.resize(&self.queue, width, height);
         }
     }
 }
