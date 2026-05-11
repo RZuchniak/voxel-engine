@@ -33,6 +33,11 @@ impl Camera {
         proj * view // * OPENGL_TO_WGPU_MATRIX
     }
 
+    pub fn set_far_plane(&mut self, zfar: f32) {
+        // Keep a small minimum margin above near plane.
+        self.zfar = zfar.max(self.znear + 1.0);
+    }
+
     pub fn new(aspect_ratio: f32, fov: f32, znear: f32, zfar: f32) -> Self {
         let position: cgmath::Point3<f32> = (8.0, 100.0, 8.0).into();
         let target: cgmath::Point3<f32> = (0.0, 76.0, 0.0).into();
@@ -113,6 +118,24 @@ impl Controller {
         if self.down {
             camera.position.y -= move_step;
         }
+        camera.yaw += self.mouse_delta.0 * self.sensitivity as f64;
+        camera.pitch -= self.mouse_delta.1 * self.sensitivity as f64;
+
+        camera.pitch = camera.pitch.clamp(-1.57, 1.57);
+
+        let direction = cgmath::Vector3::new(
+            (camera.yaw.cos() * camera.pitch.cos()) as f32,
+            camera.pitch.sin() as f32,
+            (camera.yaw.sin() * camera.pitch.cos()) as f32,
+        );
+
+        self.mouse_delta = (0.0, 0.0);
+
+        camera.target = camera.position + direction.normalize();
+    }
+
+    /// Mouse look only (used while the world is bootstrapping — no WASD / fly movement).
+    pub fn update_look_only(&mut self, camera: &mut Camera) {
         camera.yaw += self.mouse_delta.0 * self.sensitivity as f64;
         camera.pitch -= self.mouse_delta.1 * self.sensitivity as f64;
 

@@ -2,7 +2,10 @@
 use std::{collections::HashMap, sync::Mutex};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
-use std::{fs::File, io::BufReader};
+use std::{
+    fs::File,
+    io::{BufReader, ErrorKind},
+};
 
 use anyhow::Result;
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,10 +33,17 @@ impl WorldSource for ProceduralSource {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+enum RegionEntry {
+    /// No `r.x.z.mca` on disk (uncharted area — normal for finite saves).
+    Missing,
+    Open(Region<BufReader<File>>),
+}
+
 pub struct AnvilSource {
     world_path: PathBuf,
     #[cfg(not(target_arch = "wasm32"))]
-    region_cache: Mutex<HashMap<(i32, i32), Region<BufReader<File>>>>,
+    region_cache: Mutex<HashMap<(i32, i32), RegionEntry>>,
 }
 
 impl AnvilSource {
@@ -48,24 +58,43 @@ impl AnvilSource {
     #[cfg(not(target_arch = "wasm32"))]
     fn region_mut<'a>(
         &'a self,
-        cache: &'a mut HashMap<(i32, i32), Region<BufReader<File>>>,
+        cache: &'a mut HashMap<(i32, i32), RegionEntry>,
         rx: i32,
         rz: i32,
-    ) -> Result<&'a mut Region<BufReader<File>>> {
-        if !cache.contains_key(&(rx, rz)) {
-            let path = self
-                .world_path
-                .join("region")
-                .join(format!("r.{rx}.{rz}.mca"));
-            let file = File::open(&path)
-                .with_context(|| format!("failed opening region file {}", path.display()))?;
-            let region = Region::from_stream(BufReader::new(file))
-                .with_context(|| format!("failed parsing region file {}", path.display()))?;
-            cache.insert((rx, rz), region);
+    ) -> Result<Option<&'a mut Region<BufReader<File>>>> {
+        use std::collections::hash_map::Entry;
+
+        match cache.entry((rx, rz)) {
+            Entry::Occupied(e) => Ok(match e.into_mut() {
+                RegionEntry::Missing => None,
+                RegionEntry::Open(r) => Some(r),
+            }),
+            Entry::Vacant(v) => {
+                let path = self
+                    .world_path
+                    .join("region")
+                    .join(format!("r.{rx}.{rz}.mca"));
+                let file = match File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        v.insert(RegionEntry::Missing);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("failed opening region file {}", path.display())
+                        });
+                    }
+                };
+                let region = Region::from_stream(BufReader::new(file))
+                    .with_context(|| format!("failed parsing region file {}", path.display()))?;
+                let entry = v.insert(RegionEntry::Open(region));
+                match entry {
+                    RegionEntry::Open(r) => Ok(Some(r)),
+                    RegionEntry::Missing => unreachable!(),
+                }
+            }
         }
-        cache
-            .get_mut(&(rx, rz))
-            .ok_or_else(|| anyhow!("region cache lookup failed"))
     }
 }
 
@@ -88,7 +117,9 @@ impl WorldSource for AnvilSource {
             .region_cache
             .lock()
             .map_err(|_| anyhow!("region cache mutex poisoned"))?;
-        let region = self.region_mut(&mut cache, rx, rz)?;
+        let Some(region) = self.region_mut(&mut cache, rx, rz)? else {
+            return Ok(Chunk::new(coord));
+        };
         let Some(raw_chunk) = region
             .read_chunk(local_x, local_z)
             .with_context(|| format!("failed reading chunk {cx},{cz} from region {rx},{rz}"))?

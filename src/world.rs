@@ -34,6 +34,11 @@ impl Section {
     pub fn block_at(&self, x: usize, y: usize, z: usize) -> BlockId {
         self.data[Self::index(x, y, z)]
     }
+
+    #[inline]
+    pub fn has_any_non_air(&self) -> bool {
+        self.data.iter().any(|b| !b.is_air())
+    }
 }
 
 #[derive(Clone)]
@@ -63,6 +68,12 @@ impl Chunk {
             .iter()
             .enumerate()
             .filter_map(|(idx, section)| section.as_ref().map(|_| idx))
+    }
+
+    /// True if any stored section contains a non-air block (meshes may still be empty if fully occluded).
+    pub fn needs_rendered_mesh(&self) -> bool {
+        self.populated_section_indices()
+            .any(|idx| self.section(idx).is_some_and(|s| s.has_any_non_air()))
     }
 
     fn section_index_from_world_y(world_y: i32) -> Option<usize> {

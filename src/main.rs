@@ -32,18 +32,33 @@ use source::PackedWebSource;
 use streamer::ChunkStreamer;
 use world::{MIN_SECTION_Y, SECTION_SIZE, World};
 
-const LOAD_DISTANCE_CHUNKS: i32 = 12;
-const UNLOAD_MARGIN_CHUNKS: i32 = 3;
+const LOAD_DISTANCE_CHUNKS: i32 = 40;
+const UNLOAD_MARGIN_CHUNKS: i32 = 5;
 /// Full chunk mesh refresh (immediate border updates).
 const REMESH_PRIORITY_BUDGET_PER_FRAME: usize = 2;
 /// Neighbor border fixes — spread across frames to avoid Sodium-style spikes.
-const NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 2;
+const NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 1;
 const MAX_NEW_REQUESTS_PER_FRAME: usize = 6;
 const READY_DRAIN_BUDGET_PER_FRAME: usize = 64;
 const MAX_CHUNK_UPLOADS_PER_FRAME: usize = 4;
 const MAX_UPLOAD_TIME_BUDGET_MS: u128 = 1;
-const MAX_PENDING_READY_CHUNKS: usize = 384;
+/// Chebyshev radius (in chunks): all cells in the square must be loaded, meshed, and idle before play.
+const BOOTSTRAP_CHUNK_RADIUS: i32 = 8;
+const BOOTSTRAP_MAX_NEW_REQUESTS_PER_FRAME: usize = 32;
+const BOOTSTRAP_READY_DRAIN_BUDGET_PER_FRAME: usize = 256;
+const BOOTSTRAP_MAX_CHUNK_UPLOADS_PER_FRAME: usize = 24;
+const BOOTSTRAP_UPLOAD_TIME_BUDGET_MS: u128 = 12;
+const BOOTSTRAP_EXTRA_PRI_REMESH_PER_FRAME: usize = 8;
+const BOOTSTRAP_EXTRA_NEIGHBOR_REMESH_PER_FRAME: usize = 6;
+const MAX_PENDING_READY_CHUNKS: usize = 600;
+/// When many chunks finish loading together, raise remesh throughput so first paint uses neighbor-aware meshes.
+const PENDING_BACKLOG_REMESH_THRESHOLD: usize = 24;
+const PENDING_BACKLOG_EXTRA_PRI_REMESH: usize = 4;
+const PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH: usize = 3;
 const TARGET_FRAME_TIME_US: u128 = 33_333;
+const DEFAULT_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 40.0;
+const MIN_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 4.0;
+const MAX_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 64.0;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
@@ -126,9 +141,8 @@ impl UniformSky {
         Self {
             top_color: [0.42, 0.64, 0.90, 1.0],
             horizon_color: [0.72, 0.84, 0.98, 1.0],
-            // World-space fog: start (blocks), end (blocks), strength [0,1], unused.
-            // Tuned to ~section draw radius (~240 blocks) so distant chunks fade out.
-            fog_params: [200.0, 400.0, 1.0, 0.0],
+            // Runtime-updated from active section draw distance.
+            fog_params: [80.0, 120.0, 1.0, 0.0],
             camera_pos: [0.0, 0.0, 0.0, 0.0],
         }
     }
@@ -176,6 +190,9 @@ struct State {
     render_frame_index: u64,
     hud: hud::HudOverlay,
     fps_ema: f32,
+    section_draw_distance_chunks: f32,
+    /// False until the neighborhood around the spawn has GPU meshes and no pending mesh work.
+    world_ready: bool,
 }
 
 impl State {
@@ -198,17 +215,38 @@ impl State {
 
     /// Border updates when a neighbor appears — spread out to cap frame-time spikes.
     fn enqueue_neighbor_remesh(&mut self, coord: (i32, i32)) {
-        if self.remesh_priority_pending.contains(&coord) {
-            return;
-        }
         if self.remesh_neighbor_pending.insert(coord) {
             self.remesh_neighbor.push_back(coord);
         }
     }
 
-    fn dispatch_remesh_job(&mut self, coord: (i32, i32)) {
+    /// Drop completed initial loads from the back first; never discard remesh results (GPU may already
+    /// have dropped `remesh_in_flight`, so losing a remesh upload leaves stale chunk-border geometry forever).
+    fn trim_pending_ready_queue(&mut self) {
+        while self.pending_ready.len() > MAX_PENDING_READY_CHUNKS {
+            if let Some(back) = self.pending_ready.back() {
+                if !back.is_remesh {
+                    self.pending_ready.pop_back();
+                    continue;
+                }
+            }
+            let mut dropped = false;
+            for i in (0..self.pending_ready.len()).rev() {
+                if !self.pending_ready[i].is_remesh {
+                    self.pending_ready.remove(i);
+                    dropped = true;
+                    break;
+                }
+            }
+            if !dropped {
+                break;
+            }
+        }
+    }
+
+    fn dispatch_remesh_job(&mut self, coord: (i32, i32)) -> bool {
         if self.streamer.is_remesh_in_flight(coord) || !self._world.has_chunk(coord) {
-            return;
+            return false;
         }
 
         let mut local_world = World::new();
@@ -224,6 +262,7 @@ impl State {
             }
         }
         self.streamer.request_remesh(coord, local_world);
+        true
     }
 
     fn write_section_mesh(&mut self, key: (i32, i32, i32), mesh_data: &mesh::MeshData) {
@@ -300,11 +339,13 @@ impl State {
         );
         let horizontal = cgmath::Vector2::new(center.x - camera_pos.x, center.z - camera_pos.z);
         let chunk_dist = horizontal.magnitude() / SECTION_SIZE as f32;
-        if chunk_dist <= 7.5 {
+        let near = self.section_draw_distance_chunks * 0.5;
+        let mid = self.section_draw_distance_chunks * 0.8;
+        if chunk_dist <= near {
             0 // near
-        } else if chunk_dist <= 11.5 {
+        } else if chunk_dist <= mid {
             1 // mid
-        } else if chunk_dist <= 15.0 {
+        } else if chunk_dist <= self.section_draw_distance_chunks {
             2 // far
         } else {
             3 // culled
@@ -324,7 +365,7 @@ impl State {
         let dist2 = horizontal.magnitude2();
 
         // Hard horizontal distance cap to keep render distance independent of camera height.
-        let max_distance = SECTION_SIZE as f32 * 15.0;
+        let max_distance = SECTION_SIZE as f32 * self.section_draw_distance_chunks;
         if dist2 > max_distance * max_distance {
             return false;
         }
@@ -383,7 +424,7 @@ impl State {
         };
 
         let camera =
-            camera::Camera::new(config.width as f32 / config.height as f32, 45.0, 0.1, 500.0);
+            camera::Camera::new(config.width as f32 / config.height as f32, 45.0, 0.1, 1200.0);
 
         let mut camera_uniform = UniformCamera::new();
         camera_uniform.update(&camera);
@@ -562,11 +603,16 @@ impl State {
             render_frame_index: 0,
             hud,
             fps_ema: 0.0,
+            section_draw_distance_chunks: DEFAULT_SECTION_DRAW_DISTANCE_CHUNKS,
+            world_ready: false,
         };
     }
 
     fn update(&mut self) {
         self.update_streaming();
+        let draw_distance_blocks = self.section_draw_distance_chunks * SECTION_SIZE as f32;
+        // Keep camera far plane beyond draw distance so distance culling, not projection clipping, is the limiter.
+        self.camera.set_far_plane((draw_distance_blocks * 1.4).max(600.0));
         let inst_fps = if self.delta > 0 {
             1_000_000.0 / self.delta as f32
         } else {
@@ -585,6 +631,12 @@ impl State {
         );
         let cp = self.camera.position();
         self.sky_uniform.camera_pos = [cp.x, cp.y, cp.z, 0.0];
+        self.sky_uniform.fog_params = [
+            draw_distance_blocks * 0.72,
+            draw_distance_blocks * 1.02,
+            1.0,
+            0.0,
+        ];
         self.queue
             .write_buffer(&self.sky_buffer, 0, bytemuck::cast_slice(&[self.sky_uniform]));
         self.profile_accum += self.delta;
@@ -599,9 +651,76 @@ impl State {
         }
     }
 
+    fn chunk_has_any_gpu_section(&self, coord: (i32, i32)) -> bool {
+        self.section_meshes
+            .keys()
+            .any(|(cx, _, cz)| *cx == coord.0 && *cz == coord.1)
+    }
+
+    fn chunk_needs_gpu_mesh(&self, coord: (i32, i32)) -> bool {
+        self._world
+            .chunk(coord)
+            .is_some_and(|ch| ch.needs_rendered_mesh())
+    }
+
+    /// Spawn neighborhood tile: data present, optional GPU mesh if non-empty, and no in-flight mesh work.
+    fn chunk_bootstrap_tile_ready(&self, coord: (i32, i32)) -> bool {
+        if !self._world.has_chunk(coord) {
+            return false;
+        }
+        if self.streamer.is_in_flight(coord) || self.streamer.is_remesh_in_flight(coord) {
+            return false;
+        }
+        if self.remesh_priority_pending.contains(&coord) || self.remesh_neighbor_pending.contains(&coord) {
+            return false;
+        }
+        if self.pending_ready.iter().any(|m| m.coord == coord) {
+            return false;
+        }
+        if self.chunk_needs_gpu_mesh(coord) && !self.chunk_has_any_gpu_section(coord) {
+            return false;
+        }
+        true
+    }
+
+    fn bootstrap_tile_count() -> usize {
+        let w = (2 * BOOTSTRAP_CHUNK_RADIUS + 1) as usize;
+        w * w
+    }
+
+    fn bootstrap_ready_tiles(&self, player_chunk_x: i32, player_chunk_z: i32) -> usize {
+        let mut n = 0usize;
+        for dz in -BOOTSTRAP_CHUNK_RADIUS..=BOOTSTRAP_CHUNK_RADIUS {
+            for dx in -BOOTSTRAP_CHUNK_RADIUS..=BOOTSTRAP_CHUNK_RADIUS {
+                let c = (player_chunk_x + dx, player_chunk_z + dz);
+                if self.chunk_bootstrap_tile_ready(c) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn try_finish_world_bootstrap(&mut self) {
+        if self.world_ready {
+            return;
+        }
+        let px = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let pz = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        if self.bootstrap_ready_tiles(px, pz) == Self::bootstrap_tile_count() {
+            self.world_ready = true;
+        }
+    }
+
     fn update_streaming(&mut self) {
         let player_chunk_x = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let player_chunk_z = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let bootstrap = !self.world_ready;
+        let frame_over = if bootstrap {
+            0
+        } else {
+            self.delta.saturating_sub(TARGET_FRAME_TIME_US)
+        };
         let forward = self.camera.forward();
 
         let mut desired = Vec::new();
@@ -624,7 +743,11 @@ impl State {
                 .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        let mut request_budget = MAX_NEW_REQUESTS_PER_FRAME;
+        let mut request_budget = if bootstrap {
+            BOOTSTRAP_MAX_NEW_REQUESTS_PER_FRAME
+        } else {
+            MAX_NEW_REQUESTS_PER_FRAME
+        };
         for (coord, _, _) in desired.iter().copied() {
             if !self._world.has_chunk(coord) && !self.streamer.is_in_flight(coord) {
                 self.streamer.request_chunk(coord);
@@ -645,31 +768,42 @@ impl State {
                 self.section_meshes
                     .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
                 self.pending_ready.retain(|meshed| meshed.coord != coord);
+                self.remesh_priority.retain(|&c| c != coord);
+                self.remesh_neighbor.retain(|&c| c != coord);
+                self.remesh_priority_pending.remove(&coord);
+                self.remesh_neighbor_pending.remove(&coord);
+                self.streamer.clear_pending_remesh_snapshot(coord);
             }
         }
 
-        let ready = self.streamer.poll_ready(READY_DRAIN_BUDGET_PER_FRAME);
+        let drain_budget = if bootstrap {
+            BOOTSTRAP_READY_DRAIN_BUDGET_PER_FRAME
+        } else {
+            READY_DRAIN_BUDGET_PER_FRAME
+        };
+        let ready = self.streamer.poll_ready(drain_budget);
         for meshed in ready {
             if Self::chunk_within_keep_distance(meshed.coord, player_chunk_x, player_chunk_z) {
-                self.pending_ready.push_back(meshed);
+                if meshed.is_remesh {
+                    self.pending_ready.push_front(meshed);
+                } else {
+                    self.pending_ready.push_back(meshed);
+                }
             }
         }
-        while self.pending_ready.len() > MAX_PENDING_READY_CHUNKS {
-            self.pending_ready.pop_back();
-        }
+        self.trim_pending_ready_queue();
 
-        let frame_over = self.delta.saturating_sub(TARGET_FRAME_TIME_US);
-        let upload_budget_dynamic = if frame_over > 10_000 {
-            2
+        let (upload_budget_dynamic, upload_time_budget_dynamic) = if bootstrap {
+            (
+                BOOTSTRAP_MAX_CHUNK_UPLOADS_PER_FRAME,
+                BOOTSTRAP_UPLOAD_TIME_BUDGET_MS,
+            )
+        } else if frame_over > 10_000 {
+            (2, 1)
         } else if frame_over > 5_000 {
-            3
+            (3, MAX_UPLOAD_TIME_BUDGET_MS)
         } else {
-            MAX_CHUNK_UPLOADS_PER_FRAME
-        };
-        let upload_time_budget_dynamic = if frame_over > 10_000 {
-            1
-        } else {
-            MAX_UPLOAD_TIME_BUDGET_MS
+            (MAX_CHUNK_UPLOADS_PER_FRAME, MAX_UPLOAD_TIME_BUDGET_MS)
         };
 
         let upload_start = std::time::Instant::now();
@@ -687,7 +821,11 @@ impl State {
             if let Some(chunk) = meshed.chunk {
                 self._world.insert_chunk(chunk);
             }
-            self.upload_chunk_meshes(coord, meshed.section_meshes);
+            // Initial loads carry an empty mesh: drawing the worker's single-chunk mesh caused a
+            // full chunk-sized "shell" and flicker when remesh replaced it. GPU data comes from remesh.
+            if meshed.is_remesh {
+                self.upload_chunk_meshes(coord, meshed.section_meshes);
+            }
             uploaded_this_frame += 1;
 
             if !meshed.is_remesh {
@@ -711,22 +849,60 @@ impl State {
 
         let extra_priority = if uploaded_this_frame > 0 { 1 } else { 0 };
         let remesh_slowdown = if frame_over > 10_000 { 1 } else { 0 };
-        let pri_budget = (REMESH_PRIORITY_BUDGET_PER_FRAME + extra_priority).saturating_sub(remesh_slowdown);
+        let backlog = self.pending_ready.len() >= PENDING_BACKLOG_REMESH_THRESHOLD;
+        let extra_pri_backlog = if backlog {
+            PENDING_BACKLOG_EXTRA_PRI_REMESH
+        } else {
+            0
+        };
+        let extra_neighbor_backlog = if backlog {
+            PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH
+        } else {
+            0
+        };
+        let extra_pri_bootstrap = if bootstrap {
+            BOOTSTRAP_EXTRA_PRI_REMESH_PER_FRAME
+        } else {
+            0
+        };
+        let extra_neighbor_bootstrap = if bootstrap {
+            BOOTSTRAP_EXTRA_NEIGHBOR_REMESH_PER_FRAME
+        } else {
+            0
+        };
+        let pri_budget = (REMESH_PRIORITY_BUDGET_PER_FRAME
+            + extra_priority
+            + extra_pri_backlog
+            + extra_pri_bootstrap)
+            .saturating_sub(remesh_slowdown);
         for _ in 0..pri_budget {
             let Some(coord) = self.remesh_priority.pop_front() else {
                 break;
             };
-            self.remesh_priority_pending.remove(&coord);
-            self.dispatch_remesh_job(coord);
+            if self.dispatch_remesh_job(coord) {
+                self.remesh_priority_pending.remove(&coord);
+            } else {
+                // Keep pending and retry later instead of dropping the remesh request.
+                self.remesh_priority.push_back(coord);
+            }
         }
-        let neighbor_budget = NEIGHBOR_REMESH_BUDGET_PER_FRAME.saturating_sub(remesh_slowdown);
+        let neighbor_budget = (NEIGHBOR_REMESH_BUDGET_PER_FRAME
+            + extra_neighbor_backlog
+            + extra_neighbor_bootstrap)
+            .saturating_sub(remesh_slowdown);
         for _ in 0..neighbor_budget {
             let Some(coord) = self.remesh_neighbor.pop_front() else {
                 break;
             };
-            self.remesh_neighbor_pending.remove(&coord);
-            self.dispatch_remesh_job(coord);
+            if self.dispatch_remesh_job(coord) {
+                self.remesh_neighbor_pending.remove(&coord);
+            } else {
+                // Keep pending and retry later instead of dropping the remesh request.
+                self.remesh_neighbor.push_back(coord);
+            }
         }
+
+        self.try_finish_world_bootstrap();
     }
 
     fn upload_chunk_meshes(&mut self, coord: (i32, i32), section_meshes: Vec<(usize, mesh::MeshData)>) {
@@ -833,17 +1009,34 @@ impl State {
         }
 
         let stream_blocks = LOAD_DISTANCE_CHUNKS * SECTION_SIZE as i32;
-        let section_cull_blocks = (SECTION_SIZE as f32 * 15.0) as i32;
-        let hud_text = format!(
-            "FPS: {:.0}\nChunks loaded: {}\nVisible sections: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {} blocks\nMesh upload queue: {}",
-            self.fps_ema,
-            self._world.chunks().count(),
-            self.visible_sections_last_frame,
-            LOAD_DISTANCE_CHUNKS,
-            stream_blocks,
-            section_cull_blocks,
-            self.pending_ready.len(),
-        );
+        let section_cull_blocks = (SECTION_SIZE as f32 * self.section_draw_distance_chunks) as i32;
+        let px = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let pz = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let boot_n = self.bootstrap_ready_tiles(px, pz);
+        let boot_total = Self::bootstrap_tile_count();
+        let hud_text = if self.world_ready {
+            format!(
+                "FPS: {:.0}\nChunks loaded: {}\nVisible sections: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {:.1} chunks ({} blocks)\nMesh upload queue: {}\n[ / ] adjust draw distance",
+                self.fps_ema,
+                self._world.chunks().count(),
+                self.visible_sections_last_frame,
+                LOAD_DISTANCE_CHUNKS,
+                stream_blocks,
+                self.section_draw_distance_chunks,
+                section_cull_blocks,
+                self.pending_ready.len(),
+            )
+        } else {
+            format!(
+                "Loading world… {}/{} chunks ({}×{} around you)\nWASD locked until ready — mouse look OK\nFPS: {:.0}\nMesh upload queue: {}",
+                boot_n,
+                boot_total,
+                2 * BOOTSTRAP_CHUNK_RADIUS + 1,
+                2 * BOOTSTRAP_CHUNK_RADIUS + 1,
+                self.fps_ema,
+                self.pending_ready.len(),
+            )
+        };
         self.hud
             .prepare(&self.queue, &hud_text, self.config.width, self.config.height);
 
@@ -962,9 +1155,15 @@ impl ApplicationHandler for App {
                         .duration_since(state.last_frame_time)
                         .as_micros();
                     state.last_frame_time = current_time;
-                    state
-                        .camera_controller
-                        .update(state.delta, &mut state.camera);
+                    if state.world_ready {
+                        state
+                            .camera_controller
+                            .update(state.delta, &mut state.camera);
+                    } else {
+                        state
+                            .camera_controller
+                            .update_look_only(&mut state.camera);
+                    }
                     state.update();
                     state.window.request_redraw();
                     match state.render() {
@@ -1011,6 +1210,24 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::KeyP) => {
                             if key_state == ElementState::Pressed {
                                 state.set_mouse_capture(!state.mouse_captured);
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::BracketLeft) => {
+                            if key_state == ElementState::Pressed {
+                                state.section_draw_distance_chunks =
+                                    (state.section_draw_distance_chunks - 1.0).clamp(
+                                        MIN_SECTION_DRAW_DISTANCE_CHUNKS,
+                                        MAX_SECTION_DRAW_DISTANCE_CHUNKS,
+                                    );
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::BracketRight) => {
+                            if key_state == ElementState::Pressed {
+                                state.section_draw_distance_chunks =
+                                    (state.section_draw_distance_chunks + 1.0).clamp(
+                                        MIN_SECTION_DRAW_DISTANCE_CHUNKS,
+                                        MAX_SECTION_DRAW_DISTANCE_CHUNKS,
+                                    );
                             }
                         }
                         _ => {}

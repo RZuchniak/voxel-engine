@@ -308,9 +308,17 @@ fn emit_quad(
 
     // Approximate AO/brightness input inspired by stb_voxel_render's per-vertex lighting.
     let light = {
-        let wx = base_x as i32 + primary as i32;
-        let wy = base_y as i32 + secondary as i32;
-        let wz = base_z as i32 + tertiary as i32;
+        let (lx, ly, lz) = unpack_coords(
+            primary_axis,
+            secondary_axis,
+            tertiary_axis,
+            primary,
+            secondary,
+            tertiary,
+        );
+        let wx = base_x as i32 + lx as i32;
+        let wy = base_y as i32 + ly as i32;
+        let wz = base_z as i32 + lz as i32;
         let mut occluders = 0u32;
         for (dx, dy, dz) in [
             (1, 0, 0),

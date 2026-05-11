@@ -61,7 +61,7 @@ fn fs_main(
     let fog_end = sky.fog_params.y;
     let fog_strength = sky.fog_params.z;
     let dist = distance(world_pos, sky.camera_pos.xyz);
-    let fog = smoothstep(fog_start, fog_end, dist) * fog_strength;
+    let fog = pow(smoothstep(fog_start, fog_end, dist), 1.35) * fog_strength;
     let rgb = mix(lit_albedo, sky_color, fog);
     return vec4<f32>(rgb, albedo.a);
 }
