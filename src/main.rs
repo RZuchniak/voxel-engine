@@ -3,9 +3,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
 
-use cgmath::{EuclideanSpace, InnerSpace};
+use cgmath::InnerSpace;
 use wgpu::{FragmentState, util::DeviceExt};
+use web_time::Instant;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use winit::platform::web::WindowAttributesExtWebSys;
 use winit::{
@@ -18,47 +23,29 @@ use winit::{
 
 mod block;
 mod camera;
+mod cull;
 mod mesh;
+mod platform;
 mod source;
 mod streamer;
 mod texture;
 mod world;
 mod hud;
+#[cfg(target_arch = "wasm32")]
+mod web_api;
+#[cfg(target_arch = "wasm32")]
+mod worker_protocol;
+#[cfg(target_arch = "wasm32")]
+mod chunk_worker;
+#[cfg(target_arch = "wasm32")]
+mod worker_api;
+#[cfg(target_arch = "wasm32")]
+mod worker_bridge;
 
 #[cfg(not(target_arch = "wasm32"))]
 use source::AnvilSource;
-#[cfg(target_arch = "wasm32")]
-use source::PackedWebSource;
 use streamer::ChunkStreamer;
 use world::{MIN_SECTION_Y, SECTION_SIZE, World};
-
-const LOAD_DISTANCE_CHUNKS: i32 = 40;
-const UNLOAD_MARGIN_CHUNKS: i32 = 5;
-/// Full chunk mesh refresh (immediate border updates).
-const REMESH_PRIORITY_BUDGET_PER_FRAME: usize = 2;
-/// Neighbor border fixes — spread across frames to avoid Sodium-style spikes.
-const NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 1;
-const MAX_NEW_REQUESTS_PER_FRAME: usize = 6;
-const READY_DRAIN_BUDGET_PER_FRAME: usize = 64;
-const MAX_CHUNK_UPLOADS_PER_FRAME: usize = 4;
-const MAX_UPLOAD_TIME_BUDGET_MS: u128 = 1;
-/// Chebyshev radius (in chunks): all cells in the square must be loaded, meshed, and idle before play.
-const BOOTSTRAP_CHUNK_RADIUS: i32 = 8;
-const BOOTSTRAP_MAX_NEW_REQUESTS_PER_FRAME: usize = 32;
-const BOOTSTRAP_READY_DRAIN_BUDGET_PER_FRAME: usize = 256;
-const BOOTSTRAP_MAX_CHUNK_UPLOADS_PER_FRAME: usize = 24;
-const BOOTSTRAP_UPLOAD_TIME_BUDGET_MS: u128 = 12;
-const BOOTSTRAP_EXTRA_PRI_REMESH_PER_FRAME: usize = 8;
-const BOOTSTRAP_EXTRA_NEIGHBOR_REMESH_PER_FRAME: usize = 6;
-const MAX_PENDING_READY_CHUNKS: usize = 600;
-/// When many chunks finish loading together, raise remesh throughput so first paint uses neighbor-aware meshes.
-const PENDING_BACKLOG_REMESH_THRESHOLD: usize = 24;
-const PENDING_BACKLOG_EXTRA_PRI_REMESH: usize = 4;
-const PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH: usize = 3;
-const TARGET_FRAME_TIME_US: u128 = 33_333;
-const DEFAULT_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 40.0;
-const MIN_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 4.0;
-const MAX_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 64.0;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
@@ -70,7 +57,7 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
+pub(crate) struct Vertex {
     position: [f32; 3],
     uv: [f32; 2],
     tex_layer: u32,
@@ -141,19 +128,28 @@ impl UniformSky {
         Self {
             top_color: [0.42, 0.64, 0.90, 1.0],
             horizon_color: [0.72, 0.84, 0.98, 1.0],
-            // Runtime-updated from active section draw distance.
-            fog_params: [80.0, 120.0, 1.0, 0.0],
+            // Runtime-updated from active section draw distance (start, end, strength, _pad).
+            fog_params: [200.0, 480.0, 1.0, 0.0],
             camera_pos: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
 
-struct SectionMesh {
+struct SectionDrawRange {
+    first_index: u32,
+    index_count: u32,
+    section_world_y: i32,
+}
+
+struct ChunkGpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    section_draws: Vec<SectionDrawRange>,
     vertex_capacity: u64,
     index_capacity: u64,
+    bounds_min: cgmath::Vector3<f32>,
+    bounds_max: cgmath::Vector3<f32>,
+    surface_max_y: i32,
 }
 
 struct State {
@@ -166,7 +162,7 @@ struct State {
     _world: World,
     streamer: ChunkStreamer,
     pending_ready: VecDeque<streamer::MeshedChunk>,
-    section_meshes: HashMap<(i32, i32, i32), SectionMesh>,
+    chunk_meshes: HashMap<(i32, i32), ChunkGpuMesh>,
     remesh_priority: VecDeque<(i32, i32)>,
     remesh_neighbor: VecDeque<(i32, i32)>,
     remesh_priority_pending: HashSet<(i32, i32)>,
@@ -182,9 +178,10 @@ struct State {
     mouse_captured: bool,
     is_surface_configured: bool,
     delta: u128,
-    last_frame_time: std::time::Instant,
+    last_frame_time: Instant,
     depth_texture: wgpu::TextureView,
-    visible_sections_last_frame: usize,
+    visible_draw_calls_last_frame: usize,
+    visible_chunks_last_frame: usize,
     uploaded_meshes_last_frame: usize,
     profile_accum: u128,
     render_frame_index: u64,
@@ -193,6 +190,8 @@ struct State {
     section_draw_distance_chunks: f32,
     /// False until the neighborhood around the spawn has GPU meshes and no pending mesh work.
     world_ready: bool,
+    /// Bootstrap tiles we meshed (including empty/culled) so readiness does not stall forever.
+    bootstrap_mesh_attempted: HashSet<(i32, i32)>,
 }
 
 impl State {
@@ -202,6 +201,22 @@ impl State {
             return 256;
         }
         need.max(256).next_power_of_two()
+    }
+
+    fn mesh_chunk_with_neighbors(world: &World, coord: (i32, i32)) -> Vec<(usize, mesh::MeshData)> {
+        let mut local_world = World::new();
+        for c in [
+            coord,
+            (coord.0 + 1, coord.1),
+            (coord.0 - 1, coord.1),
+            (coord.0, coord.1 + 1),
+            (coord.0, coord.1 - 1),
+        ] {
+            if let Some(chunk) = world.chunk(c).cloned() {
+                local_world.insert_chunk(chunk);
+            }
+        }
+        mesh::mesh_chunk_surface(&local_world, coord)
     }
 
     /// High-priority remesh (arriving chunk). Supersedes a pending neighbor job for the same coord.
@@ -223,7 +238,7 @@ impl State {
     /// Drop completed initial loads from the back first; never discard remesh results (GPU may already
     /// have dropped `remesh_in_flight`, so losing a remesh upload leaves stale chunk-border geometry forever).
     fn trim_pending_ready_queue(&mut self) {
-        while self.pending_ready.len() > MAX_PENDING_READY_CHUNKS {
+        while self.pending_ready.len() > platform::MAX_PENDING_READY_CHUNKS {
             if let Some(back) = self.pending_ready.back() {
                 if !back.is_remesh {
                     self.pending_ready.pop_back();
@@ -265,22 +280,81 @@ impl State {
         true
     }
 
-    fn write_section_mesh(&mut self, key: (i32, i32, i32), mesh_data: &mesh::MeshData) {
-        let v_len = (mesh_data.vertices().len() * std::mem::size_of::<Vertex>()) as u64;
-        let i_len = (mesh_data.indices().len() * std::mem::size_of::<u32>()) as u64;
-        let v_slice = bytemuck::cast_slice(mesh_data.vertices());
-        let i_slice = bytemuck::cast_slice(mesh_data.indices());
-        let num_indices = mesh_data.indices().len() as u32;
+    fn mesh_loaded_chunk_during_bootstrap(&mut self, coord: (i32, i32)) {
+        let section_meshes = Self::mesh_chunk_with_neighbors(&self._world, coord);
+        if !section_meshes.is_empty() {
+            self.upload_chunk_meshes(coord, section_meshes);
+        }
+        self.bootstrap_mesh_attempted.insert(coord);
+        self.remesh_priority.retain(|&c| c != coord);
+        self.remesh_priority_pending.remove(&coord);
+    }
 
-        let reuse = self.section_meshes.remove(&key);
+    fn write_chunk_mesh(
+        &mut self,
+        coord: (i32, i32),
+        section_meshes: Vec<(usize, mesh::MeshData)>,
+    ) {
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut section_draws: Vec<SectionDrawRange> = Vec::new();
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+
+        for (section_index, mesh_data) in section_meshes {
+            if mesh_data.is_empty() {
+                continue;
+            }
+            let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+            min_y = min_y.min(section_world_y);
+            max_y = max_y.max(section_world_y + SECTION_SIZE as i32);
+
+            let base_vertex = vertices.len() as u32;
+            let first_index = indices.len() as u32;
+            vertices.extend_from_slice(mesh_data.vertices());
+            for &idx in mesh_data.indices() {
+                indices.push(base_vertex + idx);
+            }
+            section_draws.push(SectionDrawRange {
+                first_index,
+                index_count: mesh_data.indices().len() as u32,
+                section_world_y,
+            });
+        }
+
+        if section_draws.is_empty() {
+            self.chunk_meshes.remove(&coord);
+            return;
+        }
+
+        let surface_max_y = self
+            ._world
+            .chunk(coord)
+            .and_then(|c| c.max_nonempty_world_y())
+            .unwrap_or(max_y - 1);
+
+        let cx = coord.0 as f32 * SECTION_SIZE as f32;
+        let cz = coord.1 as f32 * SECTION_SIZE as f32;
+        let bounds_min = cgmath::Vector3::new(cx, min_y as f32, cz);
+        let bounds_max = cgmath::Vector3::new(cx + SECTION_SIZE as f32, max_y as f32, cz + SECTION_SIZE as f32);
+
+        let v_len = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
+        let i_len = (indices.len() * std::mem::size_of::<u32>()) as u64;
+        let v_slice = bytemuck::cast_slice(&vertices);
+        let i_slice = bytemuck::cast_slice(&indices);
+
+        let reuse = self.chunk_meshes.remove(&coord);
         if let Some(existing) = reuse {
             if existing.vertex_capacity >= v_len && existing.index_capacity >= i_len {
                 self.queue.write_buffer(&existing.vertex_buffer, 0, v_slice);
                 self.queue.write_buffer(&existing.index_buffer, 0, i_slice);
-                self.section_meshes.insert(
-                    key,
-                    SectionMesh {
-                        num_indices,
+                self.chunk_meshes.insert(
+                    coord,
+                    ChunkGpuMesh {
+                        section_draws,
+                        bounds_min,
+                        bounds_max,
+                        surface_max_y,
                         ..existing
                     },
                 );
@@ -292,7 +366,7 @@ impl State {
         let i_cap = Self::round_mesh_buffer_capacity(i_len);
 
         let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Section Vertex Buffer"),
+            label: Some("Chunk Vertex Buffer"),
             size: v_cap,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -300,21 +374,24 @@ impl State {
         self.queue.write_buffer(&vertex_buffer, 0, v_slice);
 
         let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Section Index Buffer"),
+            label: Some("Chunk Index Buffer"),
             size: i_cap,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.queue.write_buffer(&index_buffer, 0, i_slice);
 
-        self.section_meshes.insert(
-            key,
-            SectionMesh {
+        self.chunk_meshes.insert(
+            coord,
+            ChunkGpuMesh {
                 vertex_buffer,
                 index_buffer,
-                num_indices,
+                section_draws,
                 vertex_capacity: v_cap,
                 index_capacity: i_cap,
+                bounds_min,
+                bounds_max,
+                surface_max_y,
             },
         );
     }
@@ -326,62 +403,74 @@ impl State {
     ) -> bool {
         let dx = coord.0 - player_chunk_x;
         let dz = coord.1 - player_chunk_z;
-        dx.abs() <= LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
-            && dz.abs() <= LOAD_DISTANCE_CHUNKS + UNLOAD_MARGIN_CHUNKS
+        dx.abs() <= platform::load_distance_chunks() + platform::UNLOAD_MARGIN_CHUNKS
+            && dz.abs() <= platform::load_distance_chunks() + platform::UNLOAD_MARGIN_CHUNKS
     }
 
-    fn section_detail_ring(&self, section_coord: (i32, i32, i32)) -> u8 {
+    fn chunk_detail_ring(&self, chunk_coord: (i32, i32)) -> u8 {
         let camera_pos = self.camera.position();
         let center = cgmath::Vector3::new(
-            section_coord.0 as f32 * SECTION_SIZE as f32 + 8.0,
-            section_coord.1 as f32 + 8.0,
-            section_coord.2 as f32 * SECTION_SIZE as f32 + 8.0,
+            chunk_coord.0 as f32 * SECTION_SIZE as f32 + 8.0,
+            camera_pos.y,
+            chunk_coord.1 as f32 * SECTION_SIZE as f32 + 8.0,
         );
         let horizontal = cgmath::Vector2::new(center.x - camera_pos.x, center.z - camera_pos.z);
         let chunk_dist = horizontal.magnitude() / SECTION_SIZE as f32;
         let near = self.section_draw_distance_chunks * 0.5;
         let mid = self.section_draw_distance_chunks * 0.8;
         if chunk_dist <= near {
-            0 // near
+            0
         } else if chunk_dist <= mid {
-            1 // mid
+            1
         } else if chunk_dist <= self.section_draw_distance_chunks {
-            2 // far
+            2
         } else {
-            3 // culled
+            3
         }
     }
 
-    fn section_visible(&self, section_coord: (i32, i32, i32)) -> bool {
+    fn chunk_within_draw_distance(&self, chunk_coord: (i32, i32)) -> bool {
         let camera_pos = self.camera.position();
-        let forward = self.camera.forward();
-        let center = cgmath::Vector3::new(
-            section_coord.0 as f32 * SECTION_SIZE as f32 + 8.0,
-            section_coord.1 as f32 + 8.0,
-            section_coord.2 as f32 * SECTION_SIZE as f32 + 8.0,
-        );
-        let to_section = center - camera_pos.to_vec();
-        let horizontal = cgmath::Vector2::new(to_section.x, to_section.z);
-        let dist2 = horizontal.magnitude2();
-
-        // Hard horizontal distance cap to keep render distance independent of camera height.
+        let cx = chunk_coord.0 as f32 * SECTION_SIZE as f32 + 8.0;
+        let cz = chunk_coord.1 as f32 * SECTION_SIZE as f32 + 8.0;
+        let horizontal = cgmath::Vector2::new(cx - camera_pos.x, cz - camera_pos.z);
         let max_distance = SECTION_SIZE as f32 * self.section_draw_distance_chunks;
-        if dist2 > max_distance * max_distance {
+        horizontal.magnitude2() <= max_distance * max_distance
+    }
+
+    fn section_passes_surface_lod(
+        ring: u8,
+        section_world_y: i32,
+        surface_max_y: i32,
+    ) -> bool {
+        if ring < platform::FAR_DETAIL_RING {
+            return true;
+        }
+        let section_top = section_world_y + SECTION_SIZE as i32;
+        section_top >= surface_max_y - platform::SURFACE_LOD_DEPTH_BLOCKS
+    }
+
+    fn chunk_visible(&self, frustum: &cull::Frustum, chunk_coord: (i32, i32), mesh: &ChunkGpuMesh) -> bool {
+        if !self.chunk_within_draw_distance(chunk_coord) {
             return false;
         }
-
-        // Backface cone-ish culling: keep some leeway to avoid popping near edges.
-        let dir = to_section.normalize();
-        dir.dot(forward) > -0.25
+        frustum.intersects_aabb(mesh.bounds_min, mesh.bounds_max)
     }
 
-    async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
+    async fn new(window: Arc<Window>, world_source: Arc<dyn source::WorldSource>) -> Self {
+        let (width, height) = initial_surface_size(&window);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
-        window.set_cursor_visible(false);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+            window.set_cursor_visible(false);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            window.set_cursor_visible(true);
+        }
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -415,16 +504,20 @@ impl State {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width,
-            height: size.height,
+            width,
+            height,
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
 
-        let camera =
-            camera::Camera::new(config.width as f32 / config.height as f32, 45.0, 0.1, 1200.0);
+        let camera = camera::Camera::new(
+            width as f32 / height as f32,
+            45.0,
+            0.1,
+            1200.0,
+        );
 
         let mut camera_uniform = UniformCamera::new();
         camera_uniform.update(&camera);
@@ -537,14 +630,24 @@ impl State {
         let hud = hud::HudOverlay::new(&device, config.format);
 
         let world = World::new();
-        #[cfg(not(target_arch = "wasm32"))]
-        let world_source: Arc<dyn source::WorldSource> =
-            Arc::new(AnvilSource::new("saves/Basic_World"));
         #[cfg(target_arch = "wasm32")]
-        let world_source: Arc<dyn source::WorldSource> = Arc::new(PackedWebSource::new("world"));
+        let mut streamer = ChunkStreamer::new(world_source);
+        #[cfg(not(target_arch = "wasm32"))]
         let streamer = ChunkStreamer::new(world_source);
+        #[cfg(target_arch = "wasm32")]
+        if crate::platform::use_wasm_chunk_workers() {
+            if let Some(zip_bytes) = web_api::clone_init_zip() {
+                if let Err(err) = streamer.enable_workers(&zip_bytes) {
+                    web_sys::console::error_1(&JsValue::from_str(&format!(
+                        "Failed to start chunk workers: {err} — using main thread"
+                    )));
+                } else {
+                    web_api::set_load_status("Chunk workers started…");
+                }
+            }
+        }
         let pending_ready = VecDeque::new();
-        let section_meshes = HashMap::new();
+        let chunk_meshes = HashMap::new();
         let remesh_priority = VecDeque::new();
         let remesh_neighbor = VecDeque::new();
         let remesh_priority_pending = HashSet::new();
@@ -578,7 +681,7 @@ impl State {
             _world: world,
             streamer,
             pending_ready,
-            section_meshes,
+            chunk_meshes,
             remesh_priority,
             remesh_neighbor,
             remesh_priority_pending,
@@ -592,27 +695,29 @@ impl State {
             camera_bind_group,
             texture_bind_group: textures.bind_group,
             camera_controller,
-            mouse_captured: true,
+            mouse_captured: cfg!(not(target_arch = "wasm32")),
             is_surface_configured: false,
-            last_frame_time: std::time::Instant::now(),
+            last_frame_time: Instant::now(),
             delta: 0,
             depth_texture: depth_texture_view,
-            visible_sections_last_frame: 0,
+            visible_draw_calls_last_frame: 0,
+            visible_chunks_last_frame: 0,
             uploaded_meshes_last_frame: 0,
             profile_accum: 0,
             render_frame_index: 0,
             hud,
             fps_ema: 0.0,
-            section_draw_distance_chunks: DEFAULT_SECTION_DRAW_DISTANCE_CHUNKS,
+            section_draw_distance_chunks: platform::default_section_draw_distance_chunks(),
             world_ready: false,
+            bootstrap_mesh_attempted: HashSet::new(),
         };
     }
 
     fn update(&mut self) {
         self.update_streaming();
         let draw_distance_blocks = self.section_draw_distance_chunks * SECTION_SIZE as f32;
-        // Keep camera far plane beyond draw distance so distance culling, not projection clipping, is the limiter.
-        self.camera.set_far_plane((draw_distance_blocks * 1.4).max(600.0));
+        // Tight far plane improves depth precision; fog hides the cutoff before the hard cull radius.
+        self.camera.set_far_plane((draw_distance_blocks * 1.08).max(400.0));
         let inst_fps = if self.delta > 0 {
             1_000_000.0 / self.delta as f32
         } else {
@@ -632,8 +737,8 @@ impl State {
         let cp = self.camera.position();
         self.sky_uniform.camera_pos = [cp.x, cp.y, cp.z, 0.0];
         self.sky_uniform.fog_params = [
-            draw_distance_blocks * 0.72,
-            draw_distance_blocks * 1.02,
+            draw_distance_blocks * 0.42,
+            draw_distance_blocks * 0.94,
             1.0,
             0.0,
         ];
@@ -642,8 +747,9 @@ impl State {
         self.profile_accum += self.delta;
         if self.profile_accum > 1_000_000 {
             println!(
-                "profile visible_sections={} uploaded_meshes={} loaded_chunks={}",
-                self.visible_sections_last_frame,
+                "profile visible_draws={} visible_chunks={} uploaded_meshes={} loaded_chunks={}",
+                self.visible_draw_calls_last_frame,
+                self.visible_chunks_last_frame,
                 self.uploaded_meshes_last_frame,
                 self._world.chunks().count()
             );
@@ -652,15 +758,13 @@ impl State {
     }
 
     fn chunk_has_any_gpu_section(&self, coord: (i32, i32)) -> bool {
-        self.section_meshes
-            .keys()
-            .any(|(cx, _, cz)| *cx == coord.0 && *cz == coord.1)
+        self.chunk_meshes.contains_key(&coord)
     }
 
     fn chunk_needs_gpu_mesh(&self, coord: (i32, i32)) -> bool {
         self._world
             .chunk(coord)
-            .is_some_and(|ch| ch.needs_rendered_mesh())
+            .is_some_and(|ch| ch.needs_surface_mesh())
     }
 
     /// Spawn neighborhood tile: data present, optional GPU mesh if non-empty, and no in-flight mesh work.
@@ -668,30 +772,34 @@ impl State {
         if !self._world.has_chunk(coord) {
             return false;
         }
-        if self.streamer.is_in_flight(coord) || self.streamer.is_remesh_in_flight(coord) {
-            return false;
-        }
-        if self.remesh_priority_pending.contains(&coord) || self.remesh_neighbor_pending.contains(&coord) {
-            return false;
-        }
-        if self.pending_ready.iter().any(|m| m.coord == coord) {
-            return false;
+        if self.world_ready {
+            if self.streamer.is_in_flight(coord) || self.streamer.is_remesh_in_flight(coord) {
+                return false;
+            }
+            if self.remesh_priority_pending.contains(&coord)
+                || self.remesh_neighbor_pending.contains(&coord)
+            {
+                return false;
+            }
+            if self.pending_ready.iter().any(|m| m.coord == coord) {
+                return false;
+            }
         }
         if self.chunk_needs_gpu_mesh(coord) && !self.chunk_has_any_gpu_section(coord) {
-            return false;
+            return self.bootstrap_mesh_attempted.contains(&coord);
         }
         true
     }
 
     fn bootstrap_tile_count() -> usize {
-        let w = (2 * BOOTSTRAP_CHUNK_RADIUS + 1) as usize;
+        let w = (2 * platform::bootstrap_chunk_radius() + 1) as usize;
         w * w
     }
 
     fn bootstrap_ready_tiles(&self, player_chunk_x: i32, player_chunk_z: i32) -> usize {
         let mut n = 0usize;
-        for dz in -BOOTSTRAP_CHUNK_RADIUS..=BOOTSTRAP_CHUNK_RADIUS {
-            for dx in -BOOTSTRAP_CHUNK_RADIUS..=BOOTSTRAP_CHUNK_RADIUS {
+        for dz in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
+            for dx in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
                 let c = (player_chunk_x + dx, player_chunk_z + dz);
                 if self.chunk_bootstrap_tile_ready(c) {
                     n += 1;
@@ -719,13 +827,18 @@ impl State {
         let frame_over = if bootstrap {
             0
         } else {
-            self.delta.saturating_sub(TARGET_FRAME_TIME_US)
+            self.delta.saturating_sub(platform::TARGET_FRAME_TIME_US)
         };
         let forward = self.camera.forward();
 
+        let stream_radius = if bootstrap {
+            platform::bootstrap_chunk_radius()
+        } else {
+            platform::load_distance_chunks()
+        };
         let mut desired = Vec::new();
-        for dz in -LOAD_DISTANCE_CHUNKS..=LOAD_DISTANCE_CHUNKS {
-            for dx in -LOAD_DISTANCE_CHUNKS..=LOAD_DISTANCE_CHUNKS {
+        for dz in -stream_radius..=stream_radius {
+            for dx in -stream_radius..=stream_radius {
                 let cx = player_chunk_x + dx;
                 let cz = player_chunk_z + dz;
                 let dist2 = dx * dx + dz * dz;
@@ -744,16 +857,27 @@ impl State {
         });
 
         let mut request_budget = if bootstrap {
-            BOOTSTRAP_MAX_NEW_REQUESTS_PER_FRAME
+            platform::bootstrap_max_new_requests_per_frame()
         } else {
-            MAX_NEW_REQUESTS_PER_FRAME
+            platform::max_new_requests_per_frame()
         };
+        if bootstrap {
+            for dz in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
+                for dx in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
+                    let coord = (player_chunk_x + dx, player_chunk_z + dz);
+                    if !self._world.has_chunk(coord) && self.streamer.is_worker_load_busy(coord) {
+                        self.streamer.release_stale_worker_load(coord);
+                    }
+                }
+            }
+        }
         for (coord, _, _) in desired.iter().copied() {
             if !self._world.has_chunk(coord) && !self.streamer.is_in_flight(coord) {
-                self.streamer.request_chunk(coord);
-                request_budget -= 1;
-                if request_budget == 0 {
-                    break;
+                if self.streamer.request_chunk(coord, bootstrap) {
+                    request_budget -= 1;
+                    if request_budget == 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -765,8 +889,7 @@ impl State {
         for coord in loaded {
             if !Self::chunk_within_keep_distance(coord, player_chunk_x, player_chunk_z) {
                 self._world.remove_chunk(coord);
-                self.section_meshes
-                    .retain(|(chunk_x, _, chunk_z), _| *chunk_x != coord.0 || *chunk_z != coord.1);
+                self.chunk_meshes.remove(&coord);
                 self.pending_ready.retain(|meshed| meshed.coord != coord);
                 self.remesh_priority.retain(|&c| c != coord);
                 self.remesh_neighbor.retain(|&c| c != coord);
@@ -777,9 +900,9 @@ impl State {
         }
 
         let drain_budget = if bootstrap {
-            BOOTSTRAP_READY_DRAIN_BUDGET_PER_FRAME
+            platform::bootstrap_ready_drain_budget_per_frame()
         } else {
-            READY_DRAIN_BUDGET_PER_FRAME
+            platform::READY_DRAIN_BUDGET_PER_FRAME
         };
         let ready = self.streamer.poll_ready(drain_budget);
         for meshed in ready {
@@ -795,18 +918,26 @@ impl State {
 
         let (upload_budget_dynamic, upload_time_budget_dynamic) = if bootstrap {
             (
-                BOOTSTRAP_MAX_CHUNK_UPLOADS_PER_FRAME,
-                BOOTSTRAP_UPLOAD_TIME_BUDGET_MS,
+                platform::bootstrap_max_chunk_uploads_per_frame(),
+                u128::MAX,
+            )
+        } else if cfg!(target_arch = "wasm32") {
+            (
+                platform::max_chunk_uploads_per_frame(),
+                platform::max_upload_time_budget_ms(),
             )
         } else if frame_over > 10_000 {
             (2, 1)
         } else if frame_over > 5_000 {
-            (3, MAX_UPLOAD_TIME_BUDGET_MS)
+            (3, platform::max_upload_time_budget_ms())
         } else {
-            (MAX_CHUNK_UPLOADS_PER_FRAME, MAX_UPLOAD_TIME_BUDGET_MS)
+            (
+                platform::max_chunk_uploads_per_frame(),
+                platform::max_upload_time_budget_ms(),
+            )
         };
 
-        let upload_start = std::time::Instant::now();
+        let upload_start = Instant::now();
         let mut uploaded_this_frame = 0usize;
         while uploaded_this_frame < upload_budget_dynamic
             && upload_start.elapsed().as_millis() < upload_time_budget_dynamic
@@ -821,17 +952,19 @@ impl State {
             if let Some(chunk) = meshed.chunk {
                 self._world.insert_chunk(chunk);
             }
-            // Initial loads carry an empty mesh: drawing the worker's single-chunk mesh caused a
-            // full chunk-sized "shell" and flicker when remesh replaced it. GPU data comes from remesh.
+            let had_initial_meshes = !meshed.is_remesh && !meshed.section_meshes.is_empty();
             if meshed.is_remesh {
                 self.upload_chunk_meshes(coord, meshed.section_meshes);
+            } else if bootstrap {
+                self.mesh_loaded_chunk_during_bootstrap(coord);
+            } else if had_initial_meshes {
+                self.upload_chunk_meshes(coord, meshed.section_meshes);
+            } else {
+                self.enqueue_priority_remesh(coord);
             }
             uploaded_this_frame += 1;
 
-            if !meshed.is_remesh {
-                // Rebuild the arriving chunk and orthogonal neighbors so border faces are culled
-                // correctly once adjacent chunks become available.
-                self.enqueue_priority_remesh(coord);
+            if !meshed.is_remesh && self.world_ready {
                 let neighbors = [
                     (coord.0 + 1, coord.1),
                     (coord.0 - 1, coord.1),
@@ -847,34 +980,61 @@ impl State {
         }
         self.uploaded_meshes_last_frame = uploaded_this_frame;
 
+        if bootstrap {
+            let mut need_mesh: Vec<((i32, i32), i32)> = Vec::new();
+            for dz in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
+                for dx in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
+                    let coord = (player_chunk_x + dx, player_chunk_z + dz);
+                    if self._world.has_chunk(coord)
+                        && self.chunk_needs_gpu_mesh(coord)
+                        && !self.chunk_has_any_gpu_section(coord)
+                        && !self.bootstrap_mesh_attempted.contains(&coord)
+                    {
+                        need_mesh.push((coord, dx * dx + dz * dz));
+                    }
+                }
+            }
+            need_mesh.sort_by_key(|(_, dist2)| *dist2);
+            for (coord, _) in need_mesh
+                .into_iter()
+                .take(platform::bootstrap_max_chunk_uploads_per_frame())
+            {
+                self.mesh_loaded_chunk_during_bootstrap(coord);
+            }
+        }
+
         let extra_priority = if uploaded_this_frame > 0 { 1 } else { 0 };
         let remesh_slowdown = if frame_over > 10_000 { 1 } else { 0 };
-        let backlog = self.pending_ready.len() >= PENDING_BACKLOG_REMESH_THRESHOLD;
+        let backlog = self.pending_ready.len() >= platform::PENDING_BACKLOG_REMESH_THRESHOLD;
         let extra_pri_backlog = if backlog {
-            PENDING_BACKLOG_EXTRA_PRI_REMESH
+            platform::PENDING_BACKLOG_EXTRA_PRI_REMESH
         } else {
             0
         };
         let extra_neighbor_backlog = if backlog {
-            PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH
+            platform::PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH
         } else {
             0
         };
         let extra_pri_bootstrap = if bootstrap {
-            BOOTSTRAP_EXTRA_PRI_REMESH_PER_FRAME
+            platform::bootstrap_extra_pri_remesh_per_frame()
         } else {
             0
         };
         let extra_neighbor_bootstrap = if bootstrap {
-            BOOTSTRAP_EXTRA_NEIGHBOR_REMESH_PER_FRAME
+            platform::bootstrap_extra_neighbor_remesh_per_frame()
         } else {
             0
         };
-        let pri_budget = (REMESH_PRIORITY_BUDGET_PER_FRAME
-            + extra_priority
-            + extra_pri_backlog
-            + extra_pri_bootstrap)
-            .saturating_sub(remesh_slowdown);
+        let pri_budget = if bootstrap {
+            0
+        } else {
+            (platform::REMESH_PRIORITY_BUDGET_PER_FRAME
+                + extra_priority
+                + extra_pri_backlog
+                + extra_pri_bootstrap)
+                .saturating_sub(remesh_slowdown)
+        };
         for _ in 0..pri_budget {
             let Some(coord) = self.remesh_priority.pop_front() else {
                 break;
@@ -886,11 +1046,14 @@ impl State {
                 self.remesh_priority.push_back(coord);
             }
         }
-        let neighbor_budget = (NEIGHBOR_REMESH_BUDGET_PER_FRAME
+        let neighbor_budget = (platform::NEIGHBOR_REMESH_BUDGET_PER_FRAME
             + extra_neighbor_backlog
             + extra_neighbor_bootstrap)
             .saturating_sub(remesh_slowdown);
         for _ in 0..neighbor_budget {
+            if bootstrap {
+                break;
+            }
             let Some(coord) = self.remesh_neighbor.pop_front() else {
                 break;
             };
@@ -906,25 +1069,7 @@ impl State {
     }
 
     fn upload_chunk_meshes(&mut self, coord: (i32, i32), section_meshes: Vec<(usize, mesh::MeshData)>) {
-        let mut incoming_keys: HashSet<(i32, i32, i32)> = HashSet::new();
-        for (section_index, _) in &section_meshes {
-            let section_world_y = (*section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
-            incoming_keys.insert((coord.0, section_world_y, coord.1));
-        }
-
-        self.section_meshes.retain(|key, _| {
-            if key.0 == coord.0 && key.2 == coord.1 {
-                incoming_keys.contains(key)
-            } else {
-                true
-            }
-        });
-
-        for (section_index, mesh_data) in section_meshes {
-            let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
-            let key = (coord.0, section_world_y, coord.1);
-            self.write_section_mesh(key, &mesh_data);
-        }
+        self.write_chunk_mesh(coord, section_meshes);
     }
 
     fn set_mouse_capture(&mut self, captured: bool) {
@@ -961,7 +1106,15 @@ impl State {
             });
 
         self.render_frame_index = self.render_frame_index.wrapping_add(1);
-        self.visible_sections_last_frame = 0;
+        self.visible_draw_calls_last_frame = 0;
+        self.visible_chunks_last_frame = 0;
+
+        let view_proj = self.camera.build_view_projection_matrix();
+        let frustum = cull::Frustum::from_view_projection(&view_proj);
+        let player_chunk_x = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let player_chunk_z = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
+        let draw_radius = self.section_draw_distance_chunks.ceil() as i32 + 1;
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -995,20 +1148,41 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
-            for (coord, section) in &self.section_meshes {
-                if !self.section_visible(*coord) {
-                    continue;
+
+            for dz in -draw_radius..=draw_radius {
+                for dx in -draw_radius..=draw_radius {
+                    let chunk_coord = (player_chunk_x + dx, player_chunk_z + dz);
+                    let Some(mesh) = self.chunk_meshes.get(&chunk_coord) else {
+                        continue;
+                    };
+                    if !self.chunk_visible(&frustum, chunk_coord, mesh) {
+                        continue;
+                    }
+                    let ring = self.chunk_detail_ring(chunk_coord);
+                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+                    let mut chunk_drew = false;
+                    for draw in &mesh.section_draws {
+                        if !Self::section_passes_surface_lod(ring, draw.section_world_y, mesh.surface_max_y) {
+                            continue;
+                        }
+                        render_pass.draw_indexed(
+                            draw.first_index..draw.first_index + draw.index_count,
+                            0,
+                            0..1,
+                        );
+                        self.visible_draw_calls_last_frame += 1;
+                        chunk_drew = true;
+                    }
+                    if chunk_drew {
+                        self.visible_chunks_last_frame += 1;
+                    }
                 }
-                let _ring = self.section_detail_ring(*coord);
-                self.visible_sections_last_frame += 1;
-                render_pass.set_vertex_buffer(0, section.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(section.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..section.num_indices, 0, 0..1);
             }
         }
 
-        let stream_blocks = LOAD_DISTANCE_CHUNKS * SECTION_SIZE as i32;
+        let stream_blocks = platform::load_distance_chunks() * SECTION_SIZE as i32;
         let section_cull_blocks = (SECTION_SIZE as f32 * self.section_draw_distance_chunks) as i32;
         let px = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let pz = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
@@ -1016,25 +1190,35 @@ impl State {
         let boot_total = Self::bootstrap_tile_count();
         let hud_text = if self.world_ready {
             format!(
-                "FPS: {:.0}\nChunks loaded: {}\nVisible sections: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {:.1} chunks ({} blocks)\nMesh upload queue: {}\n[ / ] adjust draw distance",
+                "FPS: {:.0}\nChunks loaded: {}\nVisible chunks: {}\nSection draws: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {:.1} chunks ({} blocks)\nMesh upload queue: {}\n[ / ] adjust draw distance",
                 self.fps_ema,
                 self._world.chunks().count(),
-                self.visible_sections_last_frame,
-                LOAD_DISTANCE_CHUNKS,
+                self.visible_chunks_last_frame,
+                self.visible_draw_calls_last_frame,
+                platform::load_distance_chunks(),
                 stream_blocks,
                 self.section_draw_distance_chunks,
                 section_cull_blocks,
                 self.pending_ready.len(),
             )
         } else {
+            let worker_line = self
+                .streamer
+                .worker_status()
+                .map(|(ready, total, queued, in_flight)| {
+                    format!("\nWorkers: {ready}/{total} · {queued} queued · {in_flight} in flight")
+                })
+                .unwrap_or_else(|| "\nLoader: main thread".to_string());
             format!(
-                "Loading world… {}/{} chunks ({}×{} around you)\nWASD locked until ready — mouse look OK\nFPS: {:.0}\nMesh upload queue: {}",
+                "Loading world… {}/{} chunks ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nWASD locked until ready — mouse look OK\nFPS: {:.0}",
                 boot_n,
                 boot_total,
-                2 * BOOTSTRAP_CHUNK_RADIUS + 1,
-                2 * BOOTSTRAP_CHUNK_RADIUS + 1,
-                self.fps_ema,
+                2 * platform::bootstrap_chunk_radius() + 1,
+                2 * platform::bootstrap_chunk_radius() + 1,
+                self._world.chunks().count(),
                 self.pending_ready.len(),
+                worker_line,
+                self.fps_ema,
             )
         };
         self.hud
@@ -1095,62 +1279,206 @@ impl State {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static READY_STATE: RefCell<Option<State>> = RefCell::new(None);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn take_ready_state() -> Option<State> {
+    READY_STATE.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_ready_state(state: State) {
+    READY_STATE.with(|slot| {
+        *slot.borrow_mut() = Some(state);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn create_wasm_window(event_loop: &ActiveEventLoop) -> Result<Window, winit::error::OsError> {
+    use wasm_bindgen::JsCast;
+
+    web_api::prepare_canvas_for_game();
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .expect("document");
+    let canvas = document
+        .get_element_by_id("voxel-canvas")
+        .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+    event_loop.create_window(
+        WindowAttributes::default()
+            .with_title("Voxel Engine")
+            .with_canvas(canvas)
+            .with_visible(true),
+    )
+}
+
+fn initial_surface_size(window: &Window) -> (u32, u32) {
+    let size = window.inner_size();
+    if size.width > 0 && size.height > 0 {
+        return (size.width, size.height);
+    }
+    #[cfg(target_arch = "wasm32")]
+    if let Some((width, height)) = web_api::canvas_pixel_size() {
+        return (width, height);
+    }
+    (800, 600)
+}
+
 struct App {
+    #[cfg(target_arch = "wasm32")]
+    window: Option<Arc<Window>>,
     state: Option<State>,
+    #[cfg(target_arch = "wasm32")]
+    state_loading: bool,
+    #[cfg(target_arch = "wasm32")]
+    needs_redraw: bool,
 }
 
 impl App {
     fn new() -> Self {
-        Self { state: None }
+        Self {
+            #[cfg(target_arch = "wasm32")]
+            window: None,
+            state: None,
+            #[cfg(target_arch = "wasm32")]
+            state_loading: false,
+            #[cfg(target_arch = "wasm32")]
+            needs_redraw: false,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn try_start_pending_world(&mut self, event_loop: &ActiveEventLoop) {
+        if web_api::take_reset_renderer_loading() {
+            self.state_loading = false;
+        }
+
+        if self.state.is_some() {
+            return;
+        }
+
+        if let Some(mut state) = take_ready_state() {
+            self.state_loading = false;
+            web_api::hide_load_overlay();
+            let (width, height) = initial_surface_size(&state.window);
+            state.resize(width, height);
+            self.state = Some(state);
+            self.needs_redraw = true;
+            web_api::kick_event_loop();
+            return;
+        }
+
+        if self.state_loading {
+            return;
+        }
+
+        let Some(world_source) = web_api::take_pending_world() else {
+            return;
+        };
+
+        let window = if let Some(window) = self.window.clone() {
+            window
+        } else {
+            let window = match create_wasm_window(event_loop) {
+                Ok(window) => Arc::new(window),
+                Err(err) => {
+                    web_api::set_pending_world(world_source);
+                    web_api::set_load_error(&format!("Failed to create window: {err}"));
+                    web_api::show_startup_menu("Ready.");
+                    return;
+                }
+            };
+            self.window = Some(window.clone());
+            window
+        };
+
+        self.state_loading = true;
+        web_api::set_load_status("Starting WebGPU…");
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut state = State::new(window.clone(), world_source).await;
+            let (width, height) = initial_surface_size(&window);
+            state.resize(width, height);
+            set_ready_state(state);
+            web_api::kick_event_loop();
+        });
     }
 }
 
 impl ApplicationHandler for App {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.try_start_pending_world(event_loop);
+            if self.state.is_none() {
+                web_api::kick_event_loop();
+            } else if self.needs_redraw {
+                web_api::kick_event_loop();
+            }
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_arch = "wasm32")]
-        let attributes = {
-            use wasm_bindgen::JsCast;
-            let window = web_sys::window().expect("web window");
-            let document = window.document().expect("document");
-            let canvas = document
-                .get_element_by_id("voxel-canvas")
-                .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok());
-            WindowAttributes::default()
-                .with_title("Voxel Engine")
-                .with_canvas(canvas)
-                .with_visible(true)
-        };
+        {
+            let _ = event_loop;
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let attributes = WindowAttributes::default()
             .with_title("Voxel Engine")
             .with_visible(false);
+        #[cfg(not(target_arch = "wasm32"))]
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
                 .unwrap(),
         );
-        let mut state = pollster::block_on(State::new(window));
         #[cfg(not(target_arch = "wasm32"))]
+        {
+        let world_source: Arc<dyn source::WorldSource> =
+            Arc::new(AnvilSource::new("saves/Basic_World"));
+        let mut state = pollster::block_on(State::new(window.clone(), world_source));
         let window = Arc::clone(&state.window);
-        #[cfg(not(target_arch = "wasm32"))]
         state.window.set_maximized(true);
         let size = state.window.inner_size();
         state.resize(size.width, size.height);
         state.update();
         state.render().unwrap();
-        #[cfg(not(target_arch = "wasm32"))]
         window.set_visible(true);
         self.state = Some(state);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(target_arch = "wasm32")]
+        if self.needs_redraw {
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
+                self.needs_redraw = false;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
+            WindowEvent::Resized(size) => {
+                if let Some(state) = self.state.as_mut() {
+                    state.resize(size.width, size.height);
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(state) = self.state.as_mut() {
-                    let current_time = std::time::Instant::now();
+                    let current_time = Instant::now();
                     state.delta = current_time
                         .duration_since(state.last_frame_time)
                         .as_micros();
@@ -1174,6 +1502,26 @@ impl ApplicationHandler for App {
                             let size = state.window.inner_size();
                             state.resize(size.width, size.height);
                         }
+                    }
+                }
+            }
+            WindowEvent::Focused(focused) => {
+                if focused && self.state.is_some() {
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button,
+                ..
+            } if button_state == ElementState::Pressed && button == MouseButton::Left => {
+                #[cfg(target_arch = "wasm32")]
+                if let Some(state) = self.state.as_mut() {
+                    if !state.mouse_captured {
+                        state.set_mouse_capture(true);
+                        web_api::hide_click_to_play();
                     }
                 }
             }
@@ -1216,8 +1564,8 @@ impl ApplicationHandler for App {
                             if key_state == ElementState::Pressed {
                                 state.section_draw_distance_chunks =
                                     (state.section_draw_distance_chunks - 1.0).clamp(
-                                        MIN_SECTION_DRAW_DISTANCE_CHUNKS,
-                                        MAX_SECTION_DRAW_DISTANCE_CHUNKS,
+                                        platform::MIN_SECTION_DRAW_DISTANCE_CHUNKS,
+                                        platform::max_section_draw_distance_chunks(),
                                     );
                             }
                         }
@@ -1225,8 +1573,8 @@ impl ApplicationHandler for App {
                             if key_state == ElementState::Pressed {
                                 state.section_draw_distance_chunks =
                                     (state.section_draw_distance_chunks + 1.0).clamp(
-                                        MIN_SECTION_DRAW_DISTANCE_CHUNKS,
-                                        MAX_SECTION_DRAW_DISTANCE_CHUNKS,
+                                        platform::MIN_SECTION_DRAW_DISTANCE_CHUNKS,
+                                        platform::max_section_draw_distance_chunks(),
                                     );
                             }
                         }
@@ -1268,8 +1616,13 @@ fn main() {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
+#[wasm_bindgen(start)]
 pub fn wasm_start() {
+    // Dedicated workers import the same WASM bundle; they must not start winit.
+    if web_sys::window().is_none() {
+        return;
+    }
+    web_api::init_web_logging();
     wasm_bindgen_futures::spawn_local(async {
         run().await;
     });

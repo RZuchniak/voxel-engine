@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voxel Engine</title>
+    <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="z" />
+    <link data-trunk rel="copy-dir" href="web" />
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #1a1f2e;
+            color: #e8ecf4;
+            font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+        }
+        #voxel-canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        #voxel-canvas.hidden { display: none; }
+        #startup-menu {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at top, #243049 0%, #121722 70%);
+            z-index: 10;
+        }
+        #startup-menu.hidden { display: none; }
+        .panel {
+            width: min(520px, 92vw);
+            padding: 2rem;
+            border-radius: 12px;
+            background: rgba(15, 20, 32, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+        p { color: #aeb8cb; line-height: 1.5; margin-bottom: 1rem; }
+        label { display: block; font-size: 0.85rem; color: #c5cee0; margin-bottom: 0.35rem; }
+        input[type="file"], input[type="url"] {
+            width: 100%;
+            margin-bottom: 1rem;
+            padding: 0.55rem 0.65rem;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: #0c101a;
+            color: #e8ecf4;
+        }
+        button {
+            width: 100%;
+            padding: 0.7rem 1rem;
+            border: none;
+            border-radius: 8px;
+            background: #4f7cff;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button:hover { background: #3d6aef; }
+        button:disabled { opacity: 0.55; cursor: not-allowed; }
+        #menu-status {
+            margin-top: 1rem;
+            min-height: 1.25rem;
+            font-size: 0.9rem;
+            color: #9fb0d0;
+        }
+        #menu-error { color: #ff8a8a; margin-top: 0.5rem; min-height: 1rem; }
+        #click-to-play {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.35);
+            color: white;
+            font-size: 1.25rem;
+            z-index: 5;
+            pointer-events: none;
+        }
+        #click-to-play.hidden { display: none; }
+        #load-overlay {
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            padding: 0.75rem 1rem;
+            background: rgba(8, 10, 16, 0.92);
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            z-index: 30;
+        }
+        #load-overlay.hidden { display: none; }
+        #load-status { color: #9fb0d0; font-size: 0.9rem; }
+        #load-error { color: #ff8a8a; font-size: 0.9rem; margin-top: 0.25rem; min-height: 1rem; }
+        .hint { font-size: 0.82rem; color: #8a96ad; margin-top: 0.75rem; }
+    </style>
+</head>
+<body>
+    <div id="startup-menu">
+        <div class="panel">
+            <h1>Voxel Engine</h1>
+            <p>Load a Java Edition world by uploading a zip of your save folder (must contain a <code>region/</code> directory with <code>.mca</code> files).</p>
+            <div id="webgpu-warning" class="hidden" style="color:#ffb4b4;margin-bottom:1rem;"></div>
+            <label for="world-file">Upload world zip</label>
+            <input id="world-file" type="file" accept=".zip,application/zip" />
+            <label for="world-url">Or load from URL</label>
+            <input id="world-url" type="url" placeholder="https://example.com/my-world.zip" />
+            <button id="load-url-btn" type="button">Load from URL</button>
+            <div id="menu-status">Waiting for WASM…</div>
+            <div id="menu-error"></div>
+            <p class="hint">Tip: zip your world folder (e.g. <code>saves/Basic_World</code>) so paths look like <code>Basic_World/region/r.0.0.mca</code>.</p>
+        </div>
+    </div>
+    <div id="click-to-play" class="hidden">Click to play · WASD move · Mouse look · P release cursor</div>
+    <canvas id="voxel-canvas" class="hidden"></canvas>
+    <div id="load-overlay" class="hidden">
+        <div id="load-status"></div>
+        <div id="load-error"></div>
+    </div>
+    <script type="module">
+        function loadMenu() {
+            if (window.__voxelMenuLoaded) return;
+            window.__voxelMenuLoaded = true;
+            import("/web/menu.js");
+        }
+        if (window.wasmBindings?.set_world_from_zip) {
+            loadMenu();
+        } else {
+            window.addEventListener("TrunkApplicationStarted", loadMenu, { once: true });
+        }
+    </script>
+</body>
+</html>

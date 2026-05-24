@@ -26,6 +26,7 @@ impl BlockId {
     pub const SNOW_BLOCK: BlockId = BlockId(13);
     pub const NETHERRACK: BlockId = BlockId(14);
     pub const END_STONE: BlockId = BlockId(15);
+    pub const ICE: BlockId = BlockId(16);
 
     #[inline]
     pub fn info(self) -> &'static BlockInfo {
@@ -98,4 +99,5 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("snow_block", true, true, [14, 14, 14]),
     info("netherrack", true, true, [15, 15, 15]),
     info("end_stone", true, true, [16, 16, 16]),
+    info("ice", true, false, [17, 17, 17]),
 ];

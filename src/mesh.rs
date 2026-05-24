@@ -29,6 +29,26 @@ impl MeshData {
         &self.indices
     }
 
+    pub fn from_wire_bytes(vertices: Vec<u8>, indices: Vec<u8>) -> Option<Self> {
+        let vertex_size = std::mem::size_of::<Vertex>();
+        if vertices.len() % vertex_size != 0 {
+            return None;
+        }
+        if indices.len() % std::mem::size_of::<u32>() != 0 {
+            return None;
+        }
+        let vertices = bytemuck::try_cast_vec(vertices).ok()?;
+        let indices = bytemuck::try_cast_vec(indices).ok()?;
+        Some(Self { vertices, indices })
+    }
+
+    pub fn to_wire_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            bytemuck::cast_slice(&self.vertices).to_vec(),
+            bytemuck::cast_slice(&self.indices).to_vec(),
+        )
+    }
+
     fn push_quad(&mut self, corners: [Vertex; 4]) {
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&corners);
@@ -119,6 +139,29 @@ pub fn mesh_section(world: &World, chunk_coord: (i32, i32), section_index: usize
     } else {
         Some(mesh_data)
     }
+}
+
+/// Mesh only sections near the chunk surface (skips caves and deep underground).
+pub fn mesh_chunk_surface(world: &World, chunk_coord: (i32, i32)) -> Vec<(usize, MeshData)> {
+    use crate::world::Chunk;
+
+    let Some(chunk) = world.chunk(chunk_coord) else {
+        return Vec::new();
+    };
+    let Some(surface_max_y) = chunk.max_nonempty_world_y() else {
+        return Vec::new();
+    };
+    let depth = crate::platform::surface_mesh_depth_blocks();
+    let mut out = Vec::new();
+    for section_index in chunk.populated_section_indices() {
+        if !Chunk::section_near_surface(section_index, surface_max_y, depth) {
+            continue;
+        }
+        if let Some(mesh) = mesh_section(world, chunk_coord, section_index) {
+            out.push((section_index, mesh));
+        }
+    }
+    out
 }
 
 fn mesh_direction(
@@ -343,59 +386,71 @@ fn emit_quad(
         light,
     };
 
+    // Minecraft-style UVs from world position (Repeat sampler tiles every block).
+    let uv = |p: [f32; 3]| -> [f32; 2] {
+        match dir {
+            Direction::XPositive => [p[2], -p[1]],
+            Direction::XNegative => [-p[2], -p[1]],
+            Direction::YPositive => [p[0], p[2]],
+            Direction::YNegative => [p[0], -p[2]],
+            Direction::ZPositive => [p[0], -p[1]],
+            Direction::ZNegative => [-p[0], -p[1]],
+        }
+    };
+
     let corners: [Vertex; 4] = match dir {
         Direction::XPositive => {
             let px = (primary + 1) as f32;
             [
-                v(pos(px, s0, t0), [0.0, 0.0]),
-                v(pos(px, s1, t0), [width as f32, 0.0]),
-                v(pos(px, s1, t1), [width as f32, height as f32]),
-                v(pos(px, s0, t1), [0.0, height as f32]),
+                v(pos(px, s0, t0), uv(pos(px, s0, t0))),
+                v(pos(px, s1, t0), uv(pos(px, s1, t0))),
+                v(pos(px, s1, t1), uv(pos(px, s1, t1))),
+                v(pos(px, s0, t1), uv(pos(px, s0, t1))),
             ]
         }
         Direction::XNegative => {
             let px = primary as f32;
             [
-                v(pos(px, s0, t0), [0.0, 0.0]),
-                v(pos(px, s0, t1), [0.0, height as f32]),
-                v(pos(px, s1, t1), [width as f32, height as f32]),
-                v(pos(px, s1, t0), [width as f32, 0.0]),
+                v(pos(px, s0, t0), uv(pos(px, s0, t0))),
+                v(pos(px, s0, t1), uv(pos(px, s0, t1))),
+                v(pos(px, s1, t1), uv(pos(px, s1, t1))),
+                v(pos(px, s1, t0), uv(pos(px, s1, t0))),
             ]
         }
         Direction::YPositive => {
             let py = (primary + 1) as f32;
             [
-                v(pos(py, s0, t0), [0.0, 0.0]),
-                v(pos(py, s1, t0), [width as f32, 0.0]),
-                v(pos(py, s1, t1), [width as f32, height as f32]),
-                v(pos(py, s0, t1), [0.0, height as f32]),
+                v(pos(py, s0, t0), uv(pos(py, s0, t0))),
+                v(pos(py, s1, t0), uv(pos(py, s1, t0))),
+                v(pos(py, s1, t1), uv(pos(py, s1, t1))),
+                v(pos(py, s0, t1), uv(pos(py, s0, t1))),
             ]
         }
         Direction::YNegative => {
             let py = primary as f32;
             [
-                v(pos(py, s0, t0), [0.0, 0.0]),
-                v(pos(py, s0, t1), [0.0, height as f32]),
-                v(pos(py, s1, t1), [width as f32, height as f32]),
-                v(pos(py, s1, t0), [width as f32, 0.0]),
+                v(pos(py, s0, t0), uv(pos(py, s0, t0))),
+                v(pos(py, s0, t1), uv(pos(py, s0, t1))),
+                v(pos(py, s1, t1), uv(pos(py, s1, t1))),
+                v(pos(py, s1, t0), uv(pos(py, s1, t0))),
             ]
         }
         Direction::ZPositive => {
             let pz = (primary + 1) as f32;
             [
-                v(pos(pz, s0, t0), [0.0, 0.0]),
-                v(pos(pz, s1, t0), [width as f32, 0.0]),
-                v(pos(pz, s1, t1), [width as f32, height as f32]),
-                v(pos(pz, s0, t1), [0.0, height as f32]),
+                v(pos(pz, s0, t0), uv(pos(pz, s0, t0))),
+                v(pos(pz, s1, t0), uv(pos(pz, s1, t0))),
+                v(pos(pz, s1, t1), uv(pos(pz, s1, t1))),
+                v(pos(pz, s0, t1), uv(pos(pz, s0, t1))),
             ]
         }
         Direction::ZNegative => {
             let pz = primary as f32;
             [
-                v(pos(pz, s0, t0), [0.0, 0.0]),
-                v(pos(pz, s0, t1), [0.0, height as f32]),
-                v(pos(pz, s1, t1), [width as f32, height as f32]),
-                v(pos(pz, s1, t0), [width as f32, 0.0]),
+                v(pos(pz, s0, t0), uv(pos(pz, s0, t0))),
+                v(pos(pz, s0, t1), uv(pos(pz, s0, t1))),
+                v(pos(pz, s1, t1), uv(pos(pz, s1, t1))),
+                v(pos(pz, s1, t0), uv(pos(pz, s1, t0))),
             ]
         }
     };

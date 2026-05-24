@@ -36,6 +36,11 @@ impl Section {
     }
 
     #[inline]
+    pub fn block_data(&self) -> &[BlockId] {
+        &self.data
+    }
+
+    #[inline]
     pub fn has_any_non_air(&self) -> bool {
         self.data.iter().any(|b| !b.is_air())
     }
@@ -70,10 +75,46 @@ impl Chunk {
             .filter_map(|(idx, section)| section.as_ref().map(|_| idx))
     }
 
+    pub fn insert_section(&mut self, section_index: usize, section: Section) {
+        if section_index < self.sections.len() {
+            self.sections[section_index] = Some(section);
+        }
+    }
+
     /// True if any stored section contains a non-air block (meshes may still be empty if fully occluded).
     pub fn needs_rendered_mesh(&self) -> bool {
         self.populated_section_indices()
             .any(|idx| self.section(idx).is_some_and(|s| s.has_any_non_air()))
+    }
+
+    /// Highest world Y containing a non-air block, if any.
+    pub fn max_nonempty_world_y(&self) -> Option<i32> {
+        for idx in (0..SECTION_COUNT).rev() {
+            if self.section(idx).is_some_and(|s| s.has_any_non_air()) {
+                let section_base = (idx as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+                return Some(section_base + SECTION_SIZE as i32 - 1);
+            }
+        }
+        None
+    }
+
+    /// True when any section within [`platform::surface_mesh_depth_blocks`] of the top needs meshing.
+    pub fn needs_surface_mesh(&self) -> bool {
+        let Some(surface_max_y) = self.max_nonempty_world_y() else {
+            return false;
+        };
+        let depth = crate::platform::surface_mesh_depth_blocks();
+        self.populated_section_indices().any(|idx| {
+            Self::section_near_surface(idx, surface_max_y, depth)
+                && self.section(idx).is_some_and(|s| s.has_any_non_air())
+        })
+    }
+
+    /// Section is close enough to the chunk surface to worth meshing (skip caves/deep stone).
+    pub fn section_near_surface(section_index: usize, surface_max_y: i32, depth_blocks: i32) -> bool {
+        let section_base = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+        let section_top = section_base + SECTION_SIZE as i32;
+        section_top >= surface_max_y - depth_blocks
     }
 
     fn section_index_from_world_y(world_y: i32) -> Option<usize> {

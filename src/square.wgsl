@@ -26,7 +26,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) tex_layer: u32,
+    @location(1) @interpolate(flat) tex_layer: u32,
     @location(2) world_pos: vec3<f32>,
     @location(3) light: f32,
 };
@@ -44,24 +44,40 @@ model: VertexInput,
     return out;
 }
 
+/// Horizontal distance — stable fog when moving vertically (matches section culling).
+fn fog_distance(world_pos: vec3<f32>) -> f32 {
+    let delta = world_pos - sky.camera_pos.xyz;
+    return length(delta.xz);
+}
+
 @fragment
 fn fs_main(
     @location(0) uv: vec2<f32>,
-    @location(1) tex_layer: u32,
+    @location(1) @interpolate(flat) tex_layer: u32,
     @location(2) world_pos: vec3<f32>,
     @location(3) light: f32,
 ) -> @location(0) vec4<f32> {
-    let albedo = textureSample(block_texture, block_sampler, uv, i32(tex_layer));
-    let height_lerp = clamp(world_pos.y / 256.0, 0.0, 1.0);
-    let sky_color = mix(sky.horizon_color.rgb, sky.top_color.rgb, height_lerp);
-    let lit_albedo = albedo.rgb * (0.25 + light * 0.75);
-
-    // Distance fog: smoothstep so far geometry blends into the sky/horizon.
     let fog_start = sky.fog_params.x;
     let fog_end = sky.fog_params.y;
     let fog_strength = sky.fog_params.z;
-    let dist = distance(world_pos, sky.camera_pos.xyz);
-    let fog = pow(smoothstep(fog_start, fog_end, dist), 1.35) * fog_strength;
+    let dist = fog_distance(world_pos);
+
+    // Extra mip bias at range softens pixel crawl on distant minified texels.
+    let fog_t = smoothstep(fog_start, fog_end, dist);
+    let mip_bias = fog_t * 2.5;
+    let albedo = textureSampleBias(block_texture, block_sampler, uv, i32(tex_layer), mip_bias);
+    if (albedo.a < 0.5) {
+        discard;
+    }
+
+    let height_lerp = clamp(world_pos.y / 256.0, 0.0, 1.0);
+    let sky_color = mix(sky.horizon_color.rgb, sky.top_color.rgb, height_lerp);
+
+    // Flatten harsh per-vertex AO contrast in the far field (reduces sparkle).
+    let light_far = mix(light, 0.82, fog_t * 0.65);
+    let lit_albedo = albedo.rgb * (0.25 + light_far * 0.75);
+
+    let fog = pow(fog_t, 1.15) * fog_strength;
     let rgb = mix(lit_albedo, sky_color, fog);
     return vec4<f32>(rgb, albedo.a);
 }

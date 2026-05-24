@@ -1,0 +1,12 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+ignore = ["dist", "target", "saves", "resource_pack"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+open = true
+# WebGPU requires a secure context — use http://127.0.0.1:8080, not a LAN IP or hostname.
