@@ -3,10 +3,15 @@ const errorEl = document.getElementById("menu-error");
 const loadStatusEl = document.getElementById("load-status");
 const loadErrorEl = document.getElementById("load-error");
 const loadOverlayEl = document.getElementById("load-overlay");
+const seedInput = document.getElementById("world-seed");
+const generateSeedBtn = document.getElementById("generate-seed-btn");
+const randomSeedBtn = document.getElementById("random-seed-btn");
 const fileInput = document.getElementById("world-file");
 const urlInput = document.getElementById("world-url");
 const loadUrlBtn = document.getElementById("load-url-btn");
 const webgpuWarning = document.getElementById("webgpu-warning");
+
+const SEED_STORAGE_KEY = "voxel-engine-last-seed";
 
 function setStatus(text) {
     statusEl.textContent = text;
@@ -22,9 +27,13 @@ function setError(text) {
     }
 }
 
+function bindingsReady(bindings) {
+    return bindings?.set_world_from_seed && bindings?.set_world_from_zip;
+}
+
 /** Trunk loads WASM in index.html and exposes bindings on window.wasmBindings. */
 function awaitWasmBindings() {
-    if (window.wasmBindings?.set_world_from_zip) {
+    if (bindingsReady(window.wasmBindings)) {
         return Promise.resolve(window.wasmBindings);
     }
 
@@ -41,8 +50,8 @@ function awaitWasmBindings() {
             "TrunkApplicationStarted",
             () => {
                 clearTimeout(timeout);
-                if (!window.wasmBindings?.set_world_from_zip) {
-                    reject(new Error("WASM loaded but set_world_from_zip export is missing."));
+                if (!bindingsReady(window.wasmBindings)) {
+                    reject(new Error("WASM loaded but world exports are missing."));
                     return;
                 }
                 resolve(window.wasmBindings);
@@ -89,6 +98,60 @@ async function probeWebGpu() {
 function showWebGpuWarning(message) {
     webgpuWarning.textContent = message;
     webgpuWarning.classList.remove("hidden");
+}
+
+function javaStringHashCode(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) {
+        h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+    }
+    return BigInt(h);
+}
+
+function parseSeed(text) {
+    const trimmed = text.trim();
+    if (!trimmed) {
+        return null;
+    }
+    if (/^-?\d+$/.test(trimmed)) {
+        try {
+            return BigInt(trimmed);
+        } catch {
+            return null;
+        }
+    }
+    return javaStringHashCode(trimmed);
+}
+
+/** wasm-bindgen i64 expects bigint, not Number. */
+function normalizeSeedForWasm(seedBigInt) {
+    const mask64 = (1n << 64n) - 1n;
+    let masked = seedBigInt & mask64;
+    if (masked >= (1n << 63n)) {
+        masked -= 1n << 64n;
+    }
+    return masked;
+}
+
+async function generateFromSeed(set_world_from_seed) {
+    const parsed = parseSeed(seedInput.value);
+    if (parsed === null) {
+        setError("Enter a seed (number or text, like Minecraft).");
+        return;
+    }
+    setError("");
+    const seedStr = parsed.toString();
+    localStorage.setItem(SEED_STORAGE_KEY, seedStr);
+    setStatus(`Generating world (seed ${seedStr})…`);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    try {
+        set_world_from_seed(normalizeSeedForWasm(parsed));
+        setStatus("Starting renderer…");
+    } catch (err) {
+        setError(String(err));
+        setStatus("Ready.");
+        throw err;
+    }
 }
 
 async function loadBytes(bytes, set_world_from_zip) {
@@ -141,7 +204,7 @@ async function loadFromUrl(set_world_from_zip) {
 
 async function main() {
     setStatus("Loading engine…");
-    const { set_world_from_zip } = await awaitWasmBindings();
+    const { set_world_from_seed, set_world_from_zip } = await awaitWasmBindings();
 
     const modulePreload = document.querySelector('link[rel="modulepreload"]');
     const wasmPreload =
@@ -159,7 +222,30 @@ async function main() {
         showWebGpuWarning(webgpu.reason);
     }
 
-    setStatus("Choose a world zip to begin.");
+    const savedSeed = localStorage.getItem(SEED_STORAGE_KEY);
+    if (savedSeed) {
+        seedInput.value = savedSeed;
+    } else {
+        seedInput.value = "12345";
+    }
+
+    setStatus("Enter a seed or import a world zip.");
+    generateSeedBtn.addEventListener("click", () => {
+        generateFromSeed(set_world_from_seed).catch((err) => {
+            console.error(err);
+            setError(String(err));
+            setStatus("Ready.");
+        });
+    });
+    randomSeedBtn.addEventListener("click", () => {
+        const random = BigInt(Math.floor(Math.random() * 1_000_000_000));
+        seedInput.value = random.toString();
+    });
+    seedInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            generateSeedBtn.click();
+        }
+    });
     fileInput.addEventListener("change", () => {
         loadFile(fileInput.files[0], set_world_from_zip).catch((err) => {
             console.error(err);

@@ -21,8 +21,11 @@ trunk serve --open
 
 Open `http://127.0.0.1:8080`. Use the startup menu to:
 
-1. **Upload** a `.zip` of a Java world save folder (must contain `region/r.*.*.mca` files)
-2. **Load from URL** — the zip must be hosted with CORS enabled
+1. **Generate from seed** (recommended) — enter a number or text seed (text uses Java's `String.hashCode`, like Minecraft) and click **Generate world**. Same seed always produces the same terrain. Loads instantly; no zip or workers required.
+2. **Upload** a `.zip` of a Java world save folder (must contain `region/r.*.*.mca` files)
+3. **Load from URL** — the zip must be hosted with CORS enabled
+
+Seed mode uses Minecraft-style Perlin noise (low/high/selector octaves, sea level 63, oceans, beaches). It is **not** identical to Minecraft Java world generation — use zip import for real saves.
 
 Example zip layout:
 
@@ -50,9 +53,10 @@ Deploy the contents of `dist/` to any static host (GitHub Pages, Cloudflare Page
 
 ## Web tuning
 
-On `wasm32`, the engine uses a reduced profile and **background chunk workers**:
+On `wasm32`, the engine uses a reduced profile:
 
-- **2 Web Workers** load and mesh chunks off the main thread (same zip passed to each worker)
+- **Seed worlds** — chunks generated on the main thread (fast bootstrap, no workers)
+- **Zip import** — optional **2 Web Workers** load chunks off the main thread during streaming (after bootstrap)
 - Stream distance: **16 chunks** (desktop: 40)
 - Section draw distance: **16 chunks** (desktop: 40)
 - Bootstrap radius: **3 chunks** (desktop: 8)

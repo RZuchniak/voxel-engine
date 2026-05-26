@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use wasm_bindgen::{JsCast, prelude::*};
 
 #[cfg(target_arch = "wasm32")]
-use crate::source::{MemoryAnvilSource, WorldSource};
+use crate::source::{MemoryAnvilSource, SeededProceduralSource, WorldSource};
 
 #[cfg(target_arch = "wasm32")]
 static INIT_ZIP: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
@@ -188,6 +188,7 @@ pub fn kick_event_loop() {
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static RESET_RENDERER_LOADING: Cell<bool> = Cell::new(false);
+    static PROCEDURAL_WORLD: Cell<bool> = Cell::new(false);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -209,14 +210,36 @@ pub fn init_web_logging() {
 }
 
 #[cfg(target_arch = "wasm32")]
+pub fn is_procedural_world() -> bool {
+    PROCEDURAL_WORLD.with(|flag| flag.get())
+}
+
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn set_world_from_zip(bytes: &[u8]) -> Result<(), String> {
     clear_load_error();
+    PROCEDURAL_WORLD.with(|flag| flag.set(false));
     set_load_status("Reading world zip…");
     store_init_zip(bytes);
     let source = MemoryAnvilSource::from_zip(bytes).map_err(|e| e.to_string())?;
     set_pending_world(Arc::new(source));
     set_load_status("World loaded — starting engine…");
+    show_game_ui();
+    kick_event_loop();
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_world_from_seed(seed: i64) -> Result<(), String> {
+    clear_load_error();
+    PROCEDURAL_WORLD.with(|flag| flag.set(true));
+    if let Ok(mut slot) = init_zip_slot().lock() {
+        *slot = None;
+    }
+    set_load_status(&format!("Generating world (seed {seed})…"));
+    set_pending_world(Arc::new(SeededProceduralSource::new(seed)));
+    set_load_status("World ready — starting engine…");
     show_game_ui();
     kick_event_loop();
     Ok(())

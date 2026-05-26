@@ -25,10 +25,12 @@ mod block;
 mod camera;
 mod cull;
 mod mesh;
+mod noise;
 mod platform;
 mod source;
 mod streamer;
 mod texture;
+mod terrain;
 mod world;
 mod hud;
 #[cfg(target_arch = "wasm32")]
@@ -192,6 +194,8 @@ struct State {
     world_ready: bool,
     /// Bootstrap tiles we meshed (including empty/culled) so readiness does not stall forever.
     bootstrap_mesh_attempted: HashSet<(i32, i32)>,
+    /// Seed-mode worlds skip workers and use faster inline generate+mesh.
+    procedural_world: bool,
 }
 
 impl State {
@@ -454,7 +458,9 @@ impl State {
         if !self.chunk_within_draw_distance(chunk_coord) {
             return false;
         }
-        frustum.intersects_aabb(mesh.bounds_min, mesh.bounds_max)
+        let cp = self.camera.position();
+        let origin = cgmath::Vector3::new(cp.x, cp.y, cp.z);
+        frustum.intersects_aabb(mesh.bounds_min - origin, mesh.bounds_max - origin)
     }
 
     async fn new(window: Arc<Window>, world_source: Arc<dyn source::WorldSource>) -> Self {
@@ -618,9 +624,13 @@ impl State {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 1,
+                    slope_scale: 1.0,
+                    clamp: 0.0,
+                },
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -630,12 +640,13 @@ impl State {
         let hud = hud::HudOverlay::new(&device, config.format);
 
         let world = World::new();
+        let procedural_world = world_source.is_procedural();
         #[cfg(target_arch = "wasm32")]
         let mut streamer = ChunkStreamer::new(world_source);
         #[cfg(not(target_arch = "wasm32"))]
         let streamer = ChunkStreamer::new(world_source);
         #[cfg(target_arch = "wasm32")]
-        if crate::platform::use_wasm_chunk_workers() {
+        if crate::platform::use_wasm_chunk_workers() && !procedural_world {
             if let Some(zip_bytes) = web_api::clone_init_zip() {
                 if let Err(err) = streamer.enable_workers(&zip_bytes) {
                     web_sys::console::error_1(&JsValue::from_str(&format!(
@@ -710,6 +721,7 @@ impl State {
             section_draw_distance_chunks: platform::default_section_draw_distance_chunks(),
             world_ready: false,
             bootstrap_mesh_attempted: HashSet::new(),
+            procedural_world,
         };
     }
 
@@ -858,6 +870,8 @@ impl State {
 
         let mut request_budget = if bootstrap {
             platform::bootstrap_max_new_requests_per_frame()
+        } else if self.procedural_world {
+            platform::procedural_max_new_requests_per_frame()
         } else {
             platform::max_new_requests_per_frame()
         };
@@ -921,6 +935,11 @@ impl State {
                 platform::bootstrap_max_chunk_uploads_per_frame(),
                 u128::MAX,
             )
+        } else if self.procedural_world {
+            (
+                platform::procedural_max_chunk_uploads_per_frame(),
+                platform::max_upload_time_budget_ms(),
+            )
         } else if cfg!(target_arch = "wasm32") {
             (
                 platform::max_chunk_uploads_per_frame(),
@@ -955,8 +974,15 @@ impl State {
             let had_initial_meshes = !meshed.is_remesh && !meshed.section_meshes.is_empty();
             if meshed.is_remesh {
                 self.upload_chunk_meshes(coord, meshed.section_meshes);
-            } else if bootstrap {
-                self.mesh_loaded_chunk_during_bootstrap(coord);
+            } else if bootstrap || self.procedural_world {
+                if upload_start.elapsed().as_millis() >= upload_time_budget_dynamic {
+                    // Defer heavy inline meshing to next frame to avoid spikes.
+                    if self._world.has_chunk(coord) {
+                        self.enqueue_priority_remesh(coord);
+                    }
+                } else {
+                    self.mesh_loaded_chunk_during_bootstrap(coord);
+                }
             } else if had_initial_meshes {
                 self.upload_chunk_meshes(coord, meshed.section_meshes);
             } else {
@@ -1026,16 +1052,30 @@ impl State {
         } else {
             0
         };
+        let remesh_time_budget = if self.procedural_world {
+            platform::procedural_remesh_time_budget_ms()
+        } else {
+            platform::remesh_time_budget_ms()
+        };
+        let remesh_start = Instant::now();
+        let base_pri_budget = if self.procedural_world {
+            platform::PROCEDURAL_REMESH_PRIORITY_BUDGET_PER_FRAME
+        } else {
+            platform::REMESH_PRIORITY_BUDGET_PER_FRAME
+        };
         let pri_budget = if bootstrap {
             0
         } else {
-            (platform::REMESH_PRIORITY_BUDGET_PER_FRAME
+            (base_pri_budget
                 + extra_priority
                 + extra_pri_backlog
                 + extra_pri_bootstrap)
                 .saturating_sub(remesh_slowdown)
         };
         for _ in 0..pri_budget {
+            if remesh_start.elapsed().as_millis() > remesh_time_budget {
+                break;
+            }
             let Some(coord) = self.remesh_priority.pop_front() else {
                 break;
             };
@@ -1046,12 +1086,20 @@ impl State {
                 self.remesh_priority.push_back(coord);
             }
         }
-        let neighbor_budget = (platform::NEIGHBOR_REMESH_BUDGET_PER_FRAME
+        let base_neighbor_budget = if self.procedural_world {
+            platform::PROCEDURAL_NEIGHBOR_REMESH_BUDGET_PER_FRAME
+        } else {
+            platform::NEIGHBOR_REMESH_BUDGET_PER_FRAME
+        };
+        let neighbor_budget = (base_neighbor_budget
             + extra_neighbor_backlog
             + extra_neighbor_bootstrap)
             .saturating_sub(remesh_slowdown);
         for _ in 0..neighbor_budget {
             if bootstrap {
+                break;
+            }
+            if remesh_start.elapsed().as_millis() > remesh_time_budget {
                 break;
             }
             let Some(coord) = self.remesh_neighbor.pop_front() else {
@@ -1202,6 +1250,7 @@ impl State {
                 self.pending_ready.len(),
             )
         } else {
+            #[cfg(target_arch = "wasm32")]
             let worker_line = self
                 .streamer
                 .worker_status()
@@ -1209,6 +1258,8 @@ impl State {
                     format!("\nWorkers: {ready}/{total} · {queued} queued · {in_flight} in flight")
                 })
                 .unwrap_or_else(|| "\nLoader: main thread".to_string());
+            #[cfg(not(target_arch = "wasm32"))]
+            let worker_line = String::new();
             format!(
                 "Loading world… {}/{} chunks ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nWASD locked until ready — mouse look OK\nFPS: {:.0}",
                 boot_n,

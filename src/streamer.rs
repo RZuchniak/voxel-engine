@@ -30,12 +30,14 @@ pub struct ChunkStreamer {
     in_flight: HashSet<(i32, i32)>,
     remesh_in_flight: HashSet<(i32, i32)>,
     pending_remesh_coords: HashSet<(i32, i32)>,
+    procedural: bool,
     #[cfg(target_arch = "wasm32")]
     worker_bridge: Option<WorkerBridge>,
 }
 
 impl ChunkStreamer {
     pub fn new(source: Arc<dyn WorldSource>) -> Self {
+        let procedural = source.is_procedural();
         #[cfg(not(target_arch = "wasm32"))]
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("chunk-worker-{i}"))
@@ -51,6 +53,7 @@ impl ChunkStreamer {
             in_flight: HashSet::new(),
             remesh_in_flight: HashSet::new(),
             pending_remesh_coords: HashSet::new(),
+            procedural,
             #[cfg(target_arch = "wasm32")]
             worker_bridge: None,
         }
@@ -91,6 +94,16 @@ impl ChunkStreamer {
         });
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn send_loaded_chunk(&self, coord: (i32, i32), chunk: Chunk) {
+        let _ = self.ready_tx.send(MeshedChunk {
+            coord,
+            chunk: Some(chunk),
+            section_meshes: Vec::new(),
+            is_remesh: false,
+        });
+    }
+
     fn dispatch_remesh_work(&mut self, coord: (i32, i32), world: World) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -128,6 +141,7 @@ impl ChunkStreamer {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
     fn apply_worker_failures(&mut self) {
         for failure in take_failures() {
             if failure.is_remesh {
@@ -173,6 +187,22 @@ impl ChunkStreamer {
 
         #[cfg(target_arch = "wasm32")]
         {
+            let _ = bootstrap;
+            if self.procedural {
+                self.in_flight.insert(coord);
+                let chunk = match self.source.load_chunk(coord) {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                            "chunk load failed at ({},{}): {err:#}",
+                            coord.0, coord.1
+                        )));
+                        Chunk::new(coord)
+                    }
+                };
+                self.send_loaded_chunk(coord, chunk);
+                return true;
+            }
             if !bootstrap {
                 if let Some(bridge) = self.worker_bridge.as_mut() {
                     if bridge.try_request_load(coord) {
@@ -191,7 +221,9 @@ impl ChunkStreamer {
             self.pending_remesh_coords.insert(coord);
             return;
         }
-        if self.worker_bridge
+        #[cfg(target_arch = "wasm32")]
+        if self
+            .worker_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.is_load_busy(coord))
         {
@@ -255,6 +287,10 @@ impl ChunkStreamer {
             self.apply_worker_failures();
             out
         }
+    }
+
+    pub fn is_procedural(&self) -> bool {
+        self.procedural
     }
 
     pub fn is_in_flight(&self, coord: (i32, i32)) -> bool {

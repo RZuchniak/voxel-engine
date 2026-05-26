@@ -36,10 +36,11 @@ fn vs_main(
 model: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = camera.view_proj * vec4<f32>(model.pos, 1.0);
+    out.world_pos = model.pos;
+    let relative = model.pos - sky.camera_pos.xyz;
+    out.clip_position = camera.view_proj * vec4<f32>(relative, 1.0);
     out.uv = model.uv;
     out.tex_layer = model.tex_layer;
-    out.world_pos = model.pos;
     out.light = f32(model.light) / 255.0;
     return out;
 }
@@ -64,9 +65,9 @@ fn fs_main(
 
     // Extra mip bias at range softens pixel crawl on distant minified texels.
     let fog_t = smoothstep(fog_start, fog_end, dist);
-    let mip_bias = fog_t * 2.5;
+    let mip_bias = fog_t * 1.0;
     let albedo = textureSampleBias(block_texture, block_sampler, uv, i32(tex_layer), mip_bias);
-    if (albedo.a < 0.5) {
+    if (albedo.a < 0.01) {
         discard;
     }
 

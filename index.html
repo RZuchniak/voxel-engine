@@ -43,7 +43,7 @@
         h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
         p { color: #aeb8cb; line-height: 1.5; margin-bottom: 1rem; }
         label { display: block; font-size: 0.85rem; color: #c5cee0; margin-bottom: 0.35rem; }
-        input[type="file"], input[type="url"] {
+        input[type="file"], input[type="url"], input[type="text"] {
             width: 100%;
             margin-bottom: 1rem;
             padding: 0.55rem 0.65rem;
@@ -61,9 +61,20 @@
             color: white;
             font-weight: 600;
             cursor: pointer;
+            margin-bottom: 0.75rem;
         }
         button:hover { background: #3d6aef; }
         button:disabled { opacity: 0.55; cursor: not-allowed; }
+        button.secondary {
+            background: #2a3347;
+        }
+        button.secondary:hover { background: #36415a; }
+        .row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+        .row button { margin-bottom: 0; flex: 1; }
+        .divider {
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            margin: 1.25rem 0;
+        }
         #menu-status {
             margin-top: 1rem;
             min-height: 1.25rem;
@@ -104,16 +115,23 @@
     <div id="startup-menu">
         <div class="panel">
             <h1>Voxel Engine</h1>
-            <p>Load a Java Edition world by uploading a zip of your save folder (must contain a <code>region/</code> directory with <code>.mca</code> files).</p>
+            <p>Generate infinite terrain from a seed (Minecraft-style Perlin hills), or import a Java Edition world zip.</p>
             <div id="webgpu-warning" class="hidden" style="color:#ffb4b4;margin-bottom:1rem;"></div>
-            <label for="world-file">Upload world zip</label>
+            <label for="world-seed">World seed (fast — recommended)</label>
+            <input id="world-seed" type="text" placeholder="e.g. 12345 or herobrine" autocomplete="off" />
+            <div class="row">
+                <button id="generate-seed-btn" type="button">Generate world</button>
+                <button id="random-seed-btn" type="button" class="secondary">Random</button>
+            </div>
+            <div class="divider"></div>
+            <label for="world-file">Import Java world zip</label>
             <input id="world-file" type="file" accept=".zip,application/zip" />
-            <label for="world-url">Or load from URL</label>
+            <label for="world-url">Or load zip from URL</label>
             <input id="world-url" type="url" placeholder="https://example.com/my-world.zip" />
-            <button id="load-url-btn" type="button">Load from URL</button>
+            <button id="load-url-btn" type="button" class="secondary">Load from URL</button>
             <div id="menu-status">Waiting for WASM…</div>
             <div id="menu-error"></div>
-            <p class="hint">Tip: zip your world folder (e.g. <code>saves/Basic_World</code>) so paths look like <code>Basic_World/region/r.0.0.mca</code>.</p>
+            <p class="hint">Seed mode generates hills instantly. Zip import loads real saves from <code>region/*.mca</code> files.</p>
         </div>
     </div>
     <div id="click-to-play" class="hidden">Click to play · WASD move · Mouse look · P release cursor</div>
@@ -128,7 +146,7 @@
             window.__voxelMenuLoaded = true;
             import("/web/menu.js");
         }
-        if (window.wasmBindings?.set_world_from_zip) {
+        if (window.wasmBindings?.set_world_from_seed || window.wasmBindings?.set_world_from_zip) {
             loadMenu();
         } else {
             window.addEventListener("TrunkApplicationStarted", loadMenu, { once: true });

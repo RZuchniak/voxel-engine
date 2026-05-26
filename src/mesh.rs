@@ -398,7 +398,7 @@ fn emit_quad(
         }
     };
 
-    let corners: [Vertex; 4] = match dir {
+    let mut corners: [Vertex; 4] = match dir {
         Direction::XPositive => {
             let px = (primary + 1) as f32;
             [
@@ -455,5 +455,24 @@ fn emit_quad(
         }
     };
 
+    expand_corners(&mut corners, dir);
     mesh.push_quad(corners);
+}
+
+const FACE_EXPAND: f32 = 0.002;
+
+fn expand_corners(corners: &mut [Vertex; 4], dir: Direction) {
+    let (nx, ny, nz) = match dir {
+        Direction::XPositive => (FACE_EXPAND, 0.0, 0.0),
+        Direction::XNegative => (-FACE_EXPAND, 0.0, 0.0),
+        Direction::YPositive => (0.0, FACE_EXPAND, 0.0),
+        Direction::YNegative => (0.0, -FACE_EXPAND, 0.0),
+        Direction::ZPositive => (0.0, 0.0, FACE_EXPAND),
+        Direction::ZNegative => (0.0, 0.0, -FACE_EXPAND),
+    };
+    for corner in corners.iter_mut() {
+        corner.position[0] += nx;
+        corner.position[1] += ny;
+        corner.position[2] += nz;
+    }
 }

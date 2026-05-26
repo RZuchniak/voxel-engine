@@ -201,30 +201,8 @@ impl World {
     }
 
     #[allow(dead_code)]
-    pub fn generate_procedural_chunk(coord: (i32, i32)) -> Chunk {
-        let (chunk_x, chunk_z) = coord;
-        let mut chunk = Chunk::new((chunk_x, chunk_z));
-        for local_z in 0..SECTION_SIZE {
-            for local_x in 0..SECTION_SIZE {
-                let world_x = chunk_x * SECTION_SIZE as i32 + local_x as i32;
-                let world_z = chunk_z * SECTION_SIZE as i32 + local_z as i32;
-                let noise =
-                    ((world_x as f32 * 0.11).sin() * 6.0 + (world_z as f32 * 0.09).cos() * 6.0)
-                        as i32;
-                let top_y = (70 + noise).clamp(50, 96);
-
-                for y in -64..=top_y {
-                    let block = if y == top_y {
-                        BlockId::GRASS
-                    } else if y >= top_y - 3 {
-                        BlockId::DIRT
-                    } else {
-                        BlockId::STONE
-                    };
-                    chunk.set_block_world(local_x, y, local_z, block);
-                }
-            }
-        }
-        chunk
+    pub fn generate_procedural_chunk(seed: i64, coord: (i32, i32)) -> Chunk {
+        let generator = crate::terrain::TerrainGenerator::new(seed);
+        crate::terrain::generate_chunk(&generator, coord)
     }
 }

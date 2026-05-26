@@ -17,11 +17,43 @@ use serde::Deserialize;
 
 use crate::{
     block::BlockId,
+    terrain::TerrainGenerator,
     world::{Chunk, World},
 };
 
 pub trait WorldSource: Send + Sync {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk>;
+    fn is_procedural(&self) -> bool {
+        false
+    }
+}
+
+pub struct SeededProceduralSource {
+    seed: i64,
+    generator: TerrainGenerator,
+}
+
+impl SeededProceduralSource {
+    pub fn new(seed: i64) -> Self {
+        Self {
+            seed,
+            generator: TerrainGenerator::new(seed),
+        }
+    }
+
+    pub fn seed(&self) -> i64 {
+        self.seed
+    }
+}
+
+impl WorldSource for SeededProceduralSource {
+    fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
+        Ok(crate::terrain::generate_chunk(&self.generator, coord))
+    }
+
+    fn is_procedural(&self) -> bool {
+        true
+    }
 }
 
 #[allow(dead_code)]
@@ -29,7 +61,11 @@ pub struct ProceduralSource;
 
 impl WorldSource for ProceduralSource {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
-        Ok(World::generate_procedural_chunk(coord))
+        Ok(World::generate_procedural_chunk(0, coord))
+    }
+
+    fn is_procedural(&self) -> bool {
+        true
     }
 }
 
@@ -316,7 +352,7 @@ impl WorldSource for AnvilSource {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = coord;
-            return Ok(World::generate_procedural_chunk(coord));
+            return Ok(World::generate_procedural_chunk(0, coord));
         }
 
         #[cfg(not(target_arch = "wasm32"))]

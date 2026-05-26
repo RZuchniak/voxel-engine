@@ -1,4 +1,4 @@
-use cgmath::InnerSpace;
+use cgmath::{EuclideanSpace, InnerSpace};
 
 #[derive(Clone)]
 pub struct Camera {
@@ -23,14 +23,19 @@ impl Camera {
     }
 
     pub fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
-        let view = cgmath::Matrix4::look_at_rh(self.position, self.target, self.up);
+        // Camera-relative view keeps float precision stable far from the origin (reduces z-fighting holes).
+        let view = cgmath::Matrix4::look_at_rh(
+            cgmath::Point3::origin(),
+            cgmath::Point3::from(self.target - self.position),
+            self.up,
+        );
         let proj = cgmath::perspective(
             cgmath::Deg(self.fov),
             self.aspect_ratio,
             self.znear,
             self.zfar,
         );
-        proj * view // * OPENGL_TO_WGPU_MATRIX
+        proj * view
     }
 
     pub fn set_far_plane(&mut self, zfar: f32) {

@@ -45,6 +45,16 @@ pub const fn max_new_requests_per_frame() -> usize {
     }
 }
 
+/// Procedural generation is cheap — request more chunks per frame on wasm.
+#[inline]
+pub const fn procedural_max_new_requests_per_frame() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        10
+    } else {
+        12
+    }
+}
+
 #[inline]
 pub const fn max_chunk_uploads_per_frame() -> usize {
     if cfg!(target_arch = "wasm32") {
@@ -55,11 +65,39 @@ pub const fn max_chunk_uploads_per_frame() -> usize {
 }
 
 #[inline]
-pub const fn max_upload_time_budget_ms() -> u128 {
+pub const fn procedural_max_chunk_uploads_per_frame() -> usize {
     if cfg!(target_arch = "wasm32") {
         12
     } else {
+        8
+    }
+}
+
+#[inline]
+pub const fn max_upload_time_budget_ms() -> u128 {
+    if cfg!(target_arch = "wasm32") {
+        16
+    } else {
         1
+    }
+}
+
+/// Cap synchronous main-thread meshing per frame (wasm remesh is inline).
+#[inline]
+pub const fn remesh_time_budget_ms() -> u128 {
+    if cfg!(target_arch = "wasm32") {
+        8
+    } else {
+        2
+    }
+}
+
+#[inline]
+pub const fn procedural_remesh_time_budget_ms() -> u128 {
+    if cfg!(target_arch = "wasm32") {
+        12
+    } else {
+        4
     }
 }
 
@@ -147,6 +185,8 @@ pub const fn surface_only_chunk_load() -> bool {
 pub const UNLOAD_MARGIN_CHUNKS: i32 = 5;
 pub const REMESH_PRIORITY_BUDGET_PER_FRAME: usize = 2;
 pub const NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 1;
+pub const PROCEDURAL_REMESH_PRIORITY_BUDGET_PER_FRAME: usize = 6;
+pub const PROCEDURAL_NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 3;
 pub const READY_DRAIN_BUDGET_PER_FRAME: usize = 64;
 pub const MAX_PENDING_READY_CHUNKS: usize = 600;
 pub const PENDING_BACKLOG_REMESH_THRESHOLD: usize = 24;
