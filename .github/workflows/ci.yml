@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast rather than hanging on a prompt.
+  CARGO_NET_RETRY: 2
+
+jobs:
+  # Blocking: correctness and the work-volume baseline.
+  test:
+    name: test (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # winit/wgpu need X11 + Wayland headers to build on Linux, even though the tests
+      # themselves never open a window or touch a GPU.
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libxrandr-dev libxi-dev libxcursor-dev libgl1-mesa-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Build
+        run: cargo build --all-targets
+
+      # perf_baseline asserts exact work-volume counters. A failure here means either a
+      # real regression or an intentional change whose numbers need re-recording — the
+      # test prints expected vs actual to make that diff readable.
+      - name: Test
+        run: cargo test --all-targets
+
+  # Blocking: the lib/bin split can break the web build in ways native CI never sees,
+  # so this runs on every push rather than being left to a manual `trunk serve`.
+  wasm:
+    name: build (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-wasm-
+
+      - name: Check wasm target
+        run: cargo check --target wasm32-unknown-unknown
+
+      - name: Install trunk
+        run: |
+          if ! command -v trunk >/dev/null; then
+            cargo install trunk --locked
+          fi
+
+      # Trunk fetches wasm-bindgen-cli and wasm-opt itself on first run.
+      - name: Build web bundle
+        run: trunk build --release
+
+      - name: Verify wasm-bindgen exports survived the lib/bin split
+        run: |
+          set -euo pipefail
+          for sym in set_world_from_seed set_world_from_zip worker_init worker_handle_job; do
+            if ! grep -q "$sym" dist/*.js; then
+              echo "::error::missing export '$sym' in dist/ — the bin shim may have been dropped"
+              exit 1
+            fi
+          done
+          echo "all wasm-bindgen exports present"
+
+  # Non-blocking: the tree is not rustfmt-clean and carries ~34 clippy warnings today.
+  # Reported so they stay visible and can be burned down, but not gating until then.
+  lint:
+    name: lint (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --check
+        continue-on-error: true
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+        continue-on-error: true
