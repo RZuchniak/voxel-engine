@@ -155,16 +155,7 @@ pub const fn bootstrap_extra_neighbor_remesh_per_frame() -> usize {
     }
 }
 
-/// Scale with the machine, leaving a core for the main thread. The bridge clamps to 4.
-#[cfg(target_arch = "wasm32")]
-pub fn wasm_worker_count() -> usize {
-    web_sys::window()
-        .map(|window| window.navigator().hardware_concurrency() as usize)
-        .map(|cores| cores.saturating_sub(1).clamp(1, 4))
-        .unwrap_or(2)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
+#[inline]
 pub const fn wasm_worker_count() -> usize {
     2
 }
@@ -175,16 +166,14 @@ pub const fn use_wasm_chunk_workers() -> bool {
     true
 }
 
-/// Per-worker in-flight cap. The worker wasm instance is not re-entrant, but queueing a
-/// second job keeps it busy while a reply crosses back to the main thread.
 #[inline]
 pub const fn max_worker_jobs_in_flight() -> usize {
-    2
+    1
 }
 
 #[inline]
 pub const fn max_worker_job_queue() -> usize {
-    48
+    16
 }
 
 /// On wasm, only decode NBT sections near the surface when loading from disk.

@@ -284,14 +284,8 @@ pub struct WorkerBridge {
     inner: Rc<RefCell<WorkerBridgeInner>>,
 }
 
-/// What a worker needs to reproduce the world: raw zip bytes, or just a seed.
-pub enum WorkerSource<'a> {
-    Zip(&'a [u8]),
-    Seed(i64),
-}
-
 impl WorkerBridge {
-    pub fn start(source: WorkerSource<'_>, worker_count: usize) -> Result<Self, String> {
+    pub fn start(zip_bytes: &[u8], worker_count: usize) -> Result<Self, String> {
         let (wasm_js, wasm_module) = wasm_urls()?;
         let worker_count = worker_count.clamp(1, 4);
         let inner = Rc::new(RefCell::new(WorkerBridgeInner {
@@ -304,17 +298,6 @@ impl WorkerBridge {
             busy_coords: HashSet::new(),
         }));
 
-        // Build the zip payload once. It used to be re-allocated per worker, which for a
-        // 46 MB save meant several full copies before postMessage even cloned it.
-        let zip_buffer = match &source {
-            WorkerSource::Zip(bytes) => {
-                let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-                array.copy_from(bytes);
-                Some(array.buffer())
-            }
-            WorkerSource::Seed(_) => None,
-        };
-
         for worker_id in 0..worker_count {
             inner.borrow_mut().workers.push(WorkerHandle {
                 worker: {
@@ -325,6 +308,10 @@ impl WorkerBridge {
                 },
                 ready: Rc::new(Cell::new(false)),
             });
+
+            let zip_array = js_sys::Uint8Array::new_with_length(zip_bytes.len() as u32);
+            zip_array.copy_from(zip_bytes);
+            let zip_buffer = zip_array.buffer();
 
             let worker = inner.borrow().workers[worker_id].worker.clone();
             let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -413,19 +400,7 @@ impl WorkerBridge {
                 &JsValue::from_str("wasmModule"),
                 &JsValue::from_str(&wasm_module),
             );
-            match (&source, &zip_buffer) {
-                (WorkerSource::Seed(seed), _) => {
-                    let _ = js_sys::Reflect::set(
-                        &init,
-                        &JsValue::from_str("seed"),
-                        &js_sys::BigInt::from(*seed).into(),
-                    );
-                }
-                (WorkerSource::Zip(_), Some(buffer)) => {
-                    let _ = js_sys::Reflect::set(&init, &JsValue::from_str("zipBytes"), buffer);
-                }
-                (WorkerSource::Zip(_), None) => {}
-            }
+            let _ = js_sys::Reflect::set(&init, &JsValue::from_str("zipBytes"), &zip_buffer);
             let _ = inner.borrow().workers[worker_id].worker.post_message(&init);
         }
 

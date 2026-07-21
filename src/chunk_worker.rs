@@ -2,13 +2,13 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{
     mesh::mesh_chunk_surface,
-    source::{MemoryAnvilSource, SeededProceduralSource, WorldSource},
+    source::{MemoryAnvilSource, WorldSource},
     worker_protocol::{WorkerJob, WorkerReply, ChunkWire, SectionMeshWire},
     world::World,
 };
 
 struct Engine {
-    source: Box<dyn WorldSource>,
+    source: MemoryAnvilSource,
 }
 
 static ENGINE: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
@@ -17,7 +17,8 @@ fn engine_slot() -> &'static Mutex<Option<Engine>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-fn install(source: Box<dyn WorldSource>) -> Result<(), String> {
+pub fn init_from_zip(bytes: &[u8]) -> Result<(), String> {
+    let source = MemoryAnvilSource::from_zip(bytes).map_err(|err| err.to_string())?;
     if let Ok(mut slot) = engine_slot().lock() {
         *slot = Some(Engine { source });
         Ok(())
@@ -26,23 +27,12 @@ fn install(source: Box<dyn WorldSource>) -> Result<(), String> {
     }
 }
 
-pub fn init_from_zip(bytes: &[u8]) -> Result<(), String> {
-    let source = MemoryAnvilSource::from_zip(bytes).map_err(|err| err.to_string())?;
-    install(Box::new(source))
-}
-
-/// Seed worlds ship a seed rather than chunk data — generation is deterministic, so
-/// every worker reproduces the same terrain independently.
-pub fn init_from_seed(seed: i64) -> Result<(), String> {
-    install(Box::new(SeededProceduralSource::new(seed)))
-}
-
-fn with_source<R>(f: impl FnOnce(&dyn WorldSource) -> R) -> Result<R, String> {
+fn with_source<R>(f: impl FnOnce(&MemoryAnvilSource) -> R) -> Result<R, String> {
     let slot = engine_slot().lock().map_err(|_| "worker engine mutex poisoned".to_string())?;
     let Some(engine) = slot.as_ref() else {
         return Err("worker engine not initialized".to_string());
     };
-    Ok(f(engine.source.as_ref()))
+    Ok(f(&engine.source))
 }
 
 fn load_chunk(cx: i32, cz: i32) -> Result<ChunkWire, String> {

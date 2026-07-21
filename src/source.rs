@@ -26,12 +26,6 @@ pub trait WorldSource: Send + Sync {
     fn is_procedural(&self) -> bool {
         false
     }
-
-    /// Seed for procedural sources. Lets the engine hand workers a seed instead of
-    /// shipping chunk data, since generation is deterministic.
-    fn seed(&self) -> Option<i64> {
-        None
-    }
 }
 
 pub struct SeededProceduralSource {
@@ -59,10 +53,6 @@ impl WorldSource for SeededProceduralSource {
 
     fn is_procedural(&self) -> bool {
         true
-    }
-
-    fn seed(&self) -> Option<i64> {
-        Some(self.seed)
     }
 }
 
