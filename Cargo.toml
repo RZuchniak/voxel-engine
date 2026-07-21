@@ -3,6 +3,15 @@ name = "voxel-engine"
 version = "0.1.0"
 edition = "2024"
 
+# Plain rlib (no cdylib) so Trunk still sees exactly one wasm candidate: the bin.
+[lib]
+name = "voxel_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voxel-engine"
+path = "src/main.rs"
+
 [dependencies]
 wgpu = { version = "26.0.1" }
 bytemuck = "1.23.2"
@@ -48,3 +57,11 @@ rayon = "1.10.0"
 
 [dev-dependencies]
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# Noise/meshing are compute-bound; the wasm build needs speed, not size.
+# `panic = "abort"` is deliberately omitted so console_error_panic_hook keeps
+# producing browser stack traces during the optimization work.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

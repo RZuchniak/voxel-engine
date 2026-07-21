@@ -26,7 +26,7 @@ impl Camera {
         // Camera-relative view keeps float precision stable far from the origin (reduces z-fighting holes).
         let view = cgmath::Matrix4::look_at_rh(
             cgmath::Point3::origin(),
-            cgmath::Point3::from(self.target - self.position),
+            cgmath::Point3::from_vec(self.target - self.position),
             self.up,
         );
         let proj = cgmath::perspective(

@@ -25,7 +25,6 @@ mod block;
 mod camera;
 mod cull;
 mod mesh;
-mod noise;
 mod platform;
 mod source;
 mod streamer;
@@ -43,6 +42,10 @@ mod chunk_worker;
 mod worker_api;
 #[cfg(target_arch = "wasm32")]
 mod worker_bridge;
+
+// Re-bind lib modules into the bin's root namespace so existing `crate::…` paths in
+// submodules (e.g. `terrain.rs` -> `crate::noise`) keep resolving as modules migrate.
+use voxel_engine::noise;
 
 #[cfg(not(target_arch = "wasm32"))]
 use source::AnvilSource;
