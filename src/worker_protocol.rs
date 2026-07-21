@@ -67,9 +67,13 @@ impl ChunkWire {
         for (section_index, blocks) in self.sections {
             let mut section = Section::new();
             for (idx, block_id) in blocks.into_iter().enumerate() {
+                // `from_chunk` dumps `Section::block_data()` verbatim, and Section indexes
+                // as `x + y*16 + z*256`. Decoding with Minecraft's NBT order
+                // (`x + z*16 + y*256`) instead transposed Y and Z, which tilted every
+                // worker-delivered chunk on its side.
                 let x = idx & 0xF;
-                let z = (idx >> 4) & 0xF;
-                let y = idx >> 8;
+                let y = (idx >> 4) & 0xF;
+                let z = idx >> 8;
                 section.set_block(x, y, z, BlockId(block_id));
             }
             chunk.insert_section(section_index, section);

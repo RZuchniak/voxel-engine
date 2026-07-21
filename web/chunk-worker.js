@@ -8,6 +8,8 @@ let initPromise = null;
 let wasmModule = null;
 const jobQueue = [];
 let drainingJobs = false;
+/// Remembered from the init message so job traces can identify their worker.
+let selfWorkerId = -1;
 
 /**
  * Startup progress, reported through the ack channel so the bridge logs it.
@@ -47,6 +49,8 @@ async function runJob(msg) {
     const payload = new Uint8Array(msg.payload);
     const result = wasmModule.worker_handle_job(payload);
     const out = result instanceof Uint8Array ? result : new Uint8Array(result);
+    // Transfers `out.buffer`, so the main thread receives an ArrayBuffer rather than a
+    // Uint8Array — the bridge accepts both.
     self.postMessage({ type: "result", jobId: msg.jobId, payload: out.buffer }, [out.buffer]);
 }
 
@@ -83,6 +87,7 @@ self.onmessage = async (event) => {
 
     if (msg.type === "init") {
         try {
+            selfWorkerId = msg.workerId;
             const wasm = await ensureWasm(msg.wasmJs, msg.wasmModule, msg.workerId);
             trace(msg.workerId, "wasm:ready");
             if (msg.seed !== undefined && msg.seed !== null) {

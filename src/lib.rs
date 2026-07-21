@@ -15,6 +15,9 @@ pub mod source;
 pub mod terrain;
 pub mod texture;
 pub mod world;
+// Pure data (serde over Chunk/MeshData) with no wasm dependencies, so it lives in the lib
+// and stays testable natively even though only the wasm build uses it at runtime.
+pub mod worker_protocol;
 
 // `mesh.rs` refers to `crate::Vertex`; re-export so it compiles unchanged in the lib.
 pub use render::{OPENGL_TO_WGPU_MATRIX, Vertex};

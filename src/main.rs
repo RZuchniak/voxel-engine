@@ -26,7 +26,7 @@ mod hud;
 #[cfg(target_arch = "wasm32")]
 mod web_api;
 #[cfg(target_arch = "wasm32")]
-mod worker_protocol;
+use voxel_engine::worker_protocol;
 #[cfg(target_arch = "wasm32")]
 mod chunk_worker;
 #[cfg(target_arch = "wasm32")]

@@ -363,13 +363,41 @@ impl WorkerBridge {
                         crate::web_api::kick_event_loop();
                     }
                     Some("result") => {
+                        // Log the first few round trips so a reply that never arrives is
+                        // distinguishable from one that arrives and is then discarded.
+                        {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static SEEN: AtomicU32 = AtomicU32::new(0);
+                            let n = SEEN.fetch_add(1, Ordering::Relaxed);
+                            if n < 10 {
+                                web_sys::console::log_1(&JsValue::from_str(&format!(
+                                    "[worker] result #{n} received by main thread"
+                                )));
+                            }
+                        }
                         let job_id = js_sys::Reflect::get(data, &JsValue::from_str("jobId"))
                             .ok()
                             .and_then(|v| v.as_f64())
                             .map(|v| v as u32);
+                        // The worker posts `payload: out.buffer`, i.e. an ArrayBuffer, and
+                        // transfers it. An ArrayBuffer is not `instanceof Uint8Array`, so
+                        // casting straight to Uint8Array silently yielded None and dropped
+                        // every reply on the floor — which pinned pending_jobs at
+                        // max_in_flight and deadlocked dispatch. Accept both shapes.
                         let payload = js_sys::Reflect::get(data, &JsValue::from_str("payload"))
                             .ok()
-                            .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok());
+                            .and_then(|value| {
+                                if value.is_instance_of::<js_sys::Uint8Array>() {
+                                    value.dyn_into::<js_sys::Uint8Array>().ok()
+                                } else if value.is_instance_of::<js_sys::ArrayBuffer>() {
+                                    Some(js_sys::Uint8Array::new(&value))
+                                } else {
+                                    web_sys::console::error_1(&JsValue::from_str(
+                                        "worker reply payload was neither Uint8Array nor ArrayBuffer",
+                                    ));
+                                    None
+                                }
+                            });
                         if let (Some(job_id), Some(bytes)) = (job_id, payload) {
                             let mut vec = vec![0u8; bytes.length() as usize];
                             bytes.copy_to(&mut vec);
@@ -387,6 +415,13 @@ impl WorkerBridge {
                                     });
                                 }
                             }
+                        } else {
+                            // Dropping a reply here leaks a pending job forever, which
+                            // eventually pins pending_jobs at max_in_flight and stalls all
+                            // dispatch. Never let that happen quietly again.
+                            web_sys::console::error_1(&JsValue::from_str(
+                                "worker reply missing jobId or payload — job would leak",
+                            ));
                         }
                         crate::web_api::kick_event_loop();
                     }
