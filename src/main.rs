@@ -940,6 +940,11 @@ impl State {
             let had_initial_meshes = !meshed.is_remesh && !meshed.section_meshes.is_empty();
             if meshed.is_remesh {
                 self.upload_chunk_meshes(coord, meshed.section_meshes);
+            } else if had_initial_meshes {
+                // A worker already meshed this chunk, so just upload the buffers. This
+                // must be checked before the bootstrap/procedural branch below, which
+                // would otherwise re-mesh on the main thread and throw the work away.
+                self.upload_chunk_meshes(coord, meshed.section_meshes);
             } else if bootstrap || self.procedural_world {
                 if upload_start.elapsed().as_millis() >= upload_time_budget_dynamic {
                     // Defer heavy inline meshing to next frame to avoid spikes.
@@ -949,8 +954,6 @@ impl State {
                 } else {
                     self.mesh_loaded_chunk_during_bootstrap(coord);
                 }
-            } else if had_initial_meshes {
-                self.upload_chunk_meshes(coord, meshed.section_meshes);
             } else {
                 self.enqueue_priority_remesh(coord);
             }
