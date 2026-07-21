@@ -647,13 +647,29 @@ impl State {
         let world = World::new();
         let procedural_world = world_source.is_procedural();
         #[cfg(target_arch = "wasm32")]
+        let world_seed = world_source.seed();
+        #[cfg(target_arch = "wasm32")]
         let mut streamer = ChunkStreamer::new(world_source);
         #[cfg(not(target_arch = "wasm32"))]
         let streamer = ChunkStreamer::new(world_source);
         #[cfg(target_arch = "wasm32")]
-        if crate::platform::use_wasm_chunk_workers() && !procedural_world {
-            if let Some(zip_bytes) = web_api::clone_init_zip() {
-                if let Err(err) = streamer.enable_workers(&zip_bytes) {
+        if crate::platform::use_wasm_chunk_workers() {
+            use crate::worker_bridge::WorkerSource;
+            // Seed worlds hand workers a seed; zip worlds hand them the archive bytes.
+            let worker_source = match world_seed {
+                Some(seed) => Some(WorkerSource::Seed(seed)),
+                None => None,
+            };
+            let zip = if worker_source.is_none() {
+                web_api::clone_init_zip()
+            } else {
+                None
+            };
+            let worker_source =
+                worker_source.or_else(|| zip.as_deref().map(WorkerSource::Zip));
+
+            if let Some(worker_source) = worker_source {
+                if let Err(err) = streamer.enable_workers(worker_source) {
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "Failed to start chunk workers: {err} — using main thread"
                     )));
