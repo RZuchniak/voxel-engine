@@ -9,14 +9,30 @@ let wasmModule = null;
 const jobQueue = [];
 let drainingJobs = false;
 
-async function ensureWasm(wasmJs, wasmModuleUrl) {
+/**
+ * Startup progress, reported through the ack channel so the bridge logs it.
+ *
+ * Fires ~5 times per worker during init and never again, so it costs nothing at steady
+ * state. Worth keeping: worker console output is invisible to page-level tooling, and
+ * without these stages a worker that is merely slow is indistinguishable from one that
+ * is wedged.
+ */
+function trace(workerId, stage) {
+    self.postMessage({ type: "ack", workerId, forType: stage });
+}
+
+async function ensureWasm(wasmJs, wasmModuleUrl, workerId) {
     if (wasmModule) {
         return wasmModule;
     }
     if (!initPromise) {
         initPromise = (async () => {
+            trace(workerId, "import:start");
             const wasm = await import(wasmJs);
+            trace(workerId, "import:done");
+            trace(workerId, "instantiate:start");
             await wasm.default({ module_or_path: wasmModuleUrl });
+            trace(workerId, "instantiate:done");
             wasmModule = wasm;
             return wasm;
         })();
@@ -67,7 +83,8 @@ self.onmessage = async (event) => {
 
     if (msg.type === "init") {
         try {
-            const wasm = await ensureWasm(msg.wasmJs, msg.wasmModule);
+            const wasm = await ensureWasm(msg.wasmJs, msg.wasmModule, msg.workerId);
+            trace(msg.workerId, "wasm:ready");
             if (msg.seed !== undefined && msg.seed !== null) {
                 // Seed worlds ship a seed, not chunk data — generation is deterministic,
                 // so each worker reproduces the same terrain independently.
