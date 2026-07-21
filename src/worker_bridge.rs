@@ -284,8 +284,14 @@ pub struct WorkerBridge {
     inner: Rc<RefCell<WorkerBridgeInner>>,
 }
 
+/// What a worker needs to reproduce the world: raw zip bytes, or just a seed.
+pub enum WorkerSource<'a> {
+    Zip(&'a [u8]),
+    Seed(i64),
+}
+
 impl WorkerBridge {
-    pub fn start(zip_bytes: &[u8], worker_count: usize) -> Result<Self, String> {
+    pub fn start(source: WorkerSource<'_>, worker_count: usize) -> Result<Self, String> {
         let (wasm_js, wasm_module) = wasm_urls()?;
         let worker_count = worker_count.clamp(1, 4);
         let inner = Rc::new(RefCell::new(WorkerBridgeInner {
@@ -298,6 +304,17 @@ impl WorkerBridge {
             busy_coords: HashSet::new(),
         }));
 
+        // Build the zip payload once. It used to be re-allocated per worker, which for a
+        // 46 MB save meant several full copies before postMessage even cloned it.
+        let zip_buffer = match &source {
+            WorkerSource::Zip(bytes) => {
+                let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+                array.copy_from(bytes);
+                Some(array.buffer())
+            }
+            WorkerSource::Seed(_) => None,
+        };
+
         for worker_id in 0..worker_count {
             inner.borrow_mut().workers.push(WorkerHandle {
                 worker: {
@@ -309,10 +326,6 @@ impl WorkerBridge {
                 ready: Rc::new(Cell::new(false)),
             });
 
-            let zip_array = js_sys::Uint8Array::new_with_length(zip_bytes.len() as u32);
-            zip_array.copy_from(zip_bytes);
-            let zip_buffer = zip_array.buffer();
-
             let worker = inner.borrow().workers[worker_id].worker.clone();
             let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let data_value = event.data();
@@ -323,6 +336,22 @@ impl WorkerBridge {
                     .ok()
                     .and_then(|v| v.as_string());
                 match ty.as_deref() {
+                    // Proof the worker is alive and received the message, logged before it
+                    // has done any wasm work. Distinguishes "never arrived" from "still
+                    // starting up".
+                    Some("ack") => {
+                        let for_type = js_sys::Reflect::get(data, &JsValue::from_str("forType"))
+                            .ok()
+                            .and_then(|v| v.as_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        let worker_id = js_sys::Reflect::get(data, &JsValue::from_str("workerId"))
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as usize);
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[worker] ack from {worker_id:?} for '{for_type}'"
+                        )));
+                    }
                     Some("ready") => {
                         let worker_id = js_sys::Reflect::get(data, &JsValue::from_str("workerId"))
                             .ok()
@@ -383,6 +412,22 @@ impl WorkerBridge {
             worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
             onmessage.forget();
 
+            // Without this, a worker script that fails to load or throws during startup is
+            // completely silent: the Worker object exists, messages queue forever, and
+            // nothing ever reports ready.
+            let onerror = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(
+                move |event: web_sys::ErrorEvent| {
+                    web_sys::console::error_1(&JsValue::from_str(&format!(
+                        "chunk worker {worker_id} script error: {} ({}:{})",
+                        event.message(),
+                        event.filename(),
+                        event.lineno()
+                    )));
+                },
+            );
+            worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+            onerror.forget();
+
             let init = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&init, &JsValue::from_str("type"), &JsValue::from_str("init"));
             let _ = js_sys::Reflect::set(
@@ -400,8 +445,24 @@ impl WorkerBridge {
                 &JsValue::from_str("wasmModule"),
                 &JsValue::from_str(&wasm_module),
             );
-            let _ = js_sys::Reflect::set(&init, &JsValue::from_str("zipBytes"), &zip_buffer);
-            let _ = inner.borrow().workers[worker_id].worker.post_message(&init);
+            match (&source, &zip_buffer) {
+                (WorkerSource::Seed(seed), _) => {
+                    let _ = js_sys::Reflect::set(
+                        &init,
+                        &JsValue::from_str("seed"),
+                        &js_sys::BigInt::from(*seed).into(),
+                    );
+                }
+                (WorkerSource::Zip(_), Some(buffer)) => {
+                    let _ = js_sys::Reflect::set(&init, &JsValue::from_str("zipBytes"), buffer);
+                }
+                (WorkerSource::Zip(_), None) => {}
+            }
+            if let Err(err) = inner.borrow().workers[worker_id].worker.post_message(&init) {
+                return Err(format!(
+                    "worker {worker_id} init post_message failed: {err:?}"
+                ));
+            }
         }
 
         Ok(Self { inner })

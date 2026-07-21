@@ -60,14 +60,25 @@ self.onmessage = async (event) => {
         return;
     }
 
+    // Acknowledge before touching wasm. Loading the module takes seconds, and without
+    // this there is no way to tell "the message never arrived" apart from "the worker is
+    // still starting up" — a distinction that previously cost a long debugging session.
+    self.postMessage({ type: "ack", workerId: msg.workerId, forType: msg.type });
+
     if (msg.type === "init") {
         try {
             const wasm = await ensureWasm(msg.wasmJs, msg.wasmModule);
-            const zipBytes =
-                msg.zipBytes instanceof Uint8Array
-                    ? msg.zipBytes
-                    : new Uint8Array(msg.zipBytes);
-            wasm.worker_init(zipBytes);
+            if (msg.seed !== undefined && msg.seed !== null) {
+                // Seed worlds ship a seed, not chunk data — generation is deterministic,
+                // so each worker reproduces the same terrain independently.
+                wasm.worker_init_seed(BigInt(msg.seed));
+            } else {
+                const zipBytes =
+                    msg.zipBytes instanceof Uint8Array
+                        ? msg.zipBytes
+                        : new Uint8Array(msg.zipBytes);
+                wasm.worker_init(zipBytes);
+            }
             self.postMessage({ type: "ready", workerId: msg.workerId });
         } catch (err) {
             self.postMessage({

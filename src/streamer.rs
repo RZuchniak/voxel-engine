@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[cfg(target_arch = "wasm32")]
-use crate::worker_bridge::{take_failures, WorkerBridge};
+use crate::worker_bridge::{take_failures, WorkerBridge, WorkerSource};
 
 pub struct MeshedChunk {
     pub coord: (i32, i32),
@@ -60,11 +60,11 @@ impl ChunkStreamer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub fn enable_workers(&mut self, zip_bytes: &[u8]) -> Result<(), String> {
+    pub fn enable_workers(&mut self, source: WorkerSource<'_>) -> Result<(), String> {
         if !crate::platform::use_wasm_chunk_workers() || crate::platform::wasm_worker_count() == 0 {
             return Ok(());
         }
-        let bridge = WorkerBridge::start(zip_bytes, crate::platform::wasm_worker_count())?;
+        let bridge = WorkerBridge::start(source, crate::platform::wasm_worker_count())?;
         self.worker_bridge = Some(bridge);
         Ok(())
     }
@@ -92,6 +92,22 @@ impl ChunkStreamer {
             });
             crate::web_api::kick_event_loop();
         });
+    }
+
+    /// Generate on the main thread. Only used when no worker bridge is available.
+    #[cfg(target_arch = "wasm32")]
+    fn send_loaded_chunk_sync(&self, coord: (i32, i32)) {
+        let chunk = match self.source.load_chunk(coord) {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "chunk load failed at ({},{}): {err:#}",
+                    coord.0, coord.1
+                )));
+                Chunk::new(coord)
+            }
+        };
+        self.send_loaded_chunk(coord, chunk);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -187,31 +203,28 @@ impl ChunkStreamer {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = bootstrap;
-            if self.procedural {
-                self.in_flight.insert(coord);
-                let chunk = match self.source.load_chunk(coord) {
-                    Ok(chunk) => chunk,
-                    Err(err) => {
-                        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-                            "chunk load failed at ({},{}): {err:#}",
-                            coord.0, coord.1
-                        )));
-                        Chunk::new(coord)
-                    }
-                };
-                self.send_loaded_chunk(coord, chunk);
-                return true;
-            }
-            if !bootstrap {
+            // Seed worlds use workers from the first frame: each worker holds the same
+            // generator, so there is nothing to wait for. Zip bootstrap stays on the main
+            // thread because the workers are still parsing the archive.
+            if self.procedural || !bootstrap {
                 if let Some(bridge) = self.worker_bridge.as_mut() {
                     if bridge.try_request_load(coord) {
                         return true;
                     }
+                    // Fall through to the synchronous path below. An earlier version bailed
+                    // out here so bootstrap would wait for the workers, but if the workers
+                    // never become ready that loads nothing at all and the screen stays
+                    // blank. Degrading to main-thread generation keeps this change strictly
+                    // non-regressive: worst case is today's behaviour.
                 }
             }
+
             self.in_flight.insert(coord);
-            self.spawn_main_thread_load(coord);
+            if self.procedural {
+                self.send_loaded_chunk_sync(coord);
+            } else {
+                self.spawn_main_thread_load(coord);
+            }
             true
         }
     }
