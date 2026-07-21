@@ -21,16 +21,7 @@ use winit::{
     window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
 
-mod block;
-mod camera;
-mod cull;
-mod mesh;
-mod platform;
-mod source;
 mod streamer;
-mod texture;
-mod terrain;
-mod world;
 mod hud;
 #[cfg(target_arch = "wasm32")]
 mod web_api;
@@ -45,61 +36,15 @@ mod worker_bridge;
 
 // Re-bind lib modules into the bin's root namespace so existing `crate::…` paths in
 // submodules (e.g. `terrain.rs` -> `crate::noise`) keep resolving as modules migrate.
-use voxel_engine::noise;
+use voxel_engine::{
+    block, camera, cull, mesh, noise, platform, render, source, terrain, texture, world,
+};
+use voxel_engine::{OPENGL_TO_WGPU_MATRIX, Vertex};
 
 #[cfg(not(target_arch = "wasm32"))]
-use source::AnvilSource;
+use voxel_engine::source::AnvilSource;
 use streamer::ChunkStreamer;
-use world::{MIN_SECTION_Y, SECTION_SIZE, World};
-
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
-    cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
-    cgmath::Vector4::new(0.0, 1.0, 0.0, 0.0),
-    cgmath::Vector4::new(0.0, 0.0, 0.5, 0.0),
-    cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
-);
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub(crate) struct Vertex {
-    position: [f32; 3],
-    uv: [f32; 2],
-    tex_layer: u32,
-    light: u32,
-}
-
-impl Vertex {
-    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &[
-            wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x3,
-            },
-            wgpu::VertexAttribute {
-                offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                shader_location: 1,
-                format: wgpu::VertexFormat::Float32x2,
-            },
-            wgpu::VertexAttribute {
-                offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 2]>())
-                    as wgpu::BufferAddress,
-                shader_location: 2,
-                format: wgpu::VertexFormat::Uint32,
-            },
-            wgpu::VertexAttribute {
-                offset: (std::mem::size_of::<[f32; 3]>()
-                    + std::mem::size_of::<[f32; 2]>()
-                    + std::mem::size_of::<u32>()) as wgpu::BufferAddress,
-                shader_location: 3,
-                format: wgpu::VertexFormat::Uint32,
-            },
-        ],
-    };
-}
+use voxel_engine::world::{MIN_SECTION_Y, SECTION_SIZE, World};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
