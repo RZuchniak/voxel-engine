@@ -1615,6 +1615,13 @@ impl ApplicationHandler for App {
                     if !state.mouse_captured {
                         return;
                     }
+                    // Pointer lock (web) intermittently emits a single spurious huge
+                    // motion event; a real mouse never travels this far in one event.
+                    // Dropping the outlier stops the view from snapping mid-spin.
+                    const MAX_MOTION_PER_EVENT: f64 = 500.0;
+                    if delta.0.abs() > MAX_MOTION_PER_EVENT || delta.1.abs() > MAX_MOTION_PER_EVENT {
+                        return;
+                    }
                     let new_delta = (
                         delta.0 + state.camera_controller.mouse_delta.0,
                         delta.1 + state.camera_controller.mouse_delta.1,

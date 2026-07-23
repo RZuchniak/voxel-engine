@@ -1,5 +1,10 @@
 use cgmath::{EuclideanSpace, InnerSpace};
 
+/// Max pitch magnitude (~89°). Kept a full degree short of vertical: at exactly ±90°
+/// the look direction is parallel to world-up and `look_at_rh` becomes ill-conditioned,
+/// so turning near-vertical would snap the heading. 1.5533 rad leaves a stable margin.
+const MAX_PITCH: f64 = 1.5533;
+
 #[derive(Clone)]
 pub struct Camera {
     position: cgmath::Point3<f32>,
@@ -126,7 +131,9 @@ impl Controller {
         camera.yaw += self.mouse_delta.0 * self.sensitivity as f64;
         camera.pitch -= self.mouse_delta.1 * self.sensitivity as f64;
 
-        camera.pitch = camera.pitch.clamp(-1.57, 1.57);
+        camera.pitch = camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+        // Keep yaw bounded so it never loses float precision over a long session.
+        camera.yaw = camera.yaw.rem_euclid(std::f64::consts::TAU);
 
         let direction = cgmath::Vector3::new(
             (camera.yaw.cos() * camera.pitch.cos()) as f32,
@@ -144,7 +151,9 @@ impl Controller {
         camera.yaw += self.mouse_delta.0 * self.sensitivity as f64;
         camera.pitch -= self.mouse_delta.1 * self.sensitivity as f64;
 
-        camera.pitch = camera.pitch.clamp(-1.57, 1.57);
+        camera.pitch = camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+        // Keep yaw bounded so it never loses float precision over a long session.
+        camera.yaw = camera.yaw.rem_euclid(std::f64::consts::TAU);
 
         let direction = cgmath::Vector3::new(
             (camera.yaw.cos() * camera.pitch.cos()) as f32,
