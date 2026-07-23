@@ -7,6 +7,7 @@
 pub mod block;
 pub mod camera;
 pub mod cull;
+pub mod mc;
 pub mod noise;
 pub mod mesh;
 pub mod platform;
