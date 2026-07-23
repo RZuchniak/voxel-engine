@@ -1163,6 +1163,11 @@ impl State {
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
 
+            // Initial generation phase: draw no world geometry until the spawn area is
+            // ready. The loading HUD covers the screen and the freed frame time goes to
+            // chunk generation/meshing (like Minecraft's "Building terrain" gate).
+            // Streaming still runs in update() — only the visual draw is skipped here.
+            if self.world_ready {
             for dz in -draw_radius..=draw_radius {
                 for dx in -draw_radius..=draw_radius {
                     let chunk_coord = (player_chunk_x + dx, player_chunk_z + dz);
@@ -1193,6 +1198,7 @@ impl State {
                         self.visible_chunks_last_frame += 1;
                     }
                 }
+            }
             }
         }
 
@@ -1227,7 +1233,7 @@ impl State {
             #[cfg(not(target_arch = "wasm32"))]
             let worker_line = String::new();
             format!(
-                "Loading world… {}/{} chunks ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nWASD locked until ready — mouse look OK\nFPS: {:.0}",
+                "Building terrain… {}/{} chunks ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nRevealing once the spawn area is ready\nFPS: {:.0}",
                 boot_n,
                 boot_total,
                 2 * platform::bootstrap_chunk_radius() + 1,
