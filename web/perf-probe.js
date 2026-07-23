@@ -6,11 +6,18 @@
  * unless the page is cross-origin isolated, so sub-millisecond phase splits would
  * quantise to noise. Whole-frame deltas averaged over many frames are trustworthy.
  *
+ * The point of this probe is to make stutter a NUMBER. Averages and even p99 hide the
+ * ~1s hitches that worker-side meshing introduced, because a handful of catastrophic
+ * frames barely move a percentile computed over thousands of frames. So beyond the
+ * summary stats we capture every long frame with its timestamp, bucket them by severity,
+ * and report the worst offenders and cumulative time lost. Read `steady_hitches` first.
+ *
  * Usage — from the devtools console on http://127.0.0.1:8080:
  *
  *     await import("/web/perf-probe.js");
  *     await voxelProbe();                                  // seed 12345, defaults
  *     await voxelProbe({ seed: "42", sampleMs: 30000 });
+ *     await voxelProbe({ hitchMs: 33 });                   // stricter hitch threshold
  *
  * Results are printed and also left on `window.__voxelProbeResult` for copy-out.
  */
@@ -19,7 +26,7 @@ const OVERLAY_ID = "load-overlay";
 const SEED_INPUT_ID = "world-seed";
 const GENERATE_BTN_ID = "generate-seed-btn";
 
-/** Long-frame threshold — a frame this slow reads as a visible hitch. */
+/** Default long-frame threshold — a frame this slow reads as a visible hitch. */
 const HITCH_MS = 50;
 
 function percentile(sorted, p) {
@@ -28,7 +35,7 @@ function percentile(sorted, p) {
     return sorted[idx];
 }
 
-function summarise(deltas) {
+function summarise(deltas, hitchMs = HITCH_MS) {
     if (deltas.length === 0) {
         return { frames: 0 };
     }
@@ -43,7 +50,37 @@ function summarise(deltas) {
         p99_ms: +percentile(sorted, 99).toFixed(2),
         max_ms: +sorted[sorted.length - 1].toFixed(2),
         fps_p50: +(1000 / percentile(sorted, 50)).toFixed(1),
-        hitches: deltas.filter((d) => d >= HITCH_MS).length,
+        hitches: deltas.filter((d) => d >= hitchMs).length,
+    };
+}
+
+/**
+ * Characterise the long frames. This is the part that turns "it stutters" into evidence:
+ * how many, how bad, when, and how much wall-clock time was lost to jank overall.
+ */
+function summariseHitches(hitches, sampleMs, hitchMs) {
+    const bands = { "50-100": 0, "100-250": 0, "250-500": 0, "500-1000": 0, "1000+": 0 };
+    let totalMs = 0;
+    for (const h of hitches) {
+        totalMs += h.ms;
+        if (h.ms < 100) bands["50-100"]++;
+        else if (h.ms < 250) bands["100-250"]++;
+        else if (h.ms < 500) bands["250-500"]++;
+        else if (h.ms < 1000) bands["500-1000"]++;
+        else bands["1000+"]++;
+    }
+    const worst = [...hitches]
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, 5)
+        .map((h) => ({ ms: +h.ms.toFixed(0), at_s: h.at_s }));
+    return {
+        threshold_ms: hitchMs,
+        count: hitches.length,
+        per_min: sampleMs ? +(hitches.length / (sampleMs / 60000)).toFixed(1) : 0,
+        total_ms: +totalMs.toFixed(0),
+        pct_of_sample: sampleMs ? +((totalMs / sampleMs) * 100).toFixed(1) : 0,
+        bands,
+        worst,
     };
 }
 
@@ -70,11 +107,16 @@ function waitFor(predicate, timeoutMs, label) {
     });
 }
 
-/** Collect rAF deltas for `durationMs`, bucketed into `bucketMs` windows. */
-function collect(durationMs, bucketMs) {
+/**
+ * Collect rAF deltas for `durationMs`, bucketed into `bucketMs` windows. Every frame at
+ * or above `hitchMs` is also recorded individually with its timestamp so long frames can
+ * be located in time (e.g. correlated with chunk arrivals) rather than just counted.
+ */
+function collect(durationMs, bucketMs, hitchMs) {
     return new Promise((resolve) => {
         const deltas = [];
         const buckets = [];
+        const hitches = [];
         let current = [];
         let last = performance.now();
         const started = last;
@@ -85,17 +127,20 @@ function collect(durationMs, bucketMs) {
             last = now;
             deltas.push(dt);
             current.push(dt);
+            if (dt >= hitchMs) {
+                hitches.push({ at_s: +((now - started) / 1000).toFixed(2), ms: dt });
+            }
 
             if (now - bucketStart >= bucketMs) {
-                buckets.push({ at_s: +((now - started) / 1000).toFixed(1), ...summarise(current) });
+                buckets.push({ at_s: +((now - started) / 1000).toFixed(1), ...summarise(current, hitchMs) });
                 current = [];
                 bucketStart = now;
             }
             if (now - started >= durationMs) {
                 if (current.length) {
-                    buckets.push({ at_s: +((now - started) / 1000).toFixed(1), ...summarise(current) });
+                    buckets.push({ at_s: +((now - started) / 1000).toFixed(1), ...summarise(current, hitchMs) });
                 }
-                resolve({ deltas, buckets });
+                resolve({ deltas, buckets, hitches });
                 return;
             }
             requestAnimationFrame(tick);
@@ -110,10 +155,11 @@ window.voxelProbe = async function voxelProbe(opts = {}) {
         warmupMs = 5000,
         sampleMs = 20000,
         bucketMs = 2000,
+        hitchMs = HITCH_MS,
         startTimeoutMs = 120000,
     } = opts;
 
-    const result = { seed, startedAt: new Date().toISOString() };
+    const result = { seed, hitchMs, startedAt: new Date().toISOString() };
 
     // 1. Kick off world generation through the normal menu path, unless already running.
     if (!overlayHidden()) {
@@ -134,13 +180,15 @@ window.voxelProbe = async function voxelProbe(opts = {}) {
     // 2. Warmup. Bootstrap streaming is still running here; these frames are not
     //    representative of steady state, but the curve is worth seeing.
     console.log(`[probe] warmup ${warmupMs}ms…`);
-    const warmup = await collect(warmupMs, bucketMs);
-    result.warmup = summarise(warmup.deltas);
+    const warmup = await collect(warmupMs, bucketMs, hitchMs);
+    result.warmup = summarise(warmup.deltas, hitchMs);
+    result.warmup_hitches = summariseHitches(warmup.hitches, warmupMs, hitchMs);
 
     // 3. Steady-state sample.
     console.log(`[probe] sampling ${sampleMs}ms…`);
-    const sample = await collect(sampleMs, bucketMs);
-    result.steady = summarise(sample.deltas);
+    const sample = await collect(sampleMs, bucketMs, hitchMs);
+    result.steady = summarise(sample.deltas, hitchMs);
+    result.steady_hitches = summariseHitches(sample.hitches, sampleMs, hitchMs);
     result.buckets = sample.buckets;
 
     result.userAgent = navigator.userAgent;
@@ -151,6 +199,10 @@ window.voxelProbe = async function voxelProbe(opts = {}) {
     window.__voxelProbeResult = result;
     console.log("[probe] warmup :", result.warmup);
     console.log("[probe] steady :", result.steady);
+    console.log(`[probe] steady hitches (>=${hitchMs}ms):`, result.steady_hitches);
+    if (result.steady_hitches.count) {
+        console.table(result.steady_hitches.worst);
+    }
     console.table(result.buckets);
     console.log("[probe] full result on window.__voxelProbeResult");
     console.log(JSON.stringify(result, null, 2));
