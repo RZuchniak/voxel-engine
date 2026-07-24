@@ -29,3 +29,4 @@ pub mod noise_params;
 pub mod normal_noise;
 pub mod perlin;
 pub mod rng;
+pub mod spline;
