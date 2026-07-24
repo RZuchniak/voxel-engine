@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use super::blended_noise::BlendedNoise;
+use super::caves::Caves;
 use super::noise_params::{seed_factory, Noise};
 use super::normal_noise::NormalNoise;
 use super::spline::{self, Spline, SplineInput};
@@ -38,6 +39,7 @@ pub struct Overworld {
     offset_spline: Spline,
     factor_spline: Spline,
     jaggedness_spline: Spline,
+    caves: Caves,
 }
 
 impl Overworld {
@@ -55,6 +57,7 @@ impl Overworld {
             offset_spline: spline::overworld_offset(),
             factor_spline: spline::overworld_factor(),
             jaggedness_spline: spline::overworld_jaggedness(),
+            caves: Caves::new(&factory),
         }
     }
 
@@ -146,11 +149,23 @@ impl Overworld {
 
     /// The terrain density **without cave carving / aquifers**: the overworld y-slide
     /// applied to `slopedCheese`, then the `squeeze` post-process. `> 0 ⇒ solid`.
+    /// Faster than [`Self::final_density`] and good enough for a surface heightmap.
     pub fn density_no_caves(&self, x: f64, y: f64, z: f64) -> f64 {
         let caves = self.sloped_cheese(x, y, z);
         let slid = slide_overworld(y, caves);
         // postProcess: squeeze(0.64 · slide)  (blendDensity + interpolated are identity).
         squeeze(0.64 * slid)
+    }
+
+    /// The full overworld `finalDensity` **with cave carving** (still pre-aquifer):
+    /// `min( squeeze(0.64 · slide(caves)), NOODLE )` where
+    /// `caves = rangeChoice(slopedCheese, …, min(slopedCheese, 5·entrances), underground)`.
+    /// `> 0 ⇒ solid`. Aquifers/surface-rules are still deferred.
+    pub fn final_density(&self, x: f64, y: f64, z: f64) -> f64 {
+        let sloped_cheese = self.sloped_cheese(x, y, z);
+        let caves = self.caves.caves(x, y, z, sloped_cheese);
+        let post_processed = squeeze(0.64 * slide_overworld(y, caves));
+        self.caves.apply_noodle(x, y, z, post_processed)
     }
 
     /// Topmost `y` in `[min_y, max_y]` whose pre-cave density is solid, or `None` if the
@@ -229,5 +244,22 @@ mod tests {
     fn deterministic() {
         let ow = Overworld::new(SEED);
         assert_eq!(ow.sloped_cheese(10.0, 40.0, -20.0), ow.sloped_cheese(10.0, 40.0, -20.0));
+        assert_eq!(ow.final_density(10.0, 40.0, -20.0), ow.final_density(10.0, 40.0, -20.0));
+    }
+
+    #[test]
+    fn caves_carve_voids_underground() {
+        // With cave carving on, some below-surface blocks that the no-cave density calls
+        // solid must become air (finalDensity <= 0). Scan a small underground volume.
+        let ow = Overworld::new(SEED);
+        // A region the oracle comparison flagged as cavey (near spawn's low ground).
+        // Stop at the first carved block to keep the test cheap.
+        let carved = (16..48).flat_map(|x| (-80..-48).map(move |z| (x, z))).any(|(x, z)| {
+            (-30..40).any(|y| {
+                let (xf, yf, zf) = (x as f64, y as f64, z as f64);
+                ow.density_no_caves(xf, yf, zf) > 0.0 && ow.final_density(xf, yf, zf) <= 0.0
+            })
+        });
+        assert!(carved, "expected cave carving to open some underground voids");
     }
 }
