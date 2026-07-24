@@ -13,9 +13,13 @@
 //!   3. `normal_noise` — NormalNoise (the primitive climate/terrain noise). ✓
 //!   4. `noise_params` — the `NoiseData` table + seed→named-noise instantiation. ✓
 //!   5. `density` — the scalar density-function interpreter (node vocabulary). ✓
-//!      Still to add before a full column: `BlendedNoise` (base_3d_noise) and `Spline`
-//!      (`TerrainProvider`), then assemble the `NoiseRouterData.overworld` tree, then
-//!      slides/surface-rules/aquifers → multi-noise biomes.           ← next
+//!   6. `blended_noise` — BlendedNoise / base_3d_noise. ✓
+//!   7. `spline` — CubicSpline + TerrainProvider offset/factor/jaggedness. ✓
+//!   8. `overworld` — assembles the pre-cave terrain density; validated against the real
+//!      "Voxel" world (predicted surface within ±1–3 of the oracle; the residual is the
+//!      not-yet-ported surface rules + aquifers). ✓
+//!   9. cave carving (rangeChoice/underground/noodle/entrances) + aquifers + surface rules
+//!      → then multi-noise biomes.                                    ← next
 //!
 //! NOTE on validation: stages 1–3 are pinned to an independent BigInt reference of the
 //! same Java algorithms, so the port is faithful to that transcription. The one piece
@@ -27,6 +31,7 @@ pub mod blended_noise;
 pub mod density;
 pub mod noise_params;
 pub mod normal_noise;
+pub mod overworld;
 pub mod perlin;
 pub mod rng;
 pub mod spline;
