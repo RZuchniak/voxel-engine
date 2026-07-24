@@ -1,3 +1,5 @@
 /target
 Cargo.lock
 notes.md
+# Generated preview images from examples/preview.rs
+terrain_preview_*.png
