@@ -11,7 +11,9 @@
 //!   1. `rng`          — Xoroshiro128PlusPlus + named-noise seeding.  ✓
 //!   2. `perlin`       — ImprovedNoise + PerlinNoise (octaves).       ✓
 //!   3. `normal_noise` — NormalNoise (the primitive climate/terrain noise). ✓
-//!   4. multi-noise biomes → density functions → surface rules.      ← next
+//!   4. `noise_params` — the `NoiseData` table + seed→named-noise instantiation. ✓
+//!   5. density-function interpreter (the `NoiseRouterData.overworld` DAG) → splines
+//!      (`TerrainProvider`) → surface rules → multi-noise biomes.     ← next
 //!
 //! NOTE on validation: stages 1–3 are pinned to an independent BigInt reference of the
 //! same Java algorithms, so the port is faithful to that transcription. The one piece
@@ -19,6 +21,7 @@
 //! top-level `RandomState` chain — exactly which positional factory feeds each named
 //! noise — which belongs to stage 4's wiring, not the primitives here.
 
+pub mod noise_params;
 pub mod normal_noise;
 pub mod perlin;
 pub mod rng;
