@@ -12,8 +12,10 @@
 
 use md5::{Digest, Md5};
 
-const GOLDEN_RATIO_64: u64 = 0x6A09_E667_F3BC_C909;
-const SILVER_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
+// Named to match Mojang's `RandomSupport` constants (verified against decompiled 26.2):
+//   GOLDEN_RATIO_64 = -7046029254386353131, SILVER_RATIO_64 = 7640891576956012809.
+const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
+const SILVER_RATIO_64: u64 = 0x6A09_E667_F3BC_C909;
 
 /// SplitMix64 finalizer, "Stafford variant 13" — `RandomSupport.mixStafford13`.
 fn mix_stafford13(mut z: u64) -> u64 {
@@ -24,8 +26,8 @@ fn mix_stafford13(mut z: u64) -> u64 {
 
 /// `RandomSupport.upgradeSeedTo128bit` — expand a 64-bit world seed to the (lo, hi) pair.
 fn upgrade_seed_to_128(seed: i64) -> (u64, u64) {
-    let lo = (seed as u64) ^ GOLDEN_RATIO_64;
-    let hi = lo.wrapping_add(SILVER_RATIO_64);
+    let lo = (seed as u64) ^ SILVER_RATIO_64;
+    let hi = lo.wrapping_add(GOLDEN_RATIO_64);
     (mix_stafford13(lo), mix_stafford13(hi))
 }
 
@@ -42,8 +44,8 @@ impl XoroshiroRandom {
     /// all-zero state is replaced by a fixed nonzero seed.
     pub fn from_state(mut lo: u64, mut hi: u64) -> Self {
         if (lo | hi) == 0 {
-            lo = SILVER_RATIO_64;
-            hi = GOLDEN_RATIO_64;
+            lo = GOLDEN_RATIO_64;
+            hi = SILVER_RATIO_64;
         }
         Self { lo, hi }
     }
