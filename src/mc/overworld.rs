@@ -168,6 +168,46 @@ impl Overworld {
         self.caves.apply_noodle(x, y, z, post_processed)
     }
 
+    /// `preliminarySurfaceLevel(x, z)` — a cheap surface estimate the **aquifer** samples
+    /// (`NoiseRouterData.preliminarySurfaceLevel` → `findTopSurface`). It scans a simplified
+    /// density (offset/factor only — no 3D noise, no jaggedness) by `cellHeight = 8` from a
+    /// factor-derived ceiling and returns the first solid Y (or −64). Deliberately coarser
+    /// than [`Self::surface_y`]; it exists to seed aquifer cells, not to place blocks.
+    pub fn preliminary_surface_level(&self, x: f64, z: f64) -> i32 {
+        let factor = self.factor(x, z);
+        let offset = self.offset(x, z);
+        // upperBound = remap(0.2734375/factor − offset, 1.5,−1.5 → −64,320) clamped to [−40,320].
+        // remap(input, 1.5,−1.5,−64,320) = input·(−128) + 128.
+        let upper_raw = (0.2734375 * (1.0 / factor) - offset) * -128.0 + 128.0;
+        let upper = upper_raw.clamp(-40.0, 320.0);
+
+        const CELL_HEIGHT: i32 = 8;
+        const LOWER: i32 = -64;
+        let top_y = (upper / CELL_HEIGHT as f64).floor() as i32 * CELL_HEIGHT;
+        if top_y <= LOWER {
+            return LOWER;
+        }
+        let mut y = top_y;
+        while y >= LOWER {
+            if self.preliminary_density(y as f64, offset, factor) > 0.0 {
+                return y;
+            }
+            y -= CELL_HEIGHT;
+        }
+        LOWER
+    }
+
+    /// The simplified density `findTopSurface` scans: `slide(clamp(4·quarterNeg(depth·factor)
+    /// − 0.703125, ±64)) − 0.390625` (no 3D noise / jaggedness). `offset`/`factor` are the
+    /// column values, passed in to avoid recomputing the splines per Y step.
+    fn preliminary_density(&self, y: f64, offset: f64, factor: f64) -> f64 {
+        let depth = clamped_map(y, -64.0, 320.0, 1.5, -1.5) + offset;
+        let gradient_unscaled = depth * factor;
+        let quarter_neg = if gradient_unscaled > 0.0 { gradient_unscaled } else { gradient_unscaled * 0.25 };
+        let inner = (4.0 * quarter_neg - 0.703125).clamp(-64.0, 64.0);
+        slide_overworld(y, inner) - 0.390625
+    }
+
     /// Topmost `y` in `[min_y, max_y]` whose pre-cave density is solid, or `None` if the
     /// column is entirely air in range. This is the predicted surface altitude to compare
     /// against the oracle (subject to the deferred cave/aquifer/surface-rule caveats).
@@ -238,6 +278,16 @@ mod tests {
             (60..=70).contains(&surface),
             "predicted spawn surface y={surface}, expected near oracle's 65"
         );
+    }
+
+    #[test]
+    fn preliminary_surface_level_is_plausible() {
+        // The aquifer's cheap surface estimate: a multiple of the cell height (8) or the
+        // floor (−64), and near the real surface at spawn (oracle grass y65).
+        let ow = Overworld::new(SEED);
+        let psl = ow.preliminary_surface_level(0.0, 0.0);
+        assert!(psl == -64 || psl % 8 == 0, "psl {psl} not on the cell grid");
+        assert!((40..=96).contains(&psl), "psl {psl} implausibly far from spawn surface");
     }
 
     #[test]
