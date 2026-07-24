@@ -107,14 +107,68 @@ impl ImprovedNoise {
             lerp(v, lerp(u, g4, g5), lerp(u, g6, g7)),
         )
     }
+
+    /// `noise(x, y, z, yScale, yFudge)` — the y-smearing variant (`BlendedNoise` uses it).
+    /// The y fractional is snapped down to a multiple of `yScale` for the *gradient dots*
+    /// only; the y interpolation weight still uses the un-snapped fractional. When
+    /// `y_scale == 0` this reduces exactly to [`Self::noise`].
+    pub fn noise_smeared(&self, x: f64, y: f64, z: f64, y_scale: f64, y_fudge: f64) -> f64 {
+        let ix = x + self.xo;
+        let iy = y + self.yo;
+        let iz = z + self.zo;
+        let l = ix.floor() as i32;
+        let m = iy.floor() as i32;
+        let n = iz.floor() as i32;
+        let o = ix - l as f64;
+        let pp = iy - m as f64; // yr (original)
+        let q = iz - n as f64;
+
+        // yrFudge = floor(min(yFudge, yr) / yScale + 1e-7f) * yScale  (yScale != 0)
+        let yr = if y_scale != 0.0 {
+            let fudge_limit = if y_fudge >= 0.0 && y_fudge < pp { y_fudge } else { pp };
+            // 1.0E-7F is a *float* literal in Java; keep that exact double value.
+            let eps = 1.0e-7_f32 as f64;
+            let yr_fudge = (fudge_limit / y_scale + eps).floor() * y_scale;
+            pp - yr_fudge
+        } else {
+            pp
+        };
+
+        let a = self.perm(l).wrapping_add(m);
+        let b = self.perm(l.wrapping_add(1)).wrapping_add(m);
+        let aa = self.perm(a);
+        let ab = self.perm(a.wrapping_add(1));
+        let ba = self.perm(b);
+        let bb = self.perm(b.wrapping_add(1));
+
+        // Gradient dots use the fudged `yr`; interpolation weight `v` uses original `pp`.
+        let g0 = grad_dot(self.perm(aa.wrapping_add(n)), o, yr, q);
+        let g1 = grad_dot(self.perm(ba.wrapping_add(n)), o - 1.0, yr, q);
+        let g2 = grad_dot(self.perm(ab.wrapping_add(n)), o, yr - 1.0, q);
+        let g3 = grad_dot(self.perm(bb.wrapping_add(n)), o - 1.0, yr - 1.0, q);
+        let g4 = grad_dot(self.perm(aa.wrapping_add(n).wrapping_add(1)), o, yr, q - 1.0);
+        let g5 = grad_dot(self.perm(ba.wrapping_add(n).wrapping_add(1)), o - 1.0, yr, q - 1.0);
+        let g6 = grad_dot(self.perm(ab.wrapping_add(n).wrapping_add(1)), o, yr - 1.0, q - 1.0);
+        let g7 = grad_dot(self.perm(bb.wrapping_add(n).wrapping_add(1)), o - 1.0, yr - 1.0, q - 1.0);
+
+        let u = smoothstep(o);
+        let v = smoothstep(pp);
+        let w = smoothstep(q);
+        lerp(
+            w,
+            lerp(v, lerp(u, g0, g1), lerp(u, g2, g3)),
+            lerp(v, lerp(u, g4, g5), lerp(u, g6, g7)),
+        )
+    }
 }
 
 /// Large period used by `PerlinNoise.wrap` to keep sample coordinates in a range where
 /// `f64` precision stays high (`2^25`).
 const WRAP_PERIOD: f64 = 3.355_443_2E7;
 
+/// `PerlinNoise.wrap` — fold a coordinate into the high-precision window around 0.
 #[inline]
-fn wrap(d: f64) -> f64 {
+pub fn wrap(d: f64) -> f64 {
     d - (d / WRAP_PERIOD + 0.5).floor() * WRAP_PERIOD
 }
 

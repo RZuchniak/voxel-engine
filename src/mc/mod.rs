@@ -23,6 +23,7 @@
 //! top-level `RandomState` chain — exactly which positional factory feeds each named
 //! noise — which belongs to stage 4's wiring, not the primitives here.
 
+pub mod blended_noise;
 pub mod density;
 pub mod noise_params;
 pub mod normal_noise;
