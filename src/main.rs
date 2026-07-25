@@ -140,6 +140,16 @@ struct State {
     section_draw_distance_chunks: f32,
     /// False until the neighborhood around the spawn has GPU meshes and no pending mesh work.
     world_ready: bool,
+    /// When the engine started, for the load-timeline profile line.
+    started_at: web_time::Instant,
+    /// Loading-radius tiles already known finished. See [`Self::bootstrap_ready_tiles_cached`].
+    bootstrap_ready_cache: HashSet<(i32, i32)>,
+    /// Drain composition, for the load profile line.
+    drained_new_last_frame: usize,
+    drained_remesh_last_frame: usize,
+    /// Microseconds spent in each phase of the last update(), for the load profile line.
+    phase_stream_us: u128,
+    phase_mesh_us: u128,
     /// Bootstrap tiles we meshed (including empty/culled) so readiness does not stall forever.
     bootstrap_mesh_attempted: HashSet<(i32, i32)>,
     /// Seed-mode worlds skip workers and use faster inline generate+mesh.
@@ -686,6 +696,12 @@ impl State {
             fps_ema: 0.0,
             section_draw_distance_chunks: platform::default_section_draw_distance_chunks(),
             world_ready: false,
+            started_at: web_time::Instant::now(),
+            bootstrap_ready_cache: HashSet::new(),
+            drained_new_last_frame: 0,
+            drained_remesh_last_frame: 0,
+            phase_stream_us: 0,
+            phase_mesh_us: 0,
             bootstrap_mesh_attempted: HashSet::new(),
             procedural_world,
         };
@@ -725,10 +741,17 @@ impl State {
         self.profile_accum += self.delta;
         if self.profile_accum > 1_000_000 {
             println!(
-                "profile visible_draws={} visible_chunks={} uploaded_meshes={} loaded_chunks={}",
+                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={}",
+                self.started_at.elapsed().as_secs_f64(),
+                self.world_ready,
+                self.fps_ema,
                 self.visible_draw_calls_last_frame,
                 self.visible_chunks_last_frame,
                 self.uploaded_meshes_last_frame,
+                self.drained_new_last_frame,
+                self.drained_remesh_last_frame,
+                self.phase_stream_us,
+                self.phase_mesh_us,
                 self._world.chunks().count()
             );
             self.profile_accum = 0;
@@ -774,17 +797,31 @@ impl State {
         w * w
     }
 
-    fn bootstrap_ready_tiles(&self, player_chunk_x: i32, player_chunk_z: i32) -> usize {
-        let mut n = 0usize;
-        for dz in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
-            for dx in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
+    /// How many tiles in the loading radius are finished terrain — memoised.
+    ///
+    /// `chunk_bootstrap_tile_ready` ends up walking section block arrays via
+    /// `needs_surface_mesh`, and the uncached version ran it over every tile in the loading
+    /// radius twice a frame (once to test the gate, once for the HUD). At radius 16 that is
+    /// 1089 tiles × 2, and it was the main reason loading throughput decayed from ~69 to
+    /// ~9 chunks/s as the radius filled.
+    ///
+    /// Sound because readiness is monotonic while loading: chunks inside the loading radius
+    /// are never unloaded (keep distance is larger), and a tile that has data and a mesh
+    /// keeps them. Only unready tiles are re-tested.
+    fn bootstrap_ready_tiles_cached(&mut self, player_chunk_x: i32, player_chunk_z: i32) -> usize {
+        let radius = platform::bootstrap_chunk_radius();
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
                 let c = (player_chunk_x + dx, player_chunk_z + dz);
+                if self.bootstrap_ready_cache.contains(&c) {
+                    continue;
+                }
                 if self.chunk_bootstrap_tile_ready(c) {
-                    n += 1;
+                    self.bootstrap_ready_cache.insert(c);
                 }
             }
         }
-        n
+        self.bootstrap_ready_cache.len()
     }
 
     fn try_finish_world_bootstrap(&mut self) {
@@ -793,12 +830,20 @@ impl State {
         }
         let px = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let pz = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
-        if self.bootstrap_ready_tiles(px, pz) == Self::bootstrap_tile_count() {
+        if self.bootstrap_ready_tiles_cached(px, pz) == Self::bootstrap_tile_count() {
             self.world_ready = true;
+            self.bootstrap_ready_cache.clear();
+            println!(
+                "world revealed after {:.1}s ({} chunks built, loading radius {})",
+                self.started_at.elapsed().as_secs_f64(),
+                Self::bootstrap_tile_count(),
+                platform::bootstrap_chunk_radius(),
+            );
         }
     }
 
     fn update_streaming(&mut self) {
+        let stream_phase_start = Instant::now();
         let player_chunk_x = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let player_chunk_z = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let bootstrap = !self.world_ready;
@@ -922,8 +967,11 @@ impl State {
             )
         };
 
+        self.phase_stream_us = stream_phase_start.elapsed().as_micros();
         let upload_start = Instant::now();
         let mut uploaded_this_frame = 0usize;
+        let mut drained_new = 0usize;
+        let mesh_phase_start = Instant::now();
         while uploaded_this_frame < upload_budget_dynamic
             && upload_start.elapsed().as_millis() < upload_time_budget_dynamic
         {
@@ -955,6 +1003,9 @@ impl State {
                 self.enqueue_priority_remesh(coord);
             }
             uploaded_this_frame += 1;
+            if !meshed.is_remesh {
+                drained_new += 1;
+            }
 
             if !meshed.is_remesh && self.world_ready {
                 let neighbors = [
@@ -970,17 +1021,25 @@ impl State {
                 }
             }
         }
+        self.phase_mesh_us = mesh_phase_start.elapsed().as_micros();
         self.uploaded_meshes_last_frame = uploaded_this_frame;
+        self.drained_new_last_frame = drained_new;
+        self.drained_remesh_last_frame = uploaded_this_frame - drained_new;
 
         if bootstrap {
             let mut need_mesh: Vec<((i32, i32), i32)> = Vec::new();
             for dz in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
                 for dx in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
                     let coord = (player_chunk_x + dx, player_chunk_z + dz);
-                    if self._world.has_chunk(coord)
-                        && self.chunk_needs_gpu_mesh(coord)
+                    // Order matters: `chunk_needs_gpu_mesh` walks section block arrays, and
+                    // this loop runs over every tile in the loading radius each frame. With
+                    // the expensive test first, cost grew as the radius filled and loading
+                    // throughput decayed from ~69 to ~9 chunks/s. Cheap set/map lookups
+                    // first, so an already-handled tile never reaches the scan.
+                    if !self.bootstrap_mesh_attempted.contains(&coord)
                         && !self.chunk_has_any_gpu_section(coord)
-                        && !self.bootstrap_mesh_attempted.contains(&coord)
+                        && self._world.has_chunk(coord)
+                        && self.chunk_needs_gpu_mesh(coord)
                     {
                         need_mesh.push((coord, dx * dx + dz * dz));
                     }
@@ -1204,9 +1263,13 @@ impl State {
 
         let stream_blocks = platform::load_distance_chunks() * SECTION_SIZE as i32;
         let section_cull_blocks = (SECTION_SIZE as f32 * self.section_draw_distance_chunks) as i32;
-        let px = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
-        let pz = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
-        let boot_n = self.bootstrap_ready_tiles(px, pz);
+        // The gate already recomputed this in update(); reuse it rather than re-walking
+        // every tile a second time just to draw the progress bar.
+        let boot_n = if self.world_ready {
+            Self::bootstrap_tile_count()
+        } else {
+            self.bootstrap_ready_cache.len()
+        };
         let boot_total = Self::bootstrap_tile_count();
         let hud_text = if self.world_ready {
             format!(
@@ -1232,8 +1295,26 @@ impl State {
                 .unwrap_or_else(|| "\nLoader: main thread".to_string());
             #[cfg(not(target_arch = "wasm32"))]
             let worker_line = String::new();
+            let pct = 100.0 * boot_n as f32 / boot_total.max(1) as f32;
+            let elapsed = self.started_at.elapsed().as_secs_f32();
+            // Once enough is done to extrapolate, show a remaining estimate — a bare
+            // percentage on a minute-long wait reads as a hang.
+            let eta = if boot_n > 16 && pct > 1.0 {
+                format!(" · ~{:.0}s left", (elapsed / pct * 100.0 - elapsed).max(0.0))
+            } else {
+                String::new()
+            };
+            let bar_width = 32usize;
+            let filled = ((pct / 100.0) * bar_width as f32).round() as usize;
+            let bar: String = std::iter::repeat('#')
+                .take(filled.min(bar_width))
+                .chain(std::iter::repeat('-').take(bar_width.saturating_sub(filled)))
+                .collect();
             format!(
-                "Building terrain… {}/{} chunks ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nRevealing once the spawn area is ready\nFPS: {:.0}",
+                "Building terrain…\n[{}] {:.0}%{}\n{}/{} chunks ready ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nRevealing once the whole area is built",
+                bar,
+                pct,
+                eta,
                 boot_n,
                 boot_total,
                 2 * platform::bootstrap_chunk_radius() + 1,
@@ -1241,7 +1322,6 @@ impl State {
                 self._world.chunks().count(),
                 self.pending_ready.len(),
                 worker_line,
-                self.fps_ema,
             )
         };
         self.hud
@@ -1528,9 +1608,7 @@ impl ApplicationHandler for App {
                     state.update();
                     state.window.request_redraw();
                     match state.render() {
-                        Ok(_) => {
-                            //println!("Frame rate: {}", 1.0 / state.delta as f64 * 1000000.0);
-                        }
+                        Ok(_) => {}
                         Err(_) => {
                             let size = state.window.inner_size();
                             state.resize(size.width, size.height);

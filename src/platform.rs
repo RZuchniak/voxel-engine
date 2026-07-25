@@ -27,12 +27,35 @@ pub const fn max_section_draw_distance_chunks() -> f32 {
     }
 }
 
+/// How much world is generated *and meshed* before the player is let in.
+///
+/// This is the loading screen's size. Everything inside it is finished terrain when the
+/// world is revealed, so raising it trades a longer wait for a cleaner arrival — fewer
+/// frame-time dips and less pop-in while the rest streams in behind you.
+///
+/// Native default is 12 (625 chunks, ~17 s with the Minecraft-parity generator, after which
+/// the world holds 98–132 FPS immediately). Override with `VOXEL_LOADING_RADIUS=<chunks>` —
+/// 16 buys a wider finished area for ~46 s; 0 disables the wait entirely.
+///
+/// The wait is dominated by **main-thread meshing** (~4.6 ms/chunk), not by generation or
+/// rendering — see the load-profile notes in HANDOFF.md before trying to tune it.
 #[inline]
-pub const fn bootstrap_chunk_radius() -> i32 {
-    if cfg!(target_arch = "wasm32") {
+pub fn bootstrap_chunk_radius() -> i32 {
+    #[cfg(target_arch = "wasm32")]
+    {
         3
-    } else {
-        8
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static RADIUS: OnceLock<i32> = OnceLock::new();
+        *RADIUS.get_or_init(|| {
+            std::env::var("VOXEL_LOADING_RADIUS")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .map(|v| v.clamp(0, load_distance_chunks()))
+                .unwrap_or(12)
+        })
     }
 }
 
