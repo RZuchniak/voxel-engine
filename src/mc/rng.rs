@@ -128,6 +128,23 @@ impl PositionalFactory {
         let m = u64::from_be_bytes(digest[8..16].try_into().unwrap());
         XoroshiroRandom::from_state(l ^ self.lo, m ^ self.hi)
     }
+
+    /// `at(x, y, z)` — a stream seeded from a block position. Note this XORs
+    /// `Mth.getSeed` into the *low* word only and takes the high word verbatim, and it
+    /// uses the **raw-state** constructor (no `upgradeSeedTo128bit`). Aquifer cell
+    /// placement is the main consumer.
+    pub fn at(&self, x: i32, y: i32, z: i32) -> XoroshiroRandom {
+        XoroshiroRandom::from_state(get_seed(x, y, z) as u64 ^ self.lo, self.hi)
+    }
+}
+
+/// `Mth.getSeed(x, y, z)` — the positional hash worldgen uses to seed per-position
+/// randoms. `x * 3129871` is a 32-bit int multiply (wrapping) that is then sign-extended,
+/// and the final shift is arithmetic.
+fn get_seed(x: i32, y: i32, z: i32) -> i64 {
+    let mut s = (x.wrapping_mul(3129871) as i64) ^ (z as i64).wrapping_mul(116129781) ^ (y as i64);
+    s = s.wrapping_mul(s).wrapping_mul(42317861).wrapping_add(s.wrapping_mul(11));
+    s >> 16
 }
 
 #[cfg(test)]

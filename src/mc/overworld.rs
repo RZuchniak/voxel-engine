@@ -17,10 +17,12 @@
 //! the terrain *envelope* (surface altitude and solid body) but not cave voids or the exact
 //! surface block. Surface altitude is the first thing to validate against the oracle.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::aquifer::{AquiferNoises, ChunkAquifer};
 use super::blended_noise::BlendedNoise;
-use super::caves::Caves;
+use super::caves::{self, Caves, NoodleNodes};
 use super::noise_params::{seed_factory, Noise};
 use super::normal_noise::NormalNoise;
 use super::spline::{self, Spline, SplineInput};
@@ -40,6 +42,7 @@ pub struct Overworld {
     factor_spline: Spline,
     jaggedness_spline: Spline,
     caves: Caves,
+    aquifer: AquiferNoises,
 }
 
 impl Overworld {
@@ -58,7 +61,20 @@ impl Overworld {
             factor_spline: spline::overworld_factor(),
             jaggedness_spline: spline::overworld_jaggedness(),
             caves: Caves::new(&factory),
+            aquifer: AquiferNoises::new(&factory),
         }
+    }
+
+    /// The shared aquifer noises + positional factory (`RandomState`-level state).
+    pub(super) fn aquifer(&self) -> &AquiferNoises {
+        &self.aquifer
+    }
+
+    /// Build the [`ChunkAquifer`] for chunk `(chunk_x, chunk_z)`. The aquifer is per-chunk
+    /// in vanilla (its sampling cutoff depends on the chunk's highest surface), so a
+    /// column's substance must be queried through the aquifer of its own chunk.
+    pub fn aquifer_for_chunk(&self, chunk_x: i32, chunk_z: i32) -> ChunkAquifer<'_> {
+        ChunkAquifer::new(self, chunk_x, chunk_z)
     }
 
     // ---- shift (the coordinate warp shared by every 2d climate noise) ----
@@ -75,8 +91,11 @@ impl Overworld {
     }
 
     /// `shiftedNoise2d(shiftX, shiftZ, 0.25, noise)` at (x, z) — the shared 2d sampling.
+    /// The router wraps every 2d climate noise in `flatCache`, so it is sampled **once per
+    /// quart column** and reused across that quart's 4×4 blocks; [`quart`] reproduces that.
     #[inline]
     fn shifted_2d(&self, noise: &NormalNoise, x: f64, z: f64) -> f64 {
+        let (x, z) = (quart(x), quart(z));
         let nx = x * 0.25 + self.shift_x(x, z);
         let nz = z * 0.25 + self.shift_z(x, z);
         noise.get_value(nx, 0.0, nz)
@@ -127,7 +146,9 @@ impl Overworld {
     /// `jaggedNoise = noise(JAGGED, xzScale=1500, yScale=0)`.
     fn jaggedness(&self, x: f64, y: f64, z: f64, input: &SplineInput) -> f64 {
         let unscaled = self.jaggedness_spline.sample(input) as f64;
-        let jagged_noise = self.jagged.get_value(x * 1500.0, y * 0.0, z * 1500.0);
+        // Also `flatCache`d in the router — quart-resolution, and always at y = 0 (which is
+        // moot here since the jagged noise's y scale is 0 anyway).
+        let jagged_noise = self.jagged.get_value(quart(x) * 1500.0, y * 0.0, quart(z) * 1500.0);
         let half_neg = if jagged_noise > 0.0 { jagged_noise } else { jagged_noise * 0.5 };
         unscaled * half_neg
     }
@@ -157,15 +178,26 @@ impl Overworld {
         squeeze(0.64 * slid)
     }
 
-    /// The full overworld `finalDensity` **with cave carving** (still pre-aquifer):
-    /// `min( squeeze(0.64 · slide(caves)), NOODLE )` where
-    /// `caves = rangeChoice(slopedCheese, …, min(slopedCheese, 5·entrances), underground)`.
-    /// `> 0 ⇒ solid`. Aquifers/surface-rules are still deferred.
-    pub fn final_density(&self, x: f64, y: f64, z: f64) -> f64 {
-        let sloped_cheese = self.sloped_cheese(x, y, z);
-        let caves = self.caves.caves(x, y, z, sloped_cheese);
-        let post_processed = squeeze(0.64 * slide_overworld(y, caves));
-        self.caves.apply_noodle(x, y, z, post_processed)
+    /// The full overworld `finalDensity` **with cave carving**:
+    /// `min( squeeze(0.64 · slide(caves)), NOODLE )`. `> 0 ⇒ solid`.
+    ///
+    /// Both halves are `interpolated` in the router, so this is a trilinear blend of the
+    /// 4×8×4 cell lattice, not a per-block evaluation — see [`CellSampler`]. Each call
+    /// evaluates all 8 corners; use a [`CellSampler`] directly to reuse them across a chunk.
+    pub fn final_density(&self, x: i32, y: i32, z: i32) -> f64 {
+        CellSampler::new(self).final_density(x, y, z)
+    }
+
+    /// The `interpolated`-wrapped nodes at one cell-lattice corner.
+    fn cell_nodes(&self, x: i32, y: i32, z: i32) -> CellNodes {
+        let (xf, yf, zf) = (x as f64, y as f64, z as f64);
+        let sloped_cheese = self.sloped_cheese(xf, yf, zf);
+        let caves = self.caves.caves(xf, yf, zf, sloped_cheese);
+        CellNodes {
+            // `postProcess` interpolates `0.64 · slide(caves)`, then squeezes per block.
+            density: 0.64 * slide_overworld(yf, caves),
+            noodle: self.caves.noodle_nodes(xf, yf, zf),
+        }
     }
 
     /// `preliminarySurfaceLevel(x, z)` — a cheap surface estimate the **aquifer** samples
@@ -216,6 +248,86 @@ impl Overworld {
     }
 }
 
+/// The cell size the router's `interpolated` nodes are sampled on
+/// (`NoiseSettings.OVERWORLD_NOISE_SETTINGS.getCell{Width,Height}()`).
+const CELL_WIDTH: i32 = 4;
+const CELL_HEIGHT: i32 = 8;
+
+/// The density-function nodes vanilla wraps in `interpolated`, at one lattice corner.
+#[derive(Clone, Copy, Default)]
+struct CellNodes {
+    /// `0.64 · slide(caves)` — the argument of `postProcess`'s `interpolated`.
+    density: f64,
+    noodle: NoodleNodes,
+}
+
+/// Samples the terrain the way `NoiseChunk` does: the expensive density nodes are
+/// evaluated **only on the 4×8×4 cell lattice** and trilinearly blended between corners.
+/// That smoothing is part of the world's shape, not an optimisation — caves and overhangs
+/// come out visibly different without it.
+///
+/// The corner cache makes bulk sampling cheap: a cell's 8 corners serve all 128 blocks in
+/// it, and neighbouring cells share them. Keep one sampler per chunk.
+pub struct CellSampler<'a> {
+    ow: &'a Overworld,
+    corners: HashMap<(i32, i32, i32), CellNodes>,
+}
+
+impl<'a> CellSampler<'a> {
+    pub fn new(ow: &'a Overworld) -> Self {
+        Self { ow, corners: HashMap::new() }
+    }
+
+    /// See [`Overworld::final_density`]. `> 0 ⇒ solid`.
+    pub fn final_density(&mut self, x: i32, y: i32, z: i32) -> f64 {
+        let x0 = x.div_euclid(CELL_WIDTH) * CELL_WIDTH;
+        let y0 = y.div_euclid(CELL_HEIGHT) * CELL_HEIGHT;
+        let z0 = z.div_euclid(CELL_WIDTH) * CELL_WIDTH;
+        let ax = (x - x0) as f64 / CELL_WIDTH as f64;
+        let ay = (y - y0) as f64 / CELL_HEIGHT as f64;
+        let az = (z - z0) as f64 / CELL_WIDTH as f64;
+
+        // Corner order matches `Mth.lerp3`'s argument order: x fastest, then y, then z.
+        let mut n = [CellNodes::default(); 8];
+        let mut i = 0;
+        for dz in [0, CELL_WIDTH] {
+            for dy in [0, CELL_HEIGHT] {
+                for dx in [0, CELL_WIDTH] {
+                    n[i] = self.corner(x0 + dx, y0 + dy, z0 + dz);
+                    i += 1;
+                }
+            }
+        }
+
+        let density = squeeze(lerp3(ax, ay, az, n.map(|c| c.density)));
+        let noodle = caves::noodle(&NoodleNodes {
+            toggle: lerp3(ax, ay, az, n.map(|c| c.noodle.toggle)),
+            thickness: lerp3(ax, ay, az, n.map(|c| c.noodle.thickness)),
+            ridge_a: lerp3(ax, ay, az, n.map(|c| c.noodle.ridge_a)),
+            ridge_b: lerp3(ax, ay, az, n.map(|c| c.noodle.ridge_b)),
+        });
+        density.min(noodle)
+    }
+
+    fn corner(&mut self, x: i32, y: i32, z: i32) -> CellNodes {
+        if let Some(&c) = self.corners.get(&(x, y, z)) {
+            return c;
+        }
+        let c = self.ow.cell_nodes(x, y, z);
+        self.corners.insert((x, y, z), c);
+        c
+    }
+}
+
+/// `Mth.lerp3` — trilinear blend over corners ordered `x000, x100, x010, x110, x001, …`.
+fn lerp3(ax: f64, ay: f64, az: f64, v: [f64; 8]) -> f64 {
+    let x00 = lerp(ax, v[0], v[1]);
+    let x10 = lerp(ax, v[2], v[3]);
+    let x01 = lerp(ax, v[4], v[5]);
+    let x11 = lerp(ax, v[6], v[7]);
+    lerp(az, lerp(ay, x00, x10), lerp(ay, x01, x11))
+}
+
 /// `slideOverworld(amplified=false, caves)` — the top/bottom y taper.
 fn slide_overworld(y: f64, caves: f64) -> f64 {
     // slide(caves, minY=-64, height=384, 80, 64, -0.078125, 0, 24, 0.1171875)
@@ -236,6 +348,14 @@ fn squeeze(v: f64) -> f64 {
 #[inline]
 fn lerp(t: f64, a: f64, b: f64) -> f64 {
     a + t * (b - a)
+}
+
+/// Snap a block coordinate down to its quart (4-block) origin — `QuartPos.toBlock(
+/// QuartPos.fromBlock(v))`. This is the resolution `flatCache` pins the 2d climate and
+/// spline layer to, so terrain shaping changes only every 4 blocks in x/z.
+#[inline]
+fn quart(v: f64) -> f64 {
+    ((v.floor() as i32) & !3) as f64
 }
 
 /// `Mth.clampedMap` (double).
@@ -294,7 +414,31 @@ mod tests {
     fn deterministic() {
         let ow = Overworld::new(SEED);
         assert_eq!(ow.sloped_cheese(10.0, 40.0, -20.0), ow.sloped_cheese(10.0, 40.0, -20.0));
-        assert_eq!(ow.final_density(10.0, 40.0, -20.0), ow.final_density(10.0, 40.0, -20.0));
+        assert_eq!(ow.final_density(10, 40, -20), ow.final_density(10, 40, -20));
+    }
+
+    #[test]
+    fn cell_sampler_matches_uncached_final_density() {
+        // The corner cache must be pure memoisation.
+        let ow = Overworld::new(SEED);
+        let mut sampler = CellSampler::new(&ow);
+        for (x, y, z) in [(0, 30, 0), (7, -12, 5), (-3, 64, 11), (13, 100, -9)] {
+            assert_eq!(sampler.final_density(x, y, z), ow.final_density(x, y, z), "at {x},{y},{z}");
+        }
+    }
+
+    #[test]
+    fn density_is_continuous_across_a_cell() {
+        // Interpolation means the density varies smoothly inside a 4×8×4 cell rather than
+        // jumping: consecutive blocks along x must not differ wildly.
+        let ow = Overworld::new(SEED);
+        let mut sampler = CellSampler::new(&ow);
+        let mut prev = sampler.final_density(0, 20, 0);
+        for x in 1..8 {
+            let v = sampler.final_density(x, 20, 0);
+            assert!((v - prev).abs() < 0.5, "density jumped from {prev} to {v} at x={x}");
+            prev = v;
+        }
     }
 
     #[test]
@@ -304,10 +448,11 @@ mod tests {
         let ow = Overworld::new(SEED);
         // A region the oracle comparison flagged as cavey (near spawn's low ground).
         // Stop at the first carved block to keep the test cheap.
+        let mut sampler = CellSampler::new(&ow);
         let carved = (16..48).flat_map(|x| (-80..-48).map(move |z| (x, z))).any(|(x, z)| {
             (-30..40).any(|y| {
-                let (xf, yf, zf) = (x as f64, y as f64, z as f64);
-                ow.density_no_caves(xf, yf, zf) > 0.0 && ow.final_density(xf, yf, zf) <= 0.0
+                ow.density_no_caves(x as f64, y as f64, z as f64) > 0.0
+                    && sampler.final_density(x, y, z) <= 0.0
             })
         });
         assert!(carved, "expected cave carving to open some underground voids");

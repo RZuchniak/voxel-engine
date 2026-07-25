@@ -15,7 +15,7 @@ use std::fs::File;
 
 use fastanvil::{Chunk, CurrentJavaChunk, Region};
 use fastnbt::from_bytes;
-use voxel_engine::mc::overworld::Overworld;
+use voxel_engine::mc::overworld::{CellSampler, Overworld};
 
 const Y_LO: i32 = -64;
 const Y_HI: i32 = 200; // above this is air in these columns; skip to save time
@@ -26,6 +26,7 @@ fn main() {
     let seed: i64 = args.next().map(|s| s.parse().unwrap()).unwrap_or(6954908675375307936);
 
     let ow = Overworld::new(seed);
+    let mut sampler = CellSampler::new(&ow);
 
     let mut blocks = 0u64;
     let mut agree = 0u64;
@@ -40,7 +41,7 @@ fn main() {
             columns += 1;
             let mut col_disagree = 0u32;
             for y in Y_LO..=Y_HI {
-                let mine_solid = ow.final_density(bx as f64, y as f64, bz as f64) > 0.0;
+                let mine_solid = sampler.final_density(bx, y, bz) > 0.0;
                 let oracle_solid = col[(y - Y_LO) as usize];
                 blocks += 1;
                 if mine_solid == oracle_solid {

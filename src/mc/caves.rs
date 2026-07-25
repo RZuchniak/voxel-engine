@@ -138,24 +138,22 @@ impl Caves {
         underground_subtractions.max(pillars_cut)
     }
 
-    /// `NOODLE` — the thin worm-caves min'd onto the final density.
-    fn noodle(&self, x: f64, y: f64, z: f64) -> f64 {
+    /// The four `NOODLE` inputs. Each is separately wrapped in `interpolated` by
+    /// `yLimitedInterpolatable`, so they must be sampled on the cell lattice and blended
+    /// **before** [`noodle`] combines them — hence returning the parts, not the result.
+    pub fn noodle_nodes(&self, x: f64, y: f64, z: f64) -> NoodleNodes {
         // yLimitedInterpolatable(y, whenInRange, -60, 320, out) = whenInRange for -60<=y<=320.
         let in_range = (-60.0..=320.0).contains(&y);
-        let toggle = if in_range { noise3(&self.noodle, x, y, z, 1.0, 1.0) } else { -1.0 };
-        if toggle < 0.0 {
-            // rangeChoice(toggle, -1e6, 0.0, 64.0, …): toggle < 0 → solid filler 64.
-            return 64.0;
+        if !in_range {
+            return NoodleNodes { toggle: -1.0, thickness: 0.0, ridge_a: 0.0, ridge_b: 0.0 };
         }
-        let thickness = if in_range {
-            mapped(&self.noodle_thickness, x, y, z, 1.0, 1.0, -0.05, -0.1)
-        } else {
-            0.0
-        };
-        let ridge_a = if in_range { noise3(&self.noodle_ridge_a, x, y, z, 2.666_666_666_666_666_5, 2.666_666_666_666_666_5) } else { 0.0 };
-        let ridge_b = if in_range { noise3(&self.noodle_ridge_b, x, y, z, 2.666_666_666_666_666_5, 2.666_666_666_666_666_5) } else { 0.0 };
-        let ridged = 1.5 * ridge_a.abs().max(ridge_b.abs());
-        thickness + ridged
+        const RIDGE_FREQ: f64 = 2.666_666_666_666_666_5;
+        NoodleNodes {
+            toggle: noise3(&self.noodle, x, y, z, 1.0, 1.0),
+            thickness: mapped(&self.noodle_thickness, x, y, z, 1.0, 1.0, -0.05, -0.1),
+            ridge_a: noise3(&self.noodle_ridge_a, x, y, z, RIDGE_FREQ, RIDGE_FREQ),
+            ridge_b: noise3(&self.noodle_ridge_b, x, y, z, RIDGE_FREQ, RIDGE_FREQ),
+        }
     }
 
     /// `caves` = the near-surface/underground selection over `slopedCheese`.
@@ -168,10 +166,24 @@ impl Caves {
         }
     }
 
-    /// `min(postProcessedSlide, NOODLE)` — apply the NOODLE min after the slide/squeeze.
-    pub fn apply_noodle(&self, x: f64, y: f64, z: f64, post_processed: f64) -> f64 {
-        post_processed.min(self.noodle(x, y, z))
+}
+
+/// The interpolated `NOODLE` inputs at one position. See [`Caves::noodle_nodes`].
+#[derive(Clone, Copy, Default)]
+pub struct NoodleNodes {
+    pub toggle: f64,
+    pub thickness: f64,
+    pub ridge_a: f64,
+    pub ridge_b: f64,
+}
+
+/// `NOODLE` = `rangeChoice(toggle, -1e6, 0, 64, thickness + 1.5·max(|ridgeA|, |ridgeB|))`.
+/// A negative toggle yields the 64 filler, i.e. "no noodle cave here".
+pub fn noodle(n: &NoodleNodes) -> f64 {
+    if (-1_000_000.0..0.0).contains(&n.toggle) {
+        return 64.0;
     }
+    n.thickness + 1.5 * n.ridge_a.abs().max(n.ridge_b.abs())
 }
 
 // -------- QuantizedSpaghettiRarity: intervalSelect over the rarity modulator --------

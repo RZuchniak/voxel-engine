@@ -18,10 +18,9 @@
 //!   8. `overworld` — assembles the terrain density (surface within ±1–3 of the oracle). ✓
 //!   9. `caves` — underground/entrances/noodle/pillars/spaghetti carving; `final_density`
 //!      matches the real world to 97.1% block-level solid-vs-void agreement. ✓
-//!  10. aquifers (water table + barrier air) — IN PROGRESS. Layer 1 done:
-//!      `overworld::preliminary_surface_level` (findTopSurface). Next: positional `at(x,y,z)`
-//!      random, global fluid picker, then the `NoiseBasedAquifer` core. See HANDOFF.md.
-//!  11. surface rules → multi-noise biomes.                          ← after aquifers
+//!  10. `aquifer` — the `NoiseBasedAquifer` port: which `finalDensity <= 0` positions are
+//!      air, water or lava, and where a pressure barrier turns them back to stone. ✓
+//!  11. surface rules → multi-noise biomes.                          ← next
 //!
 //! NOTE on validation: stages 1–3 are pinned to an independent BigInt reference of the
 //! same Java algorithms, so the port is faithful to that transcription. The one piece
@@ -29,6 +28,7 @@
 //! top-level `RandomState` chain — exactly which positional factory feeds each named
 //! noise — which belongs to stage 4's wiring, not the primitives here.
 
+pub mod aquifer;
 pub mod blended_noise;
 pub mod caves;
 pub mod density;
