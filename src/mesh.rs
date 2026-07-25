@@ -313,6 +313,10 @@ fn mesh_direction(
                     world_chunk_x as f32,
                     section_world_y as f32,
                     world_chunk_z as f32,
+                    // Water, ice and lava are full cubes you can stand inside, so their
+                    // surfaces have to exist from both sides — otherwise backface culling
+                    // makes the water surface vanish when seen from underwater.
+                    !block.is_opaque(),
                 );
             }
         }
@@ -335,6 +339,7 @@ fn emit_quad(
     base_x: f32,
     base_y: f32,
     base_z: f32,
+    double_sided: bool,
 ) {
     let s0 = secondary as f32;
     let s1 = (secondary + width) as f32;
@@ -455,20 +460,30 @@ fn emit_quad(
         }
     };
 
-    expand_corners(&mut corners, dir);
+    shift_corners(&mut corners, dir, FACE_EXPAND);
     mesh.push_quad(corners);
+
+    if double_sided {
+        // Reversing the corner cycle flips the winding, so this copy survives backface
+        // culling exactly when the front one does not. Shifting it to the far side of the
+        // plane rather than leaving it coincident keeps the two out of a z-fight.
+        let mut back = corners;
+        back.reverse();
+        shift_corners(&mut back, dir, -2.0 * FACE_EXPAND);
+        mesh.push_quad(back);
+    }
 }
 
 const FACE_EXPAND: f32 = 0.002;
 
-fn expand_corners(corners: &mut [Vertex; 4], dir: Direction) {
+fn shift_corners(corners: &mut [Vertex; 4], dir: Direction, amount: f32) {
     let (nx, ny, nz) = match dir {
-        Direction::XPositive => (FACE_EXPAND, 0.0, 0.0),
-        Direction::XNegative => (-FACE_EXPAND, 0.0, 0.0),
-        Direction::YPositive => (0.0, FACE_EXPAND, 0.0),
-        Direction::YNegative => (0.0, -FACE_EXPAND, 0.0),
-        Direction::ZPositive => (0.0, 0.0, FACE_EXPAND),
-        Direction::ZNegative => (0.0, 0.0, -FACE_EXPAND),
+        Direction::XPositive => (amount, 0.0, 0.0),
+        Direction::XNegative => (-amount, 0.0, 0.0),
+        Direction::YPositive => (0.0, amount, 0.0),
+        Direction::YNegative => (0.0, -amount, 0.0),
+        Direction::ZPositive => (0.0, 0.0, amount),
+        Direction::ZNegative => (0.0, 0.0, -amount),
     };
     for corner in corners.iter_mut() {
         corner.position[0] += nx;

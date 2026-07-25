@@ -646,6 +646,11 @@ impl State {
             }),
             primitive: wgpu::PrimitiveState {
                 polygon_mode: wgpu::PolygonMode::Fill,
+                // Every quad the mesher emits winds counter-clockwise as seen from outside the
+                // block it belongs to, which `tests/correctness_winding.rs` pins down by
+                // rendering a chunk from both sides. Non-opaque blocks emit a second, reversed
+                // copy of each face so they still read correctly from inside.
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {

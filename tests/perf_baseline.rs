@@ -96,13 +96,17 @@ fn work_volume_baseline() {
     // than the old smooth heightmap, so more sections have geometry in them (18 vs 8) and
     // each has more exposed faces. If this test fails again, that is the signal it was
     // written for — a terrain change — so check whether it was intentional before editing.
+    // Re-recorded when backface culling was enabled: non-opaque full cubes (water, ice, lava)
+    // now emit a second, reversed copy of each face so their surfaces still render from
+    // inside. That is +4 quads here, 0.1% — the cost is bounded by how much fluid *surface*
+    // a chunk has, not by how much fluid.
     let expected = Counters {
         chunks_generated: 18,
         sections_meshed: 18,
-        quads: 3926,
-        vertices: 15704,
-        indices: 23556,
-        mesh_bytes: 533936,
+        quads: 3930,
+        vertices: 15720,
+        indices: 23580,
+        mesh_bytes: 534480,
     };
 
     let mut report: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
