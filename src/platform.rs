@@ -142,6 +142,32 @@ pub const fn bootstrap_ready_drain_budget_per_frame() -> usize {
     }
 }
 
+/// Threads dedicated to meshing, separate from the generator pool.
+///
+/// Only has to keep up with the generation rate, not exceed it: at ~4.6 ms a chunk, two
+/// threads mesh ~430 chunks/s against a generator that produces ~330/s on this machine.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mesh_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 4).clamp(2, 4))
+        .unwrap_or(2)
+}
+
+/// Mesh jobs handed to the worker pool per loading frame.
+///
+/// Native can outrun the pool here — the scan only ever offers chunks that are loaded and
+/// unmeshed — so this is a queue-depth knob, not a throughput one. On wasm there is no mesh
+/// pool and `dispatch_remesh_work` runs inline on the main thread, so this keeps the same
+/// per-frame cost bootstrap had before meshing moved off-thread.
+#[inline]
+pub const fn bootstrap_mesh_dispatch_per_frame() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        16
+    } else {
+        32
+    }
+}
+
 #[inline]
 pub const fn bootstrap_max_chunk_uploads_per_frame() -> usize {
     if cfg!(target_arch = "wasm32") {
@@ -223,6 +249,15 @@ pub const PROCEDURAL_REMESH_PRIORITY_BUDGET_PER_FRAME: usize = 6;
 pub const PROCEDURAL_NEIGHBOR_REMESH_BUDGET_PER_FRAME: usize = 3;
 pub const READY_DRAIN_BUDGET_PER_FRAME: usize = 64;
 pub const MAX_PENDING_READY_CHUNKS: usize = 600;
+
+/// Stop requesting new chunk loads once this many finished ones are waiting to be applied.
+///
+/// Without a gate the streaming loop requests at a fixed rate per frame while the drain loop
+/// applies at whatever rate meshing allows, so the queue fills, [`MAX_PENDING_READY_CHUNKS`]
+/// trims completed loads off the back, and those chunks are requested and regenerated again —
+/// measured at ~1300 requests/s to apply ~110 chunks/s. The backlog is only there to keep the
+/// generator pool from starving between frames; anything past that is work thrown away.
+pub const MAX_PENDING_LOAD_BACKLOG: usize = 128;
 pub const PENDING_BACKLOG_REMESH_THRESHOLD: usize = 24;
 pub const PENDING_BACKLOG_EXTRA_PRI_REMESH: usize = 4;
 pub const PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH: usize = 3;

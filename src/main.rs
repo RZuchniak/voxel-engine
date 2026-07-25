@@ -85,6 +85,100 @@ impl UniformSky {
     }
 }
 
+/// Streamer results waiting to be applied, plus an index of the coords whose chunk data is
+/// queued here.
+///
+/// The index is load-bearing, not a convenience. A chunk that has finished generating but has
+/// not been applied yet is in neither `_world` nor the streamer's in-flight set, so without it
+/// `update_streaming` re-requests every chunk sitting in this queue on every frame — the pool
+/// regenerates them and the main thread re-meshes them on pop. Measured at loading radius 12:
+/// 4492 requests and 3479 mesh jobs to build 625 chunks.
+struct PendingReady {
+    queue: VecDeque<streamer::MeshedChunk>,
+    queued_loads: HashSet<(i32, i32)>,
+}
+
+impl PendingReady {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            queued_loads: HashSet::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Finished chunk loads waiting to be applied. See [`platform::MAX_PENDING_LOAD_BACKLOG`].
+    fn load_backlog(&self) -> usize {
+        self.queued_loads.len()
+    }
+
+    /// True when this coord's *chunk data* is queued. Remesh results carry no chunk data and
+    /// are deliberately not indexed: their coord is already in the world.
+    fn contains_load(&self, coord: (i32, i32)) -> bool {
+        self.queued_loads.contains(&coord)
+    }
+
+    /// True when any result for this coord is queued, load or remesh.
+    fn contains_any(&self, coord: (i32, i32)) -> bool {
+        self.queue.iter().any(|meshed| meshed.coord == coord)
+    }
+
+    fn index(&mut self, meshed: &streamer::MeshedChunk) {
+        if !meshed.is_remesh {
+            self.queued_loads.insert(meshed.coord);
+        }
+    }
+
+    fn unindex(&mut self, meshed: &streamer::MeshedChunk) {
+        if !meshed.is_remesh {
+            self.queued_loads.remove(&meshed.coord);
+        }
+    }
+
+    fn push_front(&mut self, meshed: streamer::MeshedChunk) {
+        self.index(&meshed);
+        self.queue.push_front(meshed);
+    }
+
+    fn push_back(&mut self, meshed: streamer::MeshedChunk) {
+        self.index(&meshed);
+        self.queue.push_back(meshed);
+    }
+
+    fn pop_front(&mut self) -> Option<streamer::MeshedChunk> {
+        let meshed = self.queue.pop_front()?;
+        self.unindex(&meshed);
+        Some(meshed)
+    }
+
+    fn retain(&mut self, keep: impl Fn(&streamer::MeshedChunk) -> bool) {
+        let queued_loads = &mut self.queued_loads;
+        self.queue.retain(|meshed| {
+            let keeping = keep(meshed);
+            if !keeping && !meshed.is_remesh {
+                queued_loads.remove(&meshed.coord);
+            }
+            keeping
+        });
+    }
+
+    /// Drop the rearmost completed load. Remesh results are never dropped: the streamer has
+    /// already cleared `remesh_in_flight`, so losing one leaves stale chunk-border geometry
+    /// forever. Returns false when the queue holds nothing but remeshes.
+    fn drop_last_load(&mut self) -> bool {
+        let Some(i) = self.queue.iter().rposition(|meshed| !meshed.is_remesh) else {
+            return false;
+        };
+        if let Some(meshed) = self.queue.remove(i) {
+            self.unindex(&meshed);
+        }
+        true
+    }
+}
+
 struct SectionDrawRange {
     first_index: u32,
     index_count: u32,
@@ -111,7 +205,7 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     _world: World,
     streamer: ChunkStreamer,
-    pending_ready: VecDeque<streamer::MeshedChunk>,
+    pending_ready: PendingReady,
     chunk_meshes: HashMap<(i32, i32), ChunkGpuMesh>,
     remesh_priority: VecDeque<(i32, i32)>,
     remesh_neighbor: VecDeque<(i32, i32)>,
@@ -152,7 +246,12 @@ struct State {
     phase_mesh_us: u128,
     /// Bootstrap tiles we meshed (including empty/culled) so readiness does not stall forever.
     bootstrap_mesh_attempted: HashSet<(i32, i32)>,
-    /// Seed-mode worlds skip workers and use faster inline generate+mesh.
+    /// Cumulative chunk loads requested from the streamer, for the load profile line.
+    chunk_requests_issued: u64,
+    /// Cumulative chunks meshed, for the load profile line.
+    chunks_meshed: u64,
+    /// Seed-mode world: chunks are generated rather than read from a save, which is far more
+    /// expensive per chunk and gets larger streaming budgets.
     procedural_world: bool,
 }
 
@@ -165,7 +264,9 @@ impl State {
         need.max(256).next_power_of_two()
     }
 
-    fn mesh_chunk_with_neighbors(world: &World, coord: (i32, i32)) -> Vec<(usize, mesh::MeshData)> {
+    /// The chunk plus its four neighbours — everything `mesh_chunk_surface` can reach when it
+    /// tests a block's neighbour across a chunk border.
+    fn mesh_snapshot(world: &World, coord: (i32, i32)) -> World {
         let mut local_world = World::new();
         for c in [
             coord,
@@ -174,11 +275,11 @@ impl State {
             (coord.0, coord.1 + 1),
             (coord.0, coord.1 - 1),
         ] {
-            if let Some(chunk) = world.chunk(c).cloned() {
-                local_world.insert_chunk(chunk);
+            if let Some(chunk) = world.chunk_shared(c) {
+                local_world.insert_shared(chunk);
             }
         }
-        mesh::mesh_chunk_surface(&local_world, coord)
+        local_world
     }
 
     /// High-priority remesh (arriving chunk). Supersedes a pending neighbor job for the same coord.
@@ -201,21 +302,7 @@ impl State {
     /// have dropped `remesh_in_flight`, so losing a remesh upload leaves stale chunk-border geometry forever).
     fn trim_pending_ready_queue(&mut self) {
         while self.pending_ready.len() > platform::MAX_PENDING_READY_CHUNKS {
-            if let Some(back) = self.pending_ready.back() {
-                if !back.is_remesh {
-                    self.pending_ready.pop_back();
-                    continue;
-                }
-            }
-            let mut dropped = false;
-            for i in (0..self.pending_ready.len()).rev() {
-                if !self.pending_ready[i].is_remesh {
-                    self.pending_ready.remove(i);
-                    dropped = true;
-                    break;
-                }
-            }
-            if !dropped {
+            if !self.pending_ready.drop_last_load() {
                 break;
             }
         }
@@ -226,30 +313,10 @@ impl State {
             return false;
         }
 
-        let mut local_world = World::new();
-        for c in [
-            coord,
-            (coord.0 + 1, coord.1),
-            (coord.0 - 1, coord.1),
-            (coord.0, coord.1 + 1),
-            (coord.0, coord.1 - 1),
-        ] {
-            if let Some(chunk) = self._world.chunk(c).cloned() {
-                local_world.insert_chunk(chunk);
-            }
-        }
-        self.streamer.request_remesh(coord, local_world);
+        let snapshot = Self::mesh_snapshot(&self._world, coord);
+        self.streamer.request_remesh(coord, snapshot);
+        self.chunks_meshed += 1;
         true
-    }
-
-    fn mesh_loaded_chunk_during_bootstrap(&mut self, coord: (i32, i32)) {
-        let section_meshes = Self::mesh_chunk_with_neighbors(&self._world, coord);
-        if !section_meshes.is_empty() {
-            self.upload_chunk_meshes(coord, section_meshes);
-        }
-        self.bootstrap_mesh_attempted.insert(coord);
-        self.remesh_priority.retain(|&c| c != coord);
-        self.remesh_priority_pending.remove(&coord);
     }
 
     fn write_chunk_mesh(
@@ -633,7 +700,7 @@ impl State {
                 }
             }
         }
-        let pending_ready = VecDeque::new();
+        let pending_ready = PendingReady::new();
         let chunk_meshes = HashMap::new();
         let remesh_priority = VecDeque::new();
         let remesh_neighbor = VecDeque::new();
@@ -703,6 +770,8 @@ impl State {
             phase_stream_us: 0,
             phase_mesh_us: 0,
             bootstrap_mesh_attempted: HashSet::new(),
+            chunk_requests_issued: 0,
+            chunks_meshed: 0,
             procedural_world,
         };
     }
@@ -741,7 +810,7 @@ impl State {
         self.profile_accum += self.delta;
         if self.profile_accum > 1_000_000 {
             println!(
-                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={}",
+                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={}",
                 self.started_at.elapsed().as_secs_f64(),
                 self.world_ready,
                 self.fps_ema,
@@ -752,7 +821,10 @@ impl State {
                 self.drained_remesh_last_frame,
                 self.phase_stream_us,
                 self.phase_mesh_us,
-                self._world.chunks().count()
+                self._world.chunks().count(),
+                self.pending_ready.len(),
+                self.chunk_requests_issued,
+                self.chunks_meshed,
             );
             self.profile_accum = 0;
         }
@@ -782,7 +854,7 @@ impl State {
             {
                 return false;
             }
-            if self.pending_ready.iter().any(|m| m.coord == coord) {
+            if self.pending_ready.contains_any(coord) {
                 return false;
             }
         }
@@ -896,9 +968,25 @@ impl State {
                 }
             }
         }
+        if self.pending_ready.load_backlog() >= platform::MAX_PENDING_LOAD_BACKLOG {
+            // Enough finished chunks are already queued to keep the pool busy. Requesting more
+            // only pushes the queue into `trim_pending_ready_queue`, which discards completed
+            // loads that then have to be generated all over again.
+            request_budget = 0;
+        }
         for (coord, _, _) in desired.iter().copied() {
-            if !self._world.has_chunk(coord) && !self.streamer.is_in_flight(coord) {
+            if request_budget == 0 {
+                break;
+            }
+            // A chunk already sitting in `pending_ready` has been generated but not applied,
+            // so it is in neither the world nor the in-flight set. Without that third test it
+            // is re-requested every frame until the drain loop reaches it.
+            if !self._world.has_chunk(coord)
+                && !self.pending_ready.contains_load(coord)
+                && !self.streamer.is_in_flight(coord)
+            {
                 if self.streamer.request_chunk(coord, bootstrap) {
+                    self.chunk_requests_issued += 1;
                     request_budget -= 1;
                     if request_budget == 0 {
                         break;
@@ -988,15 +1076,14 @@ impl State {
             let had_initial_meshes = !meshed.is_remesh && !meshed.section_meshes.is_empty();
             if meshed.is_remesh {
                 self.upload_chunk_meshes(coord, meshed.section_meshes);
-            } else if bootstrap || self.procedural_world {
-                if upload_start.elapsed().as_millis() >= upload_time_budget_dynamic {
-                    // Defer heavy inline meshing to next frame to avoid spikes.
-                    if self._world.has_chunk(coord) {
-                        self.enqueue_priority_remesh(coord);
-                    }
-                } else {
-                    self.mesh_loaded_chunk_during_bootstrap(coord);
+                if bootstrap {
+                    // The mesh job dispatched by the bootstrap scan has landed. Record it here
+                    // rather than at dispatch, so the loading gate does not count a tile whose
+                    // mesh is still being built.
+                    self.bootstrap_mesh_attempted.insert(coord);
                 }
+            } else if bootstrap {
+                // Meshing is dispatched by the bootstrap scan below, on the worker pool.
             } else if had_initial_meshes {
                 self.upload_chunk_meshes(coord, meshed.section_meshes);
             } else {
@@ -1026,6 +1113,9 @@ impl State {
         self.drained_new_last_frame = drained_new;
         self.drained_remesh_last_frame = uploaded_this_frame - drained_new;
 
+        // Bootstrap meshing runs on the worker pool. Meshing is ~4.6 ms/chunk and used to run
+        // inline here, which made it ~100% of every loading frame; the pool turns the loading
+        // wait into whatever the slower of generation and meshing costs across all cores.
         if bootstrap {
             let mut need_mesh: Vec<((i32, i32), i32)> = Vec::new();
             for dz in -platform::bootstrap_chunk_radius()..=platform::bootstrap_chunk_radius() {
@@ -1038,6 +1128,7 @@ impl State {
                     // first, so an already-handled tile never reaches the scan.
                     if !self.bootstrap_mesh_attempted.contains(&coord)
                         && !self.chunk_has_any_gpu_section(coord)
+                        && !self.streamer.is_remesh_in_flight(coord)
                         && self._world.has_chunk(coord)
                         && self.chunk_needs_gpu_mesh(coord)
                     {
@@ -1048,9 +1139,9 @@ impl State {
             need_mesh.sort_by_key(|(_, dist2)| *dist2);
             for (coord, _) in need_mesh
                 .into_iter()
-                .take(platform::bootstrap_max_chunk_uploads_per_frame())
+                .take(platform::bootstrap_mesh_dispatch_per_frame())
             {
-                self.mesh_loaded_chunk_during_bootstrap(coord);
+                self.dispatch_remesh_job(coord);
             }
         }
 
@@ -1088,7 +1179,13 @@ impl State {
         } else {
             platform::REMESH_PRIORITY_BUDGET_PER_FRAME
         };
-        let pri_budget = if bootstrap {
+        // Finished mesh results are never discarded by `trim_pending_ready_queue`, so when they
+        // outrun the upload budget the queue grows past `MAX_PENDING_READY_CHUNKS` and the trim
+        // starts dropping completed *loads* instead — which are then regenerated from scratch.
+        // Stop feeding the mesh pool until the results already in hand have been applied.
+        let mesh_backpressure =
+            self.pending_ready.len() >= platform::MAX_PENDING_READY_CHUNKS / 2;
+        let pri_budget = if bootstrap || mesh_backpressure {
             0
         } else {
             (base_pri_budget
@@ -1116,10 +1213,12 @@ impl State {
         } else {
             platform::NEIGHBOR_REMESH_BUDGET_PER_FRAME
         };
-        let neighbor_budget = (base_neighbor_budget
-            + extra_neighbor_backlog
-            + extra_neighbor_bootstrap)
-            .saturating_sub(remesh_slowdown);
+        let neighbor_budget = if mesh_backpressure {
+            0
+        } else {
+            (base_neighbor_budget + extra_neighbor_backlog + extra_neighbor_bootstrap)
+                .saturating_sub(remesh_slowdown)
+        };
         for _ in 0..neighbor_budget {
             if bootstrap {
                 break;

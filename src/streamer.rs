@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -25,11 +25,23 @@ pub struct ChunkStreamer {
     source: Arc<dyn WorldSource>,
     #[cfg(not(target_arch = "wasm32"))]
     pool: ThreadPool,
+    /// Meshing gets its own threads because the two kinds of work have opposite shapes.
+    /// Generation is bulk throughput — the streamer queues the whole load radius at once, so
+    /// thousands of ~21.6 ms jobs can be outstanding. Meshing is latency-critical: a chunk is
+    /// invisible until its mesh lands. Sharing one pool puts every mesh job behind that
+    /// backlog, and new chunks stop appearing (measured: 5 chunks/s meshed against 330/s
+    /// generated).
+    #[cfg(not(target_arch = "wasm32"))]
+    mesh_pool: ThreadPool,
     ready_tx: Sender<MeshedChunk>,
     ready_rx: Receiver<MeshedChunk>,
     in_flight: HashSet<(i32, i32)>,
     remesh_in_flight: HashSet<(i32, i32)>,
-    pending_remesh_coords: HashSet<(i32, i32)>,
+    /// Remesh requests that arrived while one was already running for the same coord, each
+    /// holding the snapshot it was requested with. Keeping the snapshot matters: re-meshing a
+    /// coord against a world that does not contain it yields an empty mesh, which uploads as
+    /// "no geometry" and erases the chunk from the render.
+    pending_remesh: HashMap<(i32, i32), World>,
     procedural: bool,
     #[cfg(target_arch = "wasm32")]
     worker_bridge: Option<WorkerBridge>,
@@ -43,16 +55,27 @@ impl ChunkStreamer {
             .thread_name(|i| format!("chunk-worker-{i}"))
             .build()
             .expect("failed to create rayon pool");
+        // Deliberately oversubscribed against `pool`: these threads are idle most of the time
+        // and only need to keep up with the generation rate, so it is worth letting them
+        // preempt generation rather than wait behind it.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mesh_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::platform::mesh_worker_threads())
+            .thread_name(|i| format!("mesh-worker-{i}"))
+            .build()
+            .expect("failed to create rayon mesh pool");
         let (ready_tx, ready_rx) = unbounded();
         Self {
             source,
             #[cfg(not(target_arch = "wasm32"))]
             pool,
+            #[cfg(not(target_arch = "wasm32"))]
+            mesh_pool,
             ready_tx,
             ready_rx,
             in_flight: HashSet::new(),
             remesh_in_flight: HashSet::new(),
-            pending_remesh_coords: HashSet::new(),
+            pending_remesh: HashMap::new(),
             procedural,
             #[cfg(target_arch = "wasm32")]
             worker_bridge: None,
@@ -124,7 +147,7 @@ impl ChunkStreamer {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let ready_tx = self.ready_tx.clone();
-            self.pool.spawn(move || {
+            self.mesh_pool.spawn(move || {
                 let section_meshes = mesh_chunk_surface(&world, coord);
 
                 let _ = ready_tx.send(MeshedChunk {
@@ -151,9 +174,9 @@ impl ChunkStreamer {
 
     fn on_remesh_result_delivered(&mut self, coord: (i32, i32)) {
         self.remesh_in_flight.remove(&coord);
-        if self.pending_remesh_coords.remove(&coord) {
+        if let Some(world) = self.pending_remesh.remove(&coord) {
             self.remesh_in_flight.insert(coord);
-            self.dispatch_remesh_work(coord, World::new());
+            self.dispatch_remesh_work(coord, world);
         }
     }
 
@@ -231,7 +254,7 @@ impl ChunkStreamer {
 
     pub fn request_remesh(&mut self, coord: (i32, i32), world: World) {
         if self.is_remesh_in_flight(coord) {
-            self.pending_remesh_coords.insert(coord);
+            self.pending_remesh.insert(coord, world);
             return;
         }
         #[cfg(target_arch = "wasm32")]
@@ -240,7 +263,7 @@ impl ChunkStreamer {
             .as_ref()
             .is_some_and(|bridge| bridge.is_load_busy(coord))
         {
-            self.pending_remesh_coords.insert(coord);
+            self.pending_remesh.insert(coord, world);
             return;
         }
         self.remesh_in_flight.insert(coord);
@@ -326,7 +349,7 @@ impl ChunkStreamer {
     }
 
     pub fn clear_pending_remesh_snapshot(&mut self, coord: (i32, i32)) {
-        self.pending_remesh_coords.remove(&coord);
+        self.pending_remesh.remove(&coord);
     }
 
     pub fn is_worker_load_busy(&self, coord: (i32, i32)) -> bool {

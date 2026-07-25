@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::block::BlockId;
 
@@ -158,8 +159,12 @@ impl Chunk {
     }
 }
 
+/// Chunks are shared, not copied, because meshing runs off the main thread: a mesh job needs a
+/// snapshot of a chunk plus its four neighbours, and cloning ~40 KB × 5 per job for 24 jobs a
+/// frame is real main-thread memcpy. Nothing mutates a chunk once it is in the world, so the
+/// jobs can just hold `Arc`s.
 pub struct World {
-    chunks: HashMap<(i32, i32), Chunk>,
+    chunks: HashMap<(i32, i32), Arc<Chunk>>,
 }
 
 impl World {
@@ -170,11 +175,16 @@ impl World {
     }
 
     pub fn chunks(&self) -> impl Iterator<Item = &Chunk> {
-        self.chunks.values()
+        self.chunks.values().map(|chunk| chunk.as_ref())
     }
 
     pub fn chunk(&self, coord: (i32, i32)) -> Option<&Chunk> {
-        self.chunks.get(&coord)
+        self.chunks.get(&coord).map(|chunk| chunk.as_ref())
+    }
+
+    /// The chunk as a shared handle, for building a mesh job's snapshot without copying.
+    pub fn chunk_shared(&self, coord: (i32, i32)) -> Option<Arc<Chunk>> {
+        self.chunks.get(&coord).map(Arc::clone)
     }
 
     pub fn has_chunk(&self, coord: (i32, i32)) -> bool {
@@ -182,6 +192,10 @@ impl World {
     }
 
     pub fn insert_chunk(&mut self, chunk: Chunk) {
+        self.insert_shared(Arc::new(chunk));
+    }
+
+    pub fn insert_shared(&mut self, chunk: Arc<Chunk>) {
         self.chunks.insert(chunk.coord(), chunk);
     }
 
