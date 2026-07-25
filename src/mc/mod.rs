@@ -22,7 +22,12 @@
 //!      air, water or lava, and where a pressure barrier turns them back to stone. ✓
 //!  11. `climate` + `biome` — the 6-axis climate space and the `OverworldBiomeBuilder` port
 //!      that generates its 7594 boxes (verified exactly against Mojang's datagen dump). ✓
-//!  12. surface rules (grass/dirt/sand vs stone) — needs biomes, hence the order.  ← next
+//!  12. `surface` — `SurfaceRules`/`SurfaceSystem`/`SurfaceRuleData.overworld`: what the
+//!      stone column is faced with (grass, sand, gravel, snow, terracotta, bedrock). Needs
+//!      biomes (37 `isBiome` branches), hence the order. ✓
+//!  13. `chunk::generate_chunk` — the end-to-end pipeline, and the `WorldSource` hook. ✓
+//!
+//! Next: wire the renderer to `mc::chunk`, and chase the residual documented in HANDOFF.md.
 //!
 //! NOTE on validation: stages 1–3 are pinned to an independent BigInt reference of the
 //! same Java algorithms, so the port is faithful to that transcription. The one piece
@@ -34,6 +39,7 @@ pub mod aquifer;
 pub mod biome;
 pub mod blended_noise;
 pub mod caves;
+pub mod chunk;
 pub mod climate;
 pub mod density;
 pub mod noise_params;
@@ -42,3 +48,4 @@ pub mod overworld;
 pub mod perlin;
 pub mod rng;
 pub mod spline;
+pub mod surface;

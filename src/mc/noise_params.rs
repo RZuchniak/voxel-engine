@@ -68,6 +68,25 @@ pub enum Noise {
     NoodleRidgeA,
     NoodleRidgeB,
     Jagged,
+    // Surface-rule noises (`SurfaceSystem` + `SurfaceRuleData.overworld`).
+    Surface,
+    SurfaceSecondary,
+    ClayBandsOffset,
+    BadlandsPillar,
+    BadlandsPillarRoof,
+    BadlandsSurface,
+    IcebergPillar,
+    IcebergPillarRoof,
+    IcebergSurface,
+    SulfurCaveGradient,
+    Swamp,
+    Calcite,
+    Gravel,
+    PowderSnow,
+    PackedIce,
+    Ice,
+    GravelLayer,
+    Patch,
 }
 
 impl Noise {
@@ -139,6 +158,25 @@ pub static PARAMS: &[NoiseParameters] = &[
     p("noodle_ridge_a", -7, &[1.0]),
     p("noodle_ridge_b", -7, &[1.0]),
     p("jagged", -16, &[1.0; 16]),
+    // Surface-rule noises. Note `Noise::Swamp` registers as **"surface_swamp"**, not "swamp".
+    p("surface", -6, &[1.0, 1.0, 1.0]),
+    p("surface_secondary", -6, &[1.0, 1.0, 0.0, 1.0]),
+    p("clay_bands_offset", -8, &[1.0]),
+    p("badlands_pillar", -2, &[1.0, 1.0, 1.0, 1.0]),
+    p("badlands_pillar_roof", -8, &[1.0]),
+    p("badlands_surface", -6, &[1.0, 1.0, 1.0]),
+    p("iceberg_pillar", -6, &[1.0, 1.0, 1.0, 1.0]),
+    p("iceberg_pillar_roof", -3, &[1.0]),
+    p("iceberg_surface", -6, &[1.0, 1.0, 1.0]),
+    p("sulfur_cave_gradient", -5, &[1.0, 0.0, 1.0]),
+    p("surface_swamp", -2, &[1.0]),
+    p("calcite", -9, &[1.0, 1.0, 1.0, 1.0]),
+    p("gravel", -8, &[1.0, 1.0, 1.0, 1.0]),
+    p("powder_snow", -6, &[1.0, 1.0, 1.0, 1.0]),
+    p("packed_ice", -7, &[1.0, 1.0, 1.0, 1.0]),
+    p("ice", -4, &[1.0, 1.0, 1.0, 1.0]),
+    p("gravel_layer", -8, &[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.013_333_333_333_333_334]),
+    p("patch", -5, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.013_333_333_333_333_334]),
 ];
 
 /// Const helper so [`PARAMS`] reads as a plain table.

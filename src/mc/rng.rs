@@ -103,6 +103,21 @@ impl XoroshiroRandom {
         (m >> 32) as i32
     }
 
+    /// `nextFloat()` — 24 high bits scaled to `[0, 1)`.
+    pub fn next_float(&mut self) -> f32 {
+        self.next_bits(24) as f32 * 5.960_464_5E-8
+    }
+
+    /// `nextBoolean()` — Java takes the *sign* bit, i.e. `nextLong() < 0`.
+    pub fn next_boolean(&mut self) -> bool {
+        (self.next_long() & 1) != 0
+    }
+
+    /// `nextIntBetweenInclusive(min, max)`.
+    pub fn next_int_between_inclusive(&mut self, min: i32, max: i32) -> i32 {
+        min + self.next_int_bound(max - min + 1)
+    }
+
     /// `forkPositional()` — a factory whose seed is two fresh `nextLong()` draws.
     pub fn fork_positional(&mut self) -> PositionalFactory {
         let lo = self.next_long() as u64;
