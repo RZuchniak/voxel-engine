@@ -810,7 +810,7 @@ impl State {
         self.profile_accum += self.delta;
         if self.profile_accum > 1_000_000 {
             println!(
-                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={}",
+                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={}",
                 self.started_at.elapsed().as_secs_f64(),
                 self.world_ready,
                 self.fps_ema,
@@ -825,6 +825,7 @@ impl State {
                 self.pending_ready.len(),
                 self.chunk_requests_issued,
                 self.chunks_meshed,
+                self.resident_quads(),
             );
             self.profile_accum = 0;
         }
@@ -832,6 +833,20 @@ impl State {
 
     fn chunk_has_any_gpu_section(&self, coord: (i32, i32)) -> bool {
         self.chunk_meshes.contains_key(&coord)
+    }
+
+    /// Quads resident in chunk GPU buffers. Summed on demand — once a second for the profile
+    /// line is cheap, and it cannot drift out of sync the way an incremental counter would.
+    ///
+    /// Worth watching after any change to *when* chunks are meshed: a border meshed against a
+    /// neighbour that had not loaded yet emits faces that are buried inside the terrain, so
+    /// they never appear on screen and only show up as a higher number here.
+    fn resident_quads(&self) -> u64 {
+        self.chunk_meshes
+            .values()
+            .flat_map(|mesh| mesh.section_draws.iter())
+            .map(|draw| (draw.index_count / 6) as u64)
+            .sum()
     }
 
     fn chunk_needs_gpu_mesh(&self, coord: (i32, i32)) -> bool {
@@ -862,6 +877,37 @@ impl State {
             return self.bootstrap_mesh_attempted.contains(&coord);
         }
         true
+    }
+
+    /// A loading-radius tile is meshed only once every neighbour that will arrive during
+    /// bootstrap has arrived, so its borders are culled against real blocks instead of the air
+    /// of a chunk that simply has not loaded yet.
+    ///
+    /// This matters more than it looks. Neighbour remeshing is gated on `world_ready`, so it
+    /// never runs during bootstrap, and afterwards it only fires when a *new* chunk lands next
+    /// to an existing one — which never happens for the interior of the loading radius, since
+    /// those neighbours all loaded long ago. A border meshed against air here stays wrong for
+    /// the lifetime of the world, showing up as a grid of walls between the chunks nearest the
+    /// player while chunks streamed in later look correct.
+    ///
+    /// Neighbours *outside* the loading radius are not requested until the world is revealed,
+    /// so waiting on them would stall the gate forever. Those borders are the ones the ordinary
+    /// neighbour remesh does fix, once streaming starts.
+    fn bootstrap_neighbours_loaded(
+        &self,
+        coord: (i32, i32),
+        player_chunk_x: i32,
+        player_chunk_z: i32,
+    ) -> bool {
+        let radius = platform::bootstrap_chunk_radius();
+        [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .into_iter()
+            .all(|(dx, dz)| {
+                let neighbour = (coord.0 + dx, coord.1 + dz);
+                let inside_loading_radius = (neighbour.0 - player_chunk_x).abs() <= radius
+                    && (neighbour.1 - player_chunk_z).abs() <= radius;
+                !inside_loading_radius || self._world.has_chunk(neighbour)
+            })
     }
 
     fn bootstrap_tile_count() -> usize {
@@ -1130,6 +1176,7 @@ impl State {
                         && !self.chunk_has_any_gpu_section(coord)
                         && !self.streamer.is_remesh_in_flight(coord)
                         && self._world.has_chunk(coord)
+                        && self.bootstrap_neighbours_loaded(coord, player_chunk_x, player_chunk_z)
                         && self.chunk_needs_gpu_mesh(coord)
                     {
                         need_mesh.push((coord, dx * dx + dz * dz));
