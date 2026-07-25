@@ -20,7 +20,9 @@
 //!      matches the real world to 97.1% block-level solid-vs-void agreement. ✓
 //!  10. `aquifer` — the `NoiseBasedAquifer` port: which `finalDensity <= 0` positions are
 //!      air, water or lava, and where a pressure barrier turns them back to stone. ✓
-//!  11. surface rules → multi-noise biomes.                          ← next
+//!  11. `climate` + `biome` — the 6-axis climate space and the `OverworldBiomeBuilder` port
+//!      that generates its 7594 boxes (verified exactly against Mojang's datagen dump). ✓
+//!  12. surface rules (grass/dirt/sand vs stone) — needs biomes, hence the order.  ← next
 //!
 //! NOTE on validation: stages 1–3 are pinned to an independent BigInt reference of the
 //! same Java algorithms, so the port is faithful to that transcription. The one piece
@@ -29,8 +31,10 @@
 //! noise — which belongs to stage 4's wiring, not the primitives here.
 
 pub mod aquifer;
+pub mod biome;
 pub mod blended_noise;
 pub mod caves;
+pub mod climate;
 pub mod density;
 pub mod noise_params;
 pub mod normal_noise;

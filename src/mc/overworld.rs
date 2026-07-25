@@ -20,8 +20,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::aquifer::{AquiferNoises, ChunkAquifer};
+use super::biome::{self, Biome};
 use super::blended_noise::BlendedNoise;
 use super::caves::{self, Caves, NoodleNodes};
+use super::climate::{ParameterList, TargetPoint};
 use super::noise_params::{seed_factory, Noise};
 use super::normal_noise::NormalNoise;
 use super::spline::{self, Spline, SplineInput};
@@ -32,6 +34,8 @@ const GLOBAL_OFFSET: f64 = -0.50375f32 as f64;
 
 pub struct Overworld {
     shift: Arc<NormalNoise>,
+    temperature: Arc<NormalNoise>,
+    vegetation: Arc<NormalNoise>,
     continentalness: Arc<NormalNoise>,
     erosion: Arc<NormalNoise>,
     ridge: Arc<NormalNoise>,
@@ -42,6 +46,7 @@ pub struct Overworld {
     jaggedness_spline: Spline,
     caves: Caves,
     aquifer: AquiferNoises,
+    biomes: ParameterList<Biome>,
 }
 
 impl Overworld {
@@ -51,6 +56,8 @@ impl Overworld {
         let mut terrain_random = factory.from_hash_of("minecraft:terrain");
         Self {
             shift: Arc::new(Noise::Shift.instantiate(&factory)),
+            temperature: Arc::new(Noise::Temperature.instantiate(&factory)),
+            vegetation: Arc::new(Noise::Vegetation.instantiate(&factory)),
             continentalness: Arc::new(Noise::Continentalness.instantiate(&factory)),
             erosion: Arc::new(Noise::Erosion.instantiate(&factory)),
             ridge: Arc::new(Noise::Ridge.instantiate(&factory)),
@@ -61,6 +68,7 @@ impl Overworld {
             jaggedness_spline: spline::overworld_jaggedness(),
             caves: Caves::new(&factory),
             aquifer: AquiferNoises::new(&factory),
+            biomes: ParameterList::new(biome::overworld_biomes()),
         }
     }
 
@@ -102,6 +110,16 @@ impl Overworld {
 
     pub fn continents(&self, x: f64, z: f64) -> f64 {
         self.shifted_2d(&self.continentalness, x, z)
+    }
+    /// The `temperature` climate coordinate. (In the router this one is not itself
+    /// `flatCache`d — only its shift inputs are — but biomes are only ever sampled at
+    /// quart-aligned positions, where that distinction vanishes.)
+    pub fn temperature(&self, x: f64, z: f64) -> f64 {
+        self.shifted_2d(&self.temperature, x, z)
+    }
+    /// The `vegetation` climate coordinate — Climate's "humidity" axis.
+    pub fn vegetation(&self, x: f64, z: f64) -> f64 {
+        self.shifted_2d(&self.vegetation, x, z)
     }
     pub fn erosion(&self, x: f64, z: f64) -> f64 {
         self.shifted_2d(&self.erosion, x, z)
@@ -237,6 +255,31 @@ impl Overworld {
         let quarter_neg = if gradient_unscaled > 0.0 { gradient_unscaled } else { gradient_unscaled * 0.25 };
         let inner = (4.0 * quarter_neg - 0.703125).clamp(-64.0, 64.0);
         slide_overworld(y, inner) - 0.390625
+    }
+
+    // ---- biomes ----
+
+    /// `Climate.Sampler.sample(quartX, quartY, quartZ)` — the six climate coordinates at a
+    /// quart cell. Biomes live on a 4×4×4 grid, so this is the natural resolution.
+    pub fn climate_at_quart(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> TargetPoint {
+        let (x, y, z) = ((quart_x * 4) as f64, (quart_y * 4) as f64, (quart_z * 4) as f64);
+        TargetPoint::new(
+            self.temperature(x, z),
+            self.vegetation(x, z),
+            self.continents(x, z),
+            self.erosion(x, z),
+            self.depth(x, y, z),
+            self.ridge(x, z),
+        )
+    }
+
+    /// The biome at a **block** position, via its quart cell — the nearest climate box.
+    ///
+    /// Note this is a linear scan of 7594 boxes (see [`super::climate`]); fine for parity
+    /// checks and per-quart use, but cache it per column before calling it per block.
+    pub fn biome_at(&self, x: i32, y: i32, z: i32) -> Biome {
+        let target = self.climate_at_quart(x >> 2, y >> 2, z >> 2);
+        *self.biomes.find(&target)
     }
 
     /// Topmost `y` in `[min_y, max_y]` whose pre-cave density is solid, or `None` if the

@@ -60,6 +60,9 @@ rayon = "1.10.0"
 
 [dev-dependencies]
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+# Only for `examples/parity_biomes`, which diffs the ported OverworldBiomeBuilder against a
+# local Minecraft datagen dump. Not used by the engine or the wasm build.
+serde_json = "1.0"
 
 # Noise/meshing are compute-bound; the wasm build needs speed, not size.
 # `panic = "abort"` is deliberately omitted so console_error_panic_hook keeps
