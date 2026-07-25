@@ -7,15 +7,14 @@
 //!
 //! ## What's included vs deferred
 //!
-//! Included: the full pre-cave terrain column — climate coordinates, `offset`/`factor`/
-//! `depth`/`jaggedness`, `slopedCheese = initialDensity + base_3d_noise`, the overworld
-//! y-slide, and the `squeeze` post-process. `finalDensity > 0 ⇒ solid`.
+//! Included: the full terrain column — climate coordinates, `offset`/`factor`/`depth`/
+//! `jaggedness`, `slopedCheese = initialDensity + base_3d_noise`, the overworld y-slide,
+//! the `squeeze` post-process, cave carving (`super::caves`), and the cell interpolation
+//! that vanilla applies on top ([`CellSampler`]). `finalDensity > 0 ⇒ solid`.
 //!
-//! Deferred (documented, not yet ported): the cave carving that `NoiseRouterData.overworld`
-//! layers on via `rangeChoice(slopedCheese, …, underground(…))` + `NOODLE` + `entrances`,
-//! the aquifer fluid picker, and surface rules (grass/dirt/sand vs stone). So this predicts
-//! the terrain *envelope* (surface altitude and solid body) but not cave voids or the exact
-//! surface block. Surface altitude is the first thing to validate against the oracle.
+//! What a `finalDensity <= 0` position actually *becomes* — air, water or lava — is
+//! `super::aquifer`'s job. Still deferred: surface rules (grass/dirt/sand vs stone), so
+//! this places the right *shape* but not yet the right surface block.
 
 use std::collections::HashMap;
 use std::sync::Arc;
