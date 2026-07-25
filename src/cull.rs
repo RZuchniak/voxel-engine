@@ -1,4 +1,9 @@
+use std::collections::VecDeque;
+
 use cgmath::{InnerSpace, Matrix, Matrix4, Vector3, Vector4};
+
+use crate::visibility::{Facing, VisibilitySet, FACINGS};
+use crate::world::SECTION_COUNT;
 
 /// View-projection frustum for axis-aligned bounding box tests.
 pub struct Frustum {
@@ -49,6 +54,167 @@ impl Frustum {
             }
         }
         true
+    }
+}
+
+/// A chunk section: horizontal chunk coordinate plus an index into its 24 vertical slices.
+pub type SectionKey = ((i32, i32), usize);
+
+#[derive(Clone, Copy)]
+struct Node {
+    key: SectionKey,
+    /// The face of `key` we arrived through. `None` for the section holding the camera.
+    entered_by: Option<Facing>,
+    /// Directions taken so far along this path, as a bitmask over [`Facing::index`].
+    steps_taken: u8,
+}
+
+/// Minecraft's cave culling: walk outward from the camera's section, stepping into a
+/// neighbour only when the section you are in actually lets you see from the face you came in
+/// by to the face you would leave by.
+///
+/// The effect is that standing on the surface draws the surface, because the sections below
+/// are behind solid rock and nothing connects to them — no depth heuristic required. Sections
+/// that are merely *near* are not drawn; sections that are *reachable by a sightline* are.
+///
+/// Reused across frames so the scratch buffers stay allocated.
+/// Per-section traversal state, in the flat grid.
+const UNSEEN: u8 = 0;
+const REACHED: u8 = 1;
+/// Failed the caller's frustum/distance test. Recorded so a section neighbouring several
+/// reached ones is tested once rather than up to six times — the test is the most expensive
+/// thing in the walk, and the frontier is mostly shared edges.
+const REJECTED: u8 = 2;
+
+pub struct SectionGraph {
+    /// Flat `(2r+1) × SECTION_COUNT × (2r+1)` grid over the traversal volume.
+    state: Vec<u8>,
+    queue: VecDeque<Node>,
+    radius: i32,
+    origin_chunk: (i32, i32),
+}
+
+impl SectionGraph {
+    pub fn new() -> Self {
+        Self {
+            state: Vec::new(),
+            queue: VecDeque::new(),
+            radius: -1,
+            origin_chunk: (0, 0),
+        }
+    }
+
+    /// Did the last [`walk`](Self::walk) reach this section? Sections outside the walked
+    /// volume answer `false`.
+    pub fn reached(&self, key: SectionKey) -> bool {
+        self.slot(self.origin_chunk, key)
+            .is_some_and(|slot| self.state[slot] == REACHED)
+    }
+
+    fn slot(&self, origin: (i32, i32), key: SectionKey) -> Option<usize> {
+        let dx = key.0.0 - origin.0 + self.radius;
+        let dz = key.0.1 - origin.1 + self.radius;
+        let span = 2 * self.radius + 1;
+        if dx < 0 || dz < 0 || dx >= span || dz >= span || key.1 >= SECTION_COUNT {
+            return None;
+        }
+        Some(((dx * span + dz) as usize) * SECTION_COUNT + key.1)
+    }
+
+    /// Visits every section reachable from the camera's, in BFS order.
+    ///
+    /// `visibility` supplies a section's [`VisibilitySet`] — return [`VisibilitySet::EMPTY`]
+    /// for sections whose blocks are not loaded, so an unknown section never blocks a sightline
+    /// that really exists. `admits` is the caller's frustum and distance test; a section that
+    /// fails it is neither drawn nor traversed, which is safe because anything visible through
+    /// it would be further away and also outside the frustum.
+    pub fn walk(
+        &mut self,
+        origin: SectionKey,
+        radius: i32,
+        visibility: impl Fn(SectionKey) -> VisibilitySet,
+        admits: impl Fn(SectionKey) -> bool,
+        mut visit: impl FnMut(SectionKey),
+    ) {
+        let span = (2 * radius + 1) as usize;
+        let needed = span * span * SECTION_COUNT;
+        if self.radius != radius {
+            self.state = vec![UNSEEN; needed];
+            self.radius = radius;
+        } else {
+            self.state.fill(UNSEEN);
+        }
+        self.queue.clear();
+
+        let origin_chunk = origin.0;
+        self.origin_chunk = origin_chunk;
+        if origin.1 >= SECTION_COUNT {
+            return;
+        }
+        if let Some(slot) = self.slot(origin_chunk, origin) {
+            self.state[slot] = REACHED;
+        }
+        // The camera's own section is always drawn and always traversable in every direction:
+        // there is no face we entered it by, and the camera may well be inside solid rock.
+        self.queue.push_back(Node {
+            key: origin,
+            entered_by: None,
+            steps_taken: 0,
+        });
+
+        while let Some(node) = self.queue.pop_front() {
+            visit(node.key);
+            let set = visibility(node.key);
+
+            for step in FACINGS {
+                // Leaving through the face we came in by is walking back down the path.
+                if node.entered_by == Some(step) {
+                    continue;
+                }
+                // Never undo a direction already taken. Without this the search wanders
+                // sideways and back, and the frontier stops shrinking.
+                if node.steps_taken & (1 << step.opposite().index()) != 0 {
+                    continue;
+                }
+                // The camera's section is entered from nowhere, so every direction is open.
+                if let Some(entry) = node.entered_by {
+                    if !set.connects(entry, step) {
+                        continue;
+                    }
+                }
+
+                let (dx, dy, dz) = step.offset();
+                let section = node.key.1 as i32 + dy;
+                if section < 0 || section >= SECTION_COUNT as i32 {
+                    continue;
+                }
+                let neighbour: SectionKey =
+                    ((node.key.0.0 + dx, node.key.0.1 + dz), section as usize);
+
+                let Some(slot) = self.slot(origin_chunk, neighbour) else {
+                    continue;
+                };
+                if self.state[slot] != UNSEEN {
+                    continue;
+                }
+                if !admits(neighbour) {
+                    self.state[slot] = REJECTED;
+                    continue;
+                }
+                self.state[slot] = REACHED;
+                self.queue.push_back(Node {
+                    key: neighbour,
+                    entered_by: Some(step.opposite()),
+                    steps_taken: node.steps_taken | (1 << step.index()),
+                });
+            }
+        }
+    }
+}
+
+impl Default for SectionGraph {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -108,6 +274,133 @@ mod tests {
         assert!(clip_visible(&vp, center_l));
         assert!(frustum.intersects_aabb(min_r, max_r));
         assert!(frustum.intersects_aabb(min_l, max_l));
+    }
+
+    /// Collect the sections a walk reaches, over a world described by a visibility closure.
+    fn walked(
+        origin: SectionKey,
+        radius: i32,
+        visibility: impl Fn(SectionKey) -> VisibilitySet,
+    ) -> std::collections::HashSet<SectionKey> {
+        let mut graph = SectionGraph::new();
+        let mut seen = std::collections::HashSet::new();
+        graph.walk(origin, radius, visibility, |_| true, |key| {
+            seen.insert(key);
+        });
+        seen
+    }
+
+    #[test]
+    fn open_air_reaches_the_whole_volume() {
+        let radius = 3;
+        let seen = walked(((0, 0), 12), radius, |_| VisibilitySet::EMPTY);
+        // (2r+1)^2 chunks x 24 sections, all mutually connected.
+        assert_eq!(seen.len(), ((2 * radius + 1) * (2 * radius + 1)) as usize * SECTION_COUNT);
+    }
+
+    #[test]
+    fn solid_world_stops_at_the_walls_of_the_camera_section() {
+        // Sealed in rock: you still see the six walls around you, and those faces live in the
+        // six neighbouring sections, so those are drawn. Nothing beyond them is.
+        let origin = ((0, 0), 12);
+        let seen = walked(origin, 3, |key| {
+            if key == origin {
+                VisibilitySet::EMPTY
+            } else {
+                VisibilitySet::OPAQUE
+            }
+        });
+        assert_eq!(seen.len(), 7, "the camera's section plus its six walls");
+        assert!(seen.contains(&origin));
+        for face in FACINGS {
+            let (dx, dy, dz) = face.offset();
+            let neighbour = ((dx, dz), (12 + dy) as usize);
+            assert!(seen.contains(&neighbour), "wall {face:?} should be drawn");
+        }
+        assert!(!seen.contains(&((2, 0), 12)), "nothing past the walls");
+    }
+
+    #[test]
+    fn buried_sections_are_skipped_but_the_surface_is_not() {
+        // A world split like the real one: everything at or above section 12 is open sky,
+        // everything below is solid. Standing on the surface must draw the surface layer and
+        // nothing underneath — this is the whole point of the graph.
+        let surface = 12usize;
+        let radius = 4;
+        let seen = walked(((0, 0), surface), radius, |key| {
+            if key.1 >= surface {
+                VisibilitySet::EMPTY
+            } else {
+                VisibilitySet::OPAQUE
+            }
+        });
+
+        // One section of overshoot is correct, not a leak: the rock directly beneath you is
+        // the ground you are standing on, and its top face is visible.
+        assert!(
+            seen.iter().all(|key| key.1 >= surface - 1),
+            "traversal reached more than one section into solid rock"
+        );
+        assert!(
+            seen.contains(&((radius, radius), surface)),
+            "the far corner of the surface layer must still be reached"
+        );
+        // Sections below stay unvisited even though they are well inside the radius.
+        assert!(!seen.contains(&((1, 0), 4)));
+    }
+
+    #[test]
+    fn a_tunnel_is_followed_but_the_rock_around_it_is_not() {
+        // One section-high corridor running along +X at section 8, solid elsewhere. The walk
+        // should march down the corridor and never step off it.
+        let corridor = 8usize;
+        let mut only_x = [0u8; 6];
+        let _ = &mut only_x;
+        let seen = walked(((0, 0), corridor), 5, |key| {
+            if key.1 == corridor && key.0.1 == 0 {
+                // Open along X only.
+                let mut section = crate::world::Section::new();
+                for x in 0..crate::world::SECTION_SIZE {
+                    section.set_block(x, 8, 8, crate::block::BlockId::AIR);
+                }
+                for x in 0..crate::world::SECTION_SIZE {
+                    for y in 0..crate::world::SECTION_SIZE {
+                        for z in 0..crate::world::SECTION_SIZE {
+                            if !(y == 8 && z == 8) {
+                                section.set_block(x, y, z, crate::block::BlockId::STONE);
+                            }
+                        }
+                    }
+                }
+                VisibilitySet::from_section(&section)
+            } else {
+                VisibilitySet::OPAQUE
+            }
+        });
+
+        assert!(seen.contains(&((5, 0), corridor)), "should reach the end of the corridor");
+        assert!(seen.contains(&((-5, 0), corridor)), "and the other end");
+        assert!(!seen.contains(&((1, 1), corridor)), "must not leave the corridor sideways");
+        assert!(!seen.contains(&((1, 0), corridor + 1)), "nor vertically");
+    }
+
+    #[test]
+    fn the_frustum_test_prunes_whole_branches() {
+        // Open world, but the caller refuses everything with negative x. Nothing beyond the
+        // cut should be visited, including sections reachable only by going around it.
+        let mut graph = SectionGraph::new();
+        let mut seen = std::collections::HashSet::new();
+        graph.walk(
+            ((0, 0), 12),
+            3,
+            |_| VisibilitySet::EMPTY,
+            |key| key.0.0 >= 0,
+            |key| {
+                seen.insert(key);
+            },
+        );
+        assert!(seen.iter().all(|key| key.0.0 >= 0));
+        assert!(seen.contains(&((3, 0), 12)));
     }
 
     #[test]

@@ -142,6 +142,38 @@ pub const fn bootstrap_ready_drain_budget_per_frame() -> usize {
     }
 }
 
+/// Minecraft's cave culling: only draw sections a sightline actually reaches.
+///
+/// **Off by default until generation stops banding.** The graph works — it cuts drawn sections
+/// by 37–45% — but it cannot pay for itself yet. `generate_chunk_surface` leaves everything
+/// below the surface with no block data, and a section with no data has to be treated as
+/// transparent, so the walk explores ~21k sections of nothing every frame and costs more time
+/// than the skipped draws save (274 → 227 FPS at loading radius 12).
+///
+/// Once chunks are generated full-depth the ground below is opaque rock, the walk terminates at
+/// the surface, and both halves of that trade reverse. Flip this default then.
+///
+/// `VOXEL_SECTION_CULLING=1` enables it for measurement. A bug here shows up as terrain
+/// popping out of existence, so compare `reachable_sections` and `visible_draws` in the profile
+/// line rather than trying to catch it by eye.
+#[inline]
+pub fn section_occlusion_culling() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("VOXEL_SECTION_CULLING")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// Threads dedicated to meshing, separate from the generator pool.
 ///
 /// Only has to keep up with the generation rate, not exceed it: at ~4.6 ms a chunk, two

@@ -37,14 +37,15 @@ mod worker_bridge;
 // Re-bind lib modules into the bin's root namespace so existing `crate::…` paths in
 // submodules (e.g. `terrain.rs` -> `crate::noise`) keep resolving as modules migrate.
 use voxel_engine::{
-    block, camera, cull, mesh, noise, platform, render, source, terrain, texture, world,
+    block, camera, cull, mesh, noise, platform, render, source, terrain, texture, visibility,
+    world,
 };
 use voxel_engine::{OPENGL_TO_WGPU_MATRIX, Vertex};
 
 #[cfg(not(target_arch = "wasm32"))]
 use voxel_engine::source::AnvilSource;
 use streamer::ChunkStreamer;
-use voxel_engine::world::{MIN_SECTION_Y, SECTION_SIZE, World};
+use voxel_engine::world::{MIN_SECTION_Y, SECTION_COUNT, SECTION_SIZE, World};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -250,6 +251,13 @@ struct State {
     chunk_requests_issued: u64,
     /// Cumulative chunks meshed, for the load profile line.
     chunks_meshed: u64,
+    /// Per-chunk section connectivity, delivered with each mesh result. Chunks absent here are
+    /// treated as fully transparent by the traversal — see [`cull::SectionGraph::walk`].
+    chunk_visibility: HashMap<(i32, i32), [visibility::VisibilitySet; SECTION_COUNT]>,
+    /// Reused across frames; owns the traversal's scratch buffers.
+    section_graph: cull::SectionGraph,
+    /// Sections the traversal reached last frame, for the profile line.
+    reachable_sections_last_frame: usize,
     /// Seed-mode world: chunks are generated rather than read from a save, which is far more
     /// expensive per chunk and gets larger streaming budgets.
     procedural_world: bool,
@@ -777,6 +785,9 @@ impl State {
             bootstrap_mesh_attempted: HashSet::new(),
             chunk_requests_issued: 0,
             chunks_meshed: 0,
+            chunk_visibility: HashMap::new(),
+            section_graph: cull::SectionGraph::new(),
+            reachable_sections_last_frame: 0,
             procedural_world,
         };
     }
@@ -815,7 +826,7 @@ impl State {
         self.profile_accum += self.delta;
         if self.profile_accum > 1_000_000 {
             println!(
-                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={}",
+                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={}",
                 self.started_at.elapsed().as_secs_f64(),
                 self.world_ready,
                 self.fps_ema,
@@ -831,6 +842,7 @@ impl State {
                 self.chunk_requests_issued,
                 self.chunks_meshed,
                 self.resident_quads(),
+                self.reachable_sections_last_frame,
             );
             self.profile_accum = 0;
         }
@@ -1054,6 +1066,7 @@ impl State {
             if !Self::chunk_within_keep_distance(coord, player_chunk_x, player_chunk_z) {
                 self._world.remove_chunk(coord);
                 self.chunk_meshes.remove(&coord);
+                self.chunk_visibility.remove(&coord);
                 self.pending_ready.retain(|meshed| meshed.coord != coord);
                 self.remesh_priority.retain(|&c| c != coord);
                 self.remesh_neighbor.retain(|&c| c != coord);
@@ -1123,6 +1136,9 @@ impl State {
             }
             if let Some(chunk) = meshed.chunk {
                 self._world.insert_chunk(chunk);
+            }
+            if let Some(visibility) = meshed.visibility {
+                self.chunk_visibility.insert(coord, visibility);
             }
             let had_initial_meshes = !meshed.is_remesh && !meshed.section_meshes.is_empty();
             if meshed.is_remesh {
@@ -1339,6 +1355,51 @@ impl State {
         let player_chunk_z = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let draw_radius = self.section_draw_distance_chunks.ceil() as i32 + 1;
 
+        // Cave culling: walk outward from the camera's section through the connectivity graph,
+        // so only sections an actual sightline reaches are drawn. Two disjoint field borrows —
+        // the graph is mutated while the visibility map is read.
+        let occlusion_culling = platform::section_occlusion_culling();
+        if occlusion_culling {
+            let camera_section = ((self.camera.position().y.floor() as i32)
+                .div_euclid(SECTION_SIZE as i32)
+                - MIN_SECTION_Y)
+                .clamp(0, SECTION_COUNT as i32 - 1) as usize;
+            let cp = self.camera.position();
+            let camera_origin = cgmath::Vector3::new(cp.x, cp.y, cp.z);
+            let graph = &mut self.section_graph;
+            let visibility_map = &self.chunk_visibility;
+            let mut reachable = 0usize;
+            graph.walk(
+                ((player_chunk_x, player_chunk_z), camera_section),
+                draw_radius,
+                |key| {
+                    visibility_map
+                        .get(&key.0)
+                        .map(|sections| sections[key.1])
+                        .unwrap_or(visibility::VisibilitySet::EMPTY)
+                },
+                |key| {
+                    let base_y = (key.1 as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+                    // `build_view_projection_matrix` views from the origin to keep float
+                    // precision stable far from spawn, so the frustum's planes are in
+                    // camera-relative space and the AABB has to be shifted to match.
+                    let min = cgmath::Vector3::new(
+                        key.0.0 as f32 * SECTION_SIZE as f32 - camera_origin.x,
+                        base_y as f32 - camera_origin.y,
+                        key.0.1 as f32 * SECTION_SIZE as f32 - camera_origin.z,
+                    );
+                    let max = min + cgmath::Vector3::new(
+                        SECTION_SIZE as f32,
+                        SECTION_SIZE as f32,
+                        SECTION_SIZE as f32,
+                    );
+                    frustum.intersects_aabb(min, max)
+                },
+                |_| reachable += 1,
+            );
+            self.reachable_sections_last_frame = reachable;
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -1395,6 +1456,13 @@ impl State {
                     for draw in &mesh.section_draws {
                         if !Self::section_passes_surface_lod(ring, draw.section_world_y, mesh.surface_max_y) {
                             continue;
+                        }
+                        if occlusion_culling {
+                            let section_index = (draw.section_world_y.div_euclid(SECTION_SIZE as i32)
+                                - MIN_SECTION_Y) as usize;
+                            if !self.section_graph.reached((chunk_coord, section_index)) {
+                                continue;
+                            }
                         }
                         render_pass.draw_indexed(
                             draw.first_index..draw.first_index + draw.index_count,

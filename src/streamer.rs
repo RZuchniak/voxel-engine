@@ -8,7 +8,8 @@ use rayon::ThreadPool;
 use crate::{
     mesh::{mesh_chunk_surface, MeshData},
     source::WorldSource,
-    world::{Chunk, World},
+    visibility::{chunk_visibility, VisibilitySet},
+    world::{Chunk, World, SECTION_COUNT},
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -19,6 +20,9 @@ pub struct MeshedChunk {
     pub chunk: Option<Chunk>,
     pub section_meshes: Vec<(usize, MeshData)>,
     pub is_remesh: bool,
+    /// Section connectivity for the renderer's occlusion traversal, computed alongside the
+    /// mesh because both walk the same block arrays. `None` on results that carry no mesh.
+    pub visibility: Option<[VisibilitySet; SECTION_COUNT]>,
 }
 
 pub struct ChunkStreamer {
@@ -112,6 +116,7 @@ impl ChunkStreamer {
                 chunk: Some(chunk),
                 section_meshes: Vec::new(),
                 is_remesh: false,
+                visibility: None,
             });
             crate::web_api::kick_event_loop();
         });
@@ -140,6 +145,7 @@ impl ChunkStreamer {
             chunk: Some(chunk),
             section_meshes: Vec::new(),
             is_remesh: false,
+            visibility: None,
         });
     }
 
@@ -149,12 +155,14 @@ impl ChunkStreamer {
             let ready_tx = self.ready_tx.clone();
             self.mesh_pool.spawn(move || {
                 let section_meshes = mesh_chunk_surface(&world, coord);
+                let visibility = world.chunk(coord).map(chunk_visibility);
 
                 let _ = ready_tx.send(MeshedChunk {
                     coord,
                     chunk: None,
                     section_meshes,
                     is_remesh: true,
+                    visibility,
                 });
             });
         }
@@ -163,11 +171,13 @@ impl ChunkStreamer {
         {
             // Remesh uses the main-thread world snapshot; workers only load chunk data.
             let section_meshes = mesh_chunk_surface(&world, coord);
+            let visibility = world.chunk(coord).map(chunk_visibility);
             let _ = self.ready_tx.send(MeshedChunk {
                 coord,
                 chunk: None,
                 section_meshes,
                 is_remesh: true,
+                visibility,
             });
         }
     }
@@ -219,6 +229,7 @@ impl ChunkStreamer {
                     chunk: Some(chunk),
                     section_meshes: Vec::new(),
                     is_remesh: false,
+                    visibility: None,
                 });
             });
             return true;

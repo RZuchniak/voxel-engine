@@ -628,6 +628,10 @@ fn reply_to_meshed(reply: WorkerReply) -> Option<MeshedChunk> {
                 chunk: Some(chunk.into_chunk()),
                 section_meshes,
                 is_remesh: false,
+                // Section connectivity is not on the worker wire yet. Absent visibility reads
+                // as "fully transparent", which only ever draws too much — and section
+                // occlusion culling is off on wasm regardless.
+                visibility: None,
             })
         }
         WorkerReply::RemeshChunk {
@@ -645,6 +649,7 @@ fn reply_to_meshed(reply: WorkerReply) -> Option<MeshedChunk> {
                 chunk: None,
                 section_meshes,
                 is_remesh: true,
+                visibility: None,
             })
         }
         WorkerReply::Error { .. } => None,
