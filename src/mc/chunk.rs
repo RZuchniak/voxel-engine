@@ -28,14 +28,85 @@ impl ChunkBlocks {
     pub fn get(&self, x: usize, y: i32, z: usize) -> Block {
         self.blocks[Self::index(x, y, z)]
     }
+
+    /// Whether any column has a non-air block at this height — used to detect a band that
+    /// was cut off below the real terrain top.
+    fn has_solid_at(&self, y: i32) -> bool {
+        (0..16).any(|z| (0..16).any(|x| self.get(x, y, z) != Block::Air))
+    }
 }
 
-/// Generate chunk `(chunk_x, chunk_z)` end to end.
+/// Generate the whole chunk column, `-64..320`. This is the exact, full-fidelity path the
+/// parity harnesses use.
 pub fn generate_chunk(
     ow: &Overworld,
     surface: &SurfaceSystem,
     chunk_x: i32,
     chunk_z: i32,
+) -> ChunkBlocks {
+    generate_range(ow, surface, chunk_x, chunk_z, MIN_Y, MIN_Y + HEIGHT - 1)
+}
+
+/// How far above the *preliminary* surface estimate to start generating. That estimate
+/// omits the 3D noise and jaggedness, so the real terrain can stand above it; this covers
+/// the gap. The ceiling is also raised adaptively if terrain reaches it anyway, so this is a
+/// performance guess, not a correctness assumption.
+const CEILING_MARGIN: i32 = 32;
+
+/// Generate only the band near the surface: everything from the terrain top down to
+/// `depth` blocks below it. Blocks outside the band are left as air.
+///
+/// This is the streaming path. It exists because the renderer already refuses to mesh
+/// anything more than [`crate::platform::surface_mesh_depth_blocks`] below a chunk's top
+/// (24 on wasm, 48 native) — so generating the other ~300 blocks was work that could never
+/// be seen. **It is a rendering optimisation, not a parity one**: deep terrain and caves
+/// genuinely are not generated, so never point a parity harness at this function.
+pub fn generate_chunk_surface(
+    ow: &Overworld,
+    surface: &SurfaceSystem,
+    chunk_x: i32,
+    chunk_z: i32,
+    depth: i32,
+) -> ChunkBlocks {
+    // Bound the band from the cheap offset/factor-only surface estimate, sampled on the
+    // quart lattice the estimate is cached on anyway.
+    let (mut lowest, mut highest) = (i32::MAX, i32::MIN);
+    for dz in (0..16).step_by(4) {
+        for dx in (0..16).step_by(4) {
+            let psl = ow.preliminary_surface_level(
+                (chunk_x * 16 + dx) as f64,
+                (chunk_z * 16 + dz) as f64,
+            );
+            lowest = lowest.min(psl);
+            highest = highest.max(psl);
+        }
+    }
+
+    let mut ceiling = (highest + CEILING_MARGIN).min(MIN_Y + HEIGHT - 1);
+    // Sea level matters even where the ground is far below it — ocean columns must still
+    // reach the water surface.
+    ceiling = ceiling.max(super::aquifer::SEA_LEVEL + 1);
+    // `lowest` is already the minimum over the chunk, so `depth` below it is conservative.
+    let floor = (lowest - depth).max(MIN_Y);
+
+    let mut generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling);
+    // If terrain actually reached the ceiling the margin was too small and the column was
+    // truncated. Raise it and redo rather than silently render a flat-topped mountain.
+    while ceiling < MIN_Y + HEIGHT - 1 && generated.has_solid_at(ceiling) {
+        ceiling = (ceiling + CEILING_MARGIN).min(MIN_Y + HEIGHT - 1);
+        generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling);
+    }
+    generated
+}
+
+/// The shared pipeline, over an inclusive Y range.
+fn generate_range(
+    ow: &Overworld,
+    surface: &SurfaceSystem,
+    chunk_x: i32,
+    chunk_z: i32,
+    y_lo: i32,
+    y_hi: i32,
 ) -> ChunkBlocks {
     let mut sampler = CellSampler::new(ow);
     let mut aquifer = ow.aquifer_for_chunk(chunk_x, chunk_z);
@@ -46,7 +117,7 @@ pub fn generate_chunk(
         for lx in 0..16usize {
             let x = chunk_x * 16 + lx as i32;
             let z = chunk_z * 16 + lz as i32;
-            for y in MIN_Y..MIN_Y + HEIGHT {
+            for y in y_lo..=y_hi {
                 let density = sampler.final_density(x, y, z);
                 blocks[ChunkBlocks::index(lx, y, lz)] = match aquifer
                     .compute_substance(x, y, z, density)
@@ -64,7 +135,7 @@ pub fn generate_chunk(
     let mut heights = [MIN_Y - 1; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
-            for y in (MIN_Y..MIN_Y + HEIGHT).rev() {
+            for y in (y_lo..=y_hi).rev() {
                 if blocks[ChunkBlocks::index(lx, y, lz)] != Block::Air {
                     heights[lz * 16 + lx] = y;
                     break;
@@ -87,7 +158,7 @@ pub fn generate_chunk(
             let mut water_height = i32::MIN;
             let mut next_ceiling_stone_y = i32::MAX;
 
-            for y in (MIN_Y..MIN_Y + HEIGHT).rev() {
+            for y in (y_lo..=y_hi).rev() {
                 let current = blocks[ChunkBlocks::index(lx, y, lz)];
                 if current == Block::Air {
                     stone_depth_above = 0;
@@ -104,8 +175,8 @@ pub fn generate_chunk(
                 // Solid. Find where this run of stone bottoms out, for the ceiling depth.
                 if next_ceiling_stone_y >= y {
                     next_ceiling_stone_y = i32::MIN;
-                    for look in (MIN_Y - 1..y).rev() {
-                        let below = if look < MIN_Y {
+                    for look in (y_lo - 1..y).rev() {
+                        let below = if look < y_lo {
                             Block::Air
                         } else {
                             blocks[ChunkBlocks::index(lx, look, lz)]
@@ -217,6 +288,37 @@ mod tests {
             "unexpected surface block {surface_block:?} at y={top}"
         );
         assert_eq!(chunk.get(0, MIN_Y, 0), Block::Bedrock, "world floor must be bedrock");
+    }
+
+    /// The streaming path must be indistinguishable from the exact one wherever the
+    /// renderer can actually see. This is the guard on `CEILING_MARGIN`: if the margin is
+    /// ever too small, the band gets truncated and this fails.
+    #[test]
+    fn surface_band_matches_full_generation_where_it_is_visible() {
+        let ow = Overworld::new(SEED);
+        let surface = SurfaceSystem::new(SEED);
+        const DEPTH: i32 = 64;
+
+        for (cx, cz) in [(0, 0), (3, -2), (-5, 4), (7, 7)] {
+            let full = generate_chunk(&ow, &surface, cx, cz);
+            let banded = generate_chunk_surface(&ow, &surface, cx, cz, DEPTH);
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let top = (MIN_Y..MIN_Y + HEIGHT)
+                        .rev()
+                        .find(|&y| full.get(lx, y, lz) != Block::Air);
+                    let Some(top) = top else { continue };
+                    // Everything from the terrain top down to `depth` below it must agree.
+                    for y in (top - DEPTH).max(MIN_Y)..=top {
+                        assert_eq!(
+                            banded.get(lx, y, lz),
+                            full.get(lx, y, lz),
+                            "chunk ({cx},{cz}) column ({lx},{lz}) y={y}: band differs from full"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

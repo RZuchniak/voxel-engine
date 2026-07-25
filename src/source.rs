@@ -63,7 +63,11 @@ impl SeededProceduralSource {
 impl WorldSource for SeededProceduralSource {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
         let (cx, cz) = coord;
-        let generated = crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, cx, cz);
+        // Generate only what can be meshed. A margin over the mesh depth keeps the band's
+        // bottom face out of the meshed region, so the cut never shows.
+        let depth = crate::platform::surface_mesh_depth_blocks() + 16;
+        let generated =
+            crate::mc::chunk::generate_chunk_surface(&self.overworld, &self.surface, cx, cz, depth);
         let mut out = Chunk::new(coord);
         for lz in 0..16usize {
             for lx in 0..16usize {

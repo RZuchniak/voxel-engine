@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use voxel_engine::mc::chunk::generate_chunk;
+use voxel_engine::mc::chunk::{generate_chunk, generate_chunk_surface};
 use voxel_engine::mc::overworld::{CellSampler, Overworld};
 use voxel_engine::mc::surface::SurfaceSystem;
 
@@ -53,4 +53,17 @@ fn main() {
     }
     let total = t.elapsed().as_secs_f64() * 1000.0;
     println!("\nfull generate_chunk: {:>7.1} ms/chunk  ({count} chunks, {total:.0} ms total)", total / count as f64);
+
+    // What the engine actually streams: only the band the renderer can mesh.
+    let depth = 48 + 16;
+    let t = Instant::now();
+    for i in 0..count {
+        std::hint::black_box(generate_chunk_surface(&ow, &surface, i % 8, i / 8, depth));
+    }
+    let banded = t.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "surface band only:   {:>7.1} ms/chunk  (depth {depth}, {:.1}x faster)",
+        banded / count as f64,
+        total / banded
+    );
 }
