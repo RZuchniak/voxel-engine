@@ -166,19 +166,133 @@ impl TargetPoint {
     }
 }
 
-/// `Climate.ParameterList` — the searchable set of (box → value) pairs.
+impl ParameterPoint {
+    /// `ParameterPoint.parameterSpace()` — the box as 7 axes, with `offset` as a zero-width
+    /// seventh. The target's seventh coordinate is always 0, so that axis contributes
+    /// exactly `|offset|`, which is how the offset penalty falls out of the generic metric.
+    fn parameter_space(&self) -> [Parameter; 7] {
+        [
+            self.temperature,
+            self.humidity,
+            self.continentalness,
+            self.erosion,
+            self.depth,
+            self.weirdness,
+            Parameter { min: self.offset, max: self.offset },
+        ]
+    }
+}
+
+impl TargetPoint {
+    /// `TargetPoint.toParameterArray()`.
+    fn to_array(self) -> [i64; 7] {
+        [
+            self.temperature,
+            self.humidity,
+            self.continentalness,
+            self.erosion,
+            self.depth,
+            self.weirdness,
+            0,
+        ]
+    }
+}
+
+/// `Climate.RTree.Node` — a leaf carries an index into [`ParameterList::entries`]; a subtree
+/// carries the bounding box of its children.
+enum Node {
+    Leaf { space: [Parameter; 7], entry: usize },
+    SubTree { space: [Parameter; 7], children: Vec<Node> },
+}
+
+impl Node {
+    fn space(&self) -> &[Parameter; 7] {
+        match self {
+            Node::Leaf { space, .. } | Node::SubTree { space, .. } => space,
+        }
+    }
+
+    /// `Node.distance` — squared distance from the target to this node's box.
+    #[inline]
+    fn distance(&self, target: &[i64; 7]) -> i64 {
+        let space = self.space();
+        let mut sum = 0;
+        for i in 0..7 {
+            let d = space[i].distance(target[i]);
+            sum += d * d;
+        }
+        sum
+    }
+
+    /// The axis midpoint the tree sorts on.
+    fn center(&self, axis: usize) -> i64 {
+        let p = self.space()[axis];
+        (p.min + p.max) / 2
+    }
+
+    /// `SubTree.search` — branch and bound. A child whose *box* is already further than the
+    /// best leaf found so far cannot contain a better leaf, so its subtree is skipped
+    /// entirely. That is what makes this exact rather than approximate.
+    fn search(&self, target: &[i64; 7], candidate: Option<(usize, i64)>) -> (usize, i64) {
+        match self {
+            Node::Leaf { entry, .. } => (*entry, self.distance(target)),
+            Node::SubTree { children, .. } => {
+                let (mut best_entry, mut best_distance) = match candidate {
+                    Some(c) => c,
+                    None => (usize::MAX, i64::MAX),
+                };
+                for child in children {
+                    let child_distance = child.distance(target);
+                    if best_distance > child_distance {
+                        let found = child.search(
+                            target,
+                            (best_entry != usize::MAX).then_some((best_entry, best_distance)),
+                        );
+                        if best_distance > found.1 {
+                            best_distance = found.1;
+                            best_entry = found.0;
+                        }
+                    }
+                }
+                (best_entry, best_distance)
+            }
+        }
+    }
+}
+
+/// `Climate.ParameterList` — the searchable set of (box → value) pairs, indexed by an R-tree.
 pub struct ParameterList<T> {
     pub entries: Vec<(ParameterPoint, T)>,
+    root: Node,
 }
 
 impl<T> ParameterList<T> {
     pub fn new(entries: Vec<(ParameterPoint, T)>) -> Self {
         assert!(!entries.is_empty(), "need at least one value to search");
-        Self { entries }
+        let leaves: Vec<Node> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (point, _))| Node::Leaf { space: point.parameter_space(), entry: i })
+            .collect();
+        let root = build(leaves);
+        Self { entries, root }
     }
 
-    /// `findValueBruteForce` — the nearest box's value. First entry wins ties.
+    /// The nearest box's value, via the R-tree (`RTree.search`).
+    ///
+    /// Vanilla seeds the search with the *previous* query's leaf (a `ThreadLocal`), which
+    /// biases tie-breaking toward whatever was looked up last. That makes its result depend
+    /// on query order, which this port does not reproduce — it starts from no candidate.
+    /// Only exact `fitness` ties can differ, and vanilla's boxes barely overlap.
     pub fn find(&self, target: &TargetPoint) -> &T {
+        let (entry, _) = self.root.search(&target.to_array(), None);
+        &self.entries[entry].1
+    }
+
+    /// `findValueBruteForce` — the linear reference. Kept because it is Mojang's own
+    /// `@VisibleForTesting` oracle for the tree, and `rtree_agrees_with_brute_force` holds
+    /// the two against each other.
+    pub fn find_brute_force(&self, target: &TargetPoint) -> &T {
         let mut best = &self.entries[0];
         let mut best_fitness = best.0.fitness(target);
         for entry in &self.entries[1..] {
@@ -191,6 +305,121 @@ impl<T> ParameterList<T> {
         }
         &best.1
     }
+}
+
+/// Number of children per node vanilla packs a bucket to (`CHILDREN_PER_NODE`).
+const CHILDREN_PER_NODE: usize = 6;
+
+/// `RTree.build` — recursively group nodes into subtrees, choosing at each level the axis
+/// whose split yields the tightest bounding boxes.
+fn build(mut children: Vec<Node>) -> Node {
+    assert!(!children.is_empty(), "need at least one child to build a node");
+    if children.len() == 1 {
+        return children.pop().expect("length checked");
+    }
+    if children.len() <= CHILDREN_PER_NODE {
+        // Small groups just get ordered by total magnitude across all axes.
+        children.sort_by_key(|node| {
+            (0..7).map(|axis| node.center(axis).abs()).sum::<i64>()
+        });
+        return sub_tree(children);
+    }
+
+    // Try splitting on each axis; keep whichever gives the least total box perimeter.
+    let mut min_cost = i64::MAX;
+    let mut min_axis = 0usize;
+    let mut min_buckets: Vec<Vec<Node>> = Vec::new();
+    for axis in 0..7 {
+        sort_nodes(&mut children, axis, false);
+        let buckets = bucketize(&children);
+        let cost: i64 = buckets.iter().map(|b| cost(&bounding_space(b))).sum();
+        if min_cost > cost {
+            min_cost = cost;
+            min_axis = axis;
+            min_buckets = buckets;
+        }
+    }
+
+    // Re-sort the winning buckets by |center| on the winning axis, then recurse into each.
+    let mut bucket_nodes: Vec<Node> = min_buckets.into_iter().map(sub_tree).collect();
+    sort_nodes(&mut bucket_nodes, min_axis, true);
+    let rebuilt = bucket_nodes
+        .into_iter()
+        .map(|bucket| match bucket {
+            Node::SubTree { children, .. } => build(children),
+            leaf => leaf,
+        })
+        .collect();
+    sub_tree(rebuilt)
+}
+
+fn sub_tree(children: Vec<Node>) -> Node {
+    Node::SubTree { space: bounding_space(&children), children }
+}
+
+/// `RTree.sort` — order by one axis, breaking ties with the remaining axes in rotation.
+fn sort_nodes(nodes: &mut [Node], axis: usize, absolute: bool) {
+    let key = |node: &Node| -> [i64; 7] {
+        let mut out = [0i64; 7];
+        for d in 0..7 {
+            let c = node.center((axis + d) % 7);
+            out[d] = if absolute { c.abs() } else { c };
+        }
+        out
+    };
+    nodes.sort_by_key(key);
+}
+
+/// `RTree.bucketize` — split into runs of `6^floor(log6(n - 0.01))`.
+fn bucketize(nodes: &[Node]) -> Vec<Vec<Node>>
+where
+{
+    let n = nodes.len();
+    let expected = 6f64
+        .powf(((n as f64 - 0.01).ln() / 6f64.ln()).floor())
+        as usize;
+    let expected = expected.max(1);
+    let mut buckets = Vec::new();
+    let mut current: Vec<Node> = Vec::new();
+    for node in nodes {
+        current.push(clone_node(node));
+        if current.len() >= expected {
+            buckets.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        buckets.push(current);
+    }
+    buckets
+}
+
+/// `bucketize` is called once per axis on the same slice, so nodes must be duplicated rather
+/// than moved. Only the winning axis' buckets survive.
+fn clone_node(node: &Node) -> Node {
+    match node {
+        Node::Leaf { space, entry } => Node::Leaf { space: *space, entry: *entry },
+        Node::SubTree { space, children } => {
+            Node::SubTree { space: *space, children: children.iter().map(clone_node).collect() }
+        }
+    }
+}
+
+/// `RTree.cost` — total width across all axes; smaller means a tighter box.
+fn cost(space: &[Parameter; 7]) -> i64 {
+    space.iter().map(|p| (p.max - p.min).abs()).sum()
+}
+
+/// `RTree.buildParameterSpace` — the box enclosing every child.
+fn bounding_space(children: &[Node]) -> [Parameter; 7] {
+    let mut bounds = *children[0].space();
+    for child in &children[1..] {
+        let space = child.space();
+        for d in 0..7 {
+            bounds[d].min = bounds[d].min.min(space[d].min);
+            bounds[d].max = bounds[d].max.max(space[d].max);
+        }
+    }
+    bounds
 }
 
 #[cfg(test)]
@@ -215,6 +444,30 @@ mod tests {
         assert_eq!(p.distance(5000), 0);
         assert_eq!(p.distance(6000), 1000);
         assert_eq!(p.distance(-6000), 1000);
+    }
+
+    /// The tree must return what the linear scan returns. Mojang ships
+    /// `findValueBruteForce` as the tree's own test oracle, and this holds the two against
+    /// each other over the real 7594-box overworld table across a spread of targets.
+    #[test]
+    fn rtree_agrees_with_brute_force() {
+        let list = ParameterList::new(crate::mc::biome::overworld_biomes());
+        // A deterministic spread over climate space, including out-of-range coordinates so
+        // the "nearest box" path (not just "inside a box") gets exercised.
+        let mut disagreements = 0;
+        let mut checked = 0;
+        for i in 0..12 {
+            for j in 0..12 {
+                let f = |n: i32| (n as f64 / 11.0) * 2.4 - 1.2;
+                let target = TargetPoint::new(f(i), f(j), f((i + 5) % 12), f((j + 3) % 12), f(i % 3), f((i + j) % 12));
+                checked += 1;
+                if list.find(&target) != list.find_brute_force(&target) {
+                    disagreements += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "expected a decent sample, got {checked}");
+        assert_eq!(disagreements, 0, "R-tree disagreed with brute force on {disagreements}/{checked}");
     }
 
     #[test]
