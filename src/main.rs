@@ -1466,8 +1466,18 @@ impl ApplicationHandler for App {
         );
         #[cfg(not(target_arch = "wasm32"))]
         {
-        let world_source: Arc<dyn source::WorldSource> =
-            Arc::new(AnvilSource::new("saves/Basic_World"));
+        // `VOXEL_SEED=<seed>` previews a real Minecraft world from its seed via the
+        // parity generator; without it, load the bundled save.
+        let world_source: Arc<dyn source::WorldSource> = match std::env::var("VOXEL_SEED")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+        {
+            Some(seed) => {
+                println!("generating world from seed {seed} (Minecraft-parity generator)");
+                Arc::new(source::SeededProceduralSource::new(seed))
+            }
+            None => Arc::new(AnvilSource::new("saves/Basic_World")),
+        };
         let mut state = pollster::block_on(State::new(window.clone(), world_source));
         let window = Arc::clone(&state.window);
         state.window.set_maximized(true);

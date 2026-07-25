@@ -28,6 +28,26 @@ pub const BLOCK_TEXTURE_FILES: &[&str] = &[
     "netherrack.png",       // 15
     "end_stone.png",        // 16
     "ice.png",              // 17
+    // Added for the Minecraft-parity generator (`mc::chunk`). Several are absent from this
+    // resource pack; each has a fallback colour below so the world still reads correctly.
+    "lava_still.png",          // 18
+    "sandstone.png",           // 19
+    "red_sand.png",            // 20
+    "red_sandstone.png",       // 21
+    "podzol_top.png",          // 22
+    "coarse_dirt.png",         // 23
+    "mycelium_top.png",        // 24
+    "mud.png",                 // 25
+    "calcite.png",             // 26
+    "packed_ice.png",          // 27
+    "powder_snow.png",         // 28
+    "terracotta.png",          // 29
+    "white_terracotta.png",    // 30
+    "orange_terracotta.png",   // 31
+    "yellow_terracotta.png",   // 32
+    "brown_terracotta.png",    // 33
+    "red_terracotta.png",      // 34
+    "light_gray_terracotta.png", // 35
 ];
 
 pub const BLOCK_TEXTURE_DIR: &str = "resource_pack/assets/minecraft/textures/block";
@@ -267,6 +287,24 @@ pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> Bloc
             "end_stone.png" => [220, 220, 171, 255],
             "ice.png" => [145, 190, 255, 220],
             "grass.png" => [120, 170, 80, 255],
+            "lava_still.png" => [207, 92, 22, 255],
+            "sandstone.png" => [216, 208, 156, 255],
+            "red_sand.png" => [190, 102, 33, 255],
+            "red_sandstone.png" => [181, 97, 31, 255],
+            "podzol_top.png" => [91, 63, 24, 255],
+            "coarse_dirt.png" => [119, 85, 59, 255],
+            "mycelium_top.png" => [111, 99, 105, 255],
+            "mud.png" => [60, 55, 60, 255],
+            "calcite.png" => [223, 222, 216, 255],
+            "packed_ice.png" => [141, 180, 219, 255],
+            "powder_snow.png" => [246, 250, 253, 255],
+            "terracotta.png" => [152, 94, 67, 255],
+            "white_terracotta.png" => [209, 178, 161, 255],
+            "orange_terracotta.png" => [162, 84, 38, 255],
+            "yellow_terracotta.png" => [186, 133, 35, 255],
+            "brown_terracotta.png" => [77, 51, 36, 255],
+            "red_terracotta.png" => [143, 61, 47, 255],
+            "light_gray_terracotta.png" => [135, 107, 98, 255],
             _ => [255, 0, 255, 255],
         };
         layers.push(load_layer_by_index(layer, pack_file, fallback));

@@ -94,6 +94,43 @@ impl ParameterPoint {
             + sq(self.weirdness.distance(t.weirdness))
             + sq(self.offset)
     }
+
+    /// [`Self::fitness`], abandoned as soon as the running total reaches `limit`.
+    ///
+    /// Every term is non-negative, so a partial sum is a lower bound on the whole — once it
+    /// reaches the best fitness seen so far, this entry cannot win and the rest of the terms
+    /// are wasted work. Returns `None` in that case. Selection is unchanged; this is purely
+    /// a speedup for the linear scan, which runs 7594 times per lookup.
+    ///
+    /// Axis order is deliberate: `depth` first because vanilla's boxes are pinned to a few
+    /// discrete depths (0, 1, 0.2..0.9, 1.1) and so reject hardest, then the two axes that
+    /// carve the map into the largest regions.
+    #[inline]
+    fn fitness_below(&self, t: &TargetPoint, limit: i64) -> Option<i64> {
+        let sq = |v: i64| v * v;
+        let mut sum = sq(self.depth.distance(t.depth));
+        if sum >= limit {
+            return None;
+        }
+        sum += sq(self.continentalness.distance(t.continentalness));
+        if sum >= limit {
+            return None;
+        }
+        sum += sq(self.erosion.distance(t.erosion));
+        if sum >= limit {
+            return None;
+        }
+        sum += sq(self.weirdness.distance(t.weirdness));
+        if sum >= limit {
+            return None;
+        }
+        sum += sq(self.temperature.distance(t.temperature));
+        if sum >= limit {
+            return None;
+        }
+        sum += sq(self.humidity.distance(t.humidity)) + sq(self.offset);
+        if sum >= limit { None } else { Some(sum) }
+    }
 }
 
 /// `Climate.TargetPoint` — the sampled climate at one position.
@@ -145,8 +182,9 @@ impl<T> ParameterList<T> {
         let mut best = &self.entries[0];
         let mut best_fitness = best.0.fitness(target);
         for entry in &self.entries[1..] {
-            let fitness = entry.0.fitness(target);
-            if fitness < best_fitness {
+            // `fitness_below` returns `None` exactly when `fitness >= best_fitness`, which is
+            // the same test the plain form does — so ties still keep the earlier entry.
+            if let Some(fitness) = entry.0.fitness_below(target, best_fitness) {
                 best_fitness = fitness;
                 best = entry;
             }

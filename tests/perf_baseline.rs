@@ -90,13 +90,19 @@ fn work_volume_baseline() {
     //   mesh_bytes == vertices * size_of::<Vertex>() + indices * 4   (Vertex is 28 bytes)
     // so a vertex-format change moves mesh_bytes alone, while a terrain change moves quads
     // and everything downstream of it.
+    // Re-recorded when `SeededProceduralSource` switched from the approximate
+    // `TerrainGenerator` to the Minecraft-parity generator (`mc::chunk`). The ~10× jump is
+    // expected and is the point of the change: real Minecraft terrain has far more relief
+    // than the old smooth heightmap, so more sections have geometry in them (18 vs 8) and
+    // each has more exposed faces. If this test fails again, that is the signal it was
+    // written for — a terrain change — so check whether it was intentional before editing.
     let expected = Counters {
         chunks_generated: 18,
-        sections_meshed: 8,
-        quads: 371,
-        vertices: 1484,
-        indices: 2226,
-        mesh_bytes: 50456,
+        sections_meshed: 18,
+        quads: 3926,
+        vertices: 15704,
+        indices: 23556,
+        mesh_bytes: 533936,
     };
 
     let mut report: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

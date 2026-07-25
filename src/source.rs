@@ -34,16 +34,24 @@ pub trait WorldSource: Send + Sync {
     }
 }
 
+/// A world generated from a real Minecraft seed, using the bit-parity generator in
+/// [`crate::mc`]. This is the project's whole point: type in your seed, see your world.
+///
+/// Costs roughly 45 ms per chunk (vs ~1 ms for the old approximate [`TerrainGenerator`]),
+/// which is the price of matching the real game. Generation is deterministic, so workers
+/// are handed the seed rather than chunk data.
 pub struct SeededProceduralSource {
     seed: i64,
-    generator: TerrainGenerator,
+    overworld: crate::mc::overworld::Overworld,
+    surface: crate::mc::surface::SurfaceSystem,
 }
 
 impl SeededProceduralSource {
     pub fn new(seed: i64) -> Self {
         Self {
             seed,
-            generator: TerrainGenerator::new(seed),
+            overworld: crate::mc::overworld::Overworld::new(seed),
+            surface: crate::mc::surface::SurfaceSystem::new(seed),
         }
     }
 
@@ -53,6 +61,49 @@ impl SeededProceduralSource {
 }
 
 impl WorldSource for SeededProceduralSource {
+    fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
+        let (cx, cz) = coord;
+        let generated = crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, cx, cz);
+        let mut out = Chunk::new(coord);
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                for y in crate::mc::chunk::MIN_Y..crate::mc::chunk::MIN_Y + crate::mc::chunk::HEIGHT
+                {
+                    let block = generated.get(lx, y, lz);
+                    if block != crate::mc::surface::Block::Air {
+                        out.set_block_world(lx, y, lz, block.block_id());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn is_procedural(&self) -> bool {
+        true
+    }
+
+    fn seed(&self) -> Option<i64> {
+        Some(self.seed)
+    }
+}
+
+/// The engine's original approximate generator, kept as a fast fallback for perf work —
+/// it is roughly 45× cheaper per chunk than the parity generator above.
+#[allow(dead_code)]
+pub struct ApproximateProceduralSource {
+    seed: i64,
+    generator: TerrainGenerator,
+}
+
+impl ApproximateProceduralSource {
+    #[allow(dead_code)]
+    pub fn new(seed: i64) -> Self {
+        Self { seed, generator: TerrainGenerator::new(seed) }
+    }
+}
+
+impl WorldSource for ApproximateProceduralSource {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
         Ok(crate::terrain::generate_chunk(&self.generator, coord))
     }

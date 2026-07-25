@@ -49,8 +49,7 @@ impl Camera {
     }
 
     pub fn new(aspect_ratio: f32, fov: f32, znear: f32, zfar: f32) -> Self {
-        let position: cgmath::Point3<f32> = (8.0, 100.0, 8.0).into();
-        let target: cgmath::Point3<f32> = (0.0, 76.0, 0.0).into();
+        let (position, target) = Self::start_view();
         let look = (target - position).normalize();
         let yaw = look.z.atan2(look.x) as f64;
         let pitch = look.y.asin() as f64;
@@ -64,6 +63,41 @@ impl Camera {
             zfar,
             pitch,
             yaw,
+        }
+    }
+
+    /// Where the camera starts, and what it looks at.
+    ///
+    /// `VOXEL_CAMERA="x,y,z,yaw_deg,pitch_deg"` overrides it. Terrain work is judged by
+    /// looking at it, and mouse-look can't be scripted, so this makes a given viewpoint
+    /// reproducible across runs — the same seed and the same string give the same picture.
+    fn start_view() -> (cgmath::Point3<f32>, cgmath::Point3<f32>) {
+        let default = (
+            cgmath::Point3::new(8.0, 100.0, 8.0),
+            cgmath::Point3::new(0.0, 76.0, 0.0),
+        );
+        #[cfg(target_arch = "wasm32")]
+        return default;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Ok(spec) = std::env::var("VOXEL_CAMERA") else { return default };
+            let parts: Vec<f32> = spec
+                .split(',')
+                .filter_map(|p| p.trim().parse::<f32>().ok())
+                .collect();
+            let [x, y, z, yaw_deg, pitch_deg] = parts[..] else {
+                eprintln!("VOXEL_CAMERA must be \"x,y,z,yaw_deg,pitch_deg\"; ignoring {spec:?}");
+                return default;
+            };
+            let (yaw, pitch) = (yaw_deg.to_radians(), pitch_deg.to_radians());
+            let position = cgmath::Point3::new(x, y, z);
+            let look = cgmath::Vector3::new(
+                yaw.cos() * pitch.cos(),
+                pitch.sin(),
+                yaw.sin() * pitch.cos(),
+            );
+            (position, position + look * 10.0)
         }
     }
 }

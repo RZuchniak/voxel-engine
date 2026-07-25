@@ -64,6 +64,45 @@ pub enum Block {
 }
 
 impl Block {
+    /// The engine's render id for this block.
+    pub fn block_id(self) -> crate::block::BlockId {
+        use crate::block::BlockId as Id;
+        match self {
+            Block::Air => Id::AIR,
+            Block::Water => Id::WATER,
+            Block::Lava => Id::LAVA,
+            Block::Stone => Id::STONE,
+            Block::Deepslate => Id::DEEPSLATE,
+            Block::Bedrock => Id::BEDROCK,
+            Block::Dirt => Id::DIRT,
+            Block::CoarseDirt => Id::COARSE_DIRT,
+            Block::Podzol => Id::PODZOL,
+            Block::GrassBlock => Id::GRASS,
+            Block::Mycelium => Id::MYCELIUM,
+            Block::Mud => Id::MUD,
+            Block::Sand => Id::SAND,
+            Block::Sandstone => Id::SANDSTONE,
+            Block::RedSand => Id::RED_SAND,
+            Block::RedSandstone => Id::RED_SANDSTONE,
+            Block::Gravel => Id::GRAVEL,
+            Block::Calcite => Id::CALCITE,
+            Block::PackedIce => Id::PACKED_ICE,
+            Block::Ice => Id::ICE,
+            Block::SnowBlock => Id::SNOW_BLOCK,
+            Block::PowderSnow => Id::POWDER_SNOW,
+            Block::Terracotta => Id::TERRACOTTA,
+            Block::WhiteTerracotta => Id::WHITE_TERRACOTTA,
+            Block::OrangeTerracotta => Id::ORANGE_TERRACOTTA,
+            Block::YellowTerracotta => Id::YELLOW_TERRACOTTA,
+            Block::BrownTerracotta => Id::BROWN_TERRACOTTA,
+            Block::RedTerracotta => Id::RED_TERRACOTTA,
+            Block::LightGrayTerracotta => Id::LIGHT_GRAY_TERRACOTTA,
+            // No dedicated render blocks for the sulfur-cave pair; they only appear deep
+            // underground, where stone reads fine.
+            Block::Cinnabar | Block::Sulfur => Id::STONE,
+        }
+    }
+
     /// The registry name, for comparing against a real world's blocks.
     pub fn name(self) -> &'static str {
         match self {

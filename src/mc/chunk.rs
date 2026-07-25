@@ -74,6 +74,7 @@ pub fn generate_chunk(
     }
 
     // Stage 3: surface rules, walking each column top-down.
+    let mut biome_cache = BiomeCache::new(chunk_x, chunk_z);
     for lz in 0..16usize {
         for lx in 0..16usize {
             let x = chunk_x * 16 + lx as i32;
@@ -81,12 +82,10 @@ pub fn generate_chunk(
             let surface_depth = surface.surface_depth_at(x, z);
             let min_surface_level = surface.min_surface_level(ow, x, z, surface_depth);
             let steep = is_steep(&heights, lx, lz);
-            let biome_cache = ColumnBiomes::new();
 
             let mut stone_depth_above = 0i32;
             let mut water_height = i32::MIN;
             let mut next_ceiling_stone_y = i32::MAX;
-            let mut biome_cache = biome_cache;
 
             for y in (MIN_Y..MIN_Y + HEIGHT).rev() {
                 let current = blocks[ChunkBlocks::index(lx, y, lz)];
@@ -157,25 +156,35 @@ fn is_steep(heights: &[i32; 256], lx: usize, lz: usize) -> bool {
     h(x_west, lz) >= h(x_east, lz) + 4
 }
 
-/// Biomes only change every 4 blocks vertically, and the lookup is a 7594-box scan, so cache
-/// it per quart cell as we walk down the column.
-struct ColumnBiomes {
-    last_quart_y: i32,
-    last: &'static str,
+/// Biomes live on a 4×4×4 grid and each lookup is a 7594-box scan, so a chunk needs only
+/// 4×4×96 = 1536 of them. Caching **per chunk** rather than per column is worth ~16× — the
+/// 16 columns inside a quart cell would otherwise each redo the same search.
+struct BiomeCache {
+    chunk_x: i32,
+    chunk_z: i32,
+    cells: Vec<Option<&'static str>>,
 }
 
-impl ColumnBiomes {
-    fn new() -> Self {
-        Self { last_quart_y: i32::MIN, last: "plains" }
+/// Quart cells per chunk axis, and vertically over the world height.
+const QUARTS_XZ: usize = 4;
+const QUARTS_Y: usize = (HEIGHT / 4) as usize;
+
+impl BiomeCache {
+    fn new(chunk_x: i32, chunk_z: i32) -> Self {
+        Self { chunk_x, chunk_z, cells: vec![None; QUARTS_XZ * QUARTS_XZ * QUARTS_Y] }
     }
 
     fn get(&mut self, ow: &Overworld, x: i32, y: i32, z: i32) -> &'static str {
-        let quart_y = y >> 2;
-        if quart_y != self.last_quart_y {
-            self.last_quart_y = quart_y;
-            self.last = ow.biome_at(x, y, z);
+        let qx = (x - self.chunk_x * 16) as usize / 4;
+        let qz = (z - self.chunk_z * 16) as usize / 4;
+        let qy = ((y - MIN_Y) / 4) as usize;
+        let index = (qy * QUARTS_XZ + qz) * QUARTS_XZ + qx;
+        if let Some(cached) = self.cells[index] {
+            return cached;
         }
-        self.last
+        let biome = ow.biome_at(x, y, z);
+        self.cells[index] = Some(biome);
+        biome
     }
 }
 

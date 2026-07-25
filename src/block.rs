@@ -27,6 +27,25 @@ impl BlockId {
     pub const NETHERRACK: BlockId = BlockId(14);
     pub const END_STONE: BlockId = BlockId(15);
     pub const ICE: BlockId = BlockId(16);
+    // Added for the Minecraft-parity generator (`mc::chunk`).
+    pub const LAVA: BlockId = BlockId(17);
+    pub const SANDSTONE: BlockId = BlockId(18);
+    pub const RED_SAND: BlockId = BlockId(19);
+    pub const RED_SANDSTONE: BlockId = BlockId(20);
+    pub const PODZOL: BlockId = BlockId(21);
+    pub const COARSE_DIRT: BlockId = BlockId(22);
+    pub const MYCELIUM: BlockId = BlockId(23);
+    pub const MUD: BlockId = BlockId(24);
+    pub const CALCITE: BlockId = BlockId(25);
+    pub const PACKED_ICE: BlockId = BlockId(26);
+    pub const POWDER_SNOW: BlockId = BlockId(27);
+    pub const TERRACOTTA: BlockId = BlockId(28);
+    pub const WHITE_TERRACOTTA: BlockId = BlockId(29);
+    pub const ORANGE_TERRACOTTA: BlockId = BlockId(30);
+    pub const YELLOW_TERRACOTTA: BlockId = BlockId(31);
+    pub const BROWN_TERRACOTTA: BlockId = BlockId(32);
+    pub const RED_TERRACOTTA: BlockId = BlockId(33);
+    pub const LIGHT_GRAY_TERRACOTTA: BlockId = BlockId(34);
 
     #[inline]
     pub fn info(self) -> &'static BlockInfo {
@@ -100,4 +119,23 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("netherrack", true, true, [15, 15, 15]),
     info("end_stone", true, true, [16, 16, 16]),
     info("ice", true, false, [17, 17, 17]),
+    // `mc::chunk` palette. Lava is non-opaque so it glows through like water does.
+    info("lava", true, false, [18, 18, 18]),
+    info("sandstone", true, true, [19, 19, 19]),
+    info("red_sand", true, true, [20, 20, 20]),
+    info("red_sandstone", true, true, [21, 21, 21]),
+    info("podzol", true, true, [22, 2, 22]),
+    info("coarse_dirt", true, true, [23, 23, 23]),
+    info("mycelium", true, true, [24, 2, 24]),
+    info("mud", true, true, [25, 25, 25]),
+    info("calcite", true, true, [26, 26, 26]),
+    info("packed_ice", true, true, [27, 27, 27]),
+    info("powder_snow", true, true, [28, 28, 28]),
+    info("terracotta", true, true, [29, 29, 29]),
+    info("white_terracotta", true, true, [30, 30, 30]),
+    info("orange_terracotta", true, true, [31, 31, 31]),
+    info("yellow_terracotta", true, true, [32, 32, 32]),
+    info("brown_terracotta", true, true, [33, 33, 33]),
+    info("red_terracotta", true, true, [34, 34, 34]),
+    info("light_gray_terracotta", true, true, [35, 35, 35]),
 ];
