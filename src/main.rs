@@ -498,6 +498,17 @@ impl State {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(surface_caps.formats[0]);
+        // Logged because this is the prime suspect for "the lighting looks different in the
+        // browser". The shader writes linear colour and relies on the *surface* to encode it; an
+        // sRGB surface does that in hardware, a non-sRGB one does not, and the same scene then
+        // displays markedly darker and more contrasty. Native almost always offers an sRGB format,
+        // whereas a WebGPU canvas commonly reports only `bgra8unorm` — in which case this falls
+        // through to `formats[0]` and the two targets genuinely differ.
+        platform::log_line(&format!(
+            "surface format {surface_format:?} (srgb={}), from {:?}",
+            surface_format.is_srgb(),
+            surface_caps.formats
+        ));
         let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
             wgpu::PresentMode::Fifo
         } else {

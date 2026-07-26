@@ -4,9 +4,11 @@
 //! deep clone, and any vertex-format change. A refactor that is supposed to be
 //! behaviour-preserving must not move these numbers.
 
+use std::collections::BTreeSet;
+
 use voxel_engine::{
     block::BlockId,
-    mesh::mesh_chunk,
+    mesh::{mesh_chunk, AO_MASK, FACE_SHADE_SHIFT},
     world::{Chunk, World, SECTION_SIZE},
 };
 
@@ -120,6 +122,63 @@ fn opaque_faces_land_on_the_block_lattice() {
             }
         }
     }
+}
+
+/// Every face must carry the directional brightness index matching its own normal.
+///
+/// Vanilla multiplies each face by a constant that depends only on its facing — up 1.0, down 0.5,
+/// north/south 0.8, east/west 0.6. The engine previously had **no** directional term: its only
+/// shading input was a per-vertex occluder count, which varies with position rather than facing,
+/// so every face of an isolated cube came out identically lit and the geometry read flat.
+///
+/// The split between this test and the shader matters: the *index* is a mesher fact and is checked
+/// here; the four *factors* live in `square.wgsl` and are not reachable from CPU code. So this
+/// catches a mis-packed or mis-assigned face, which is the failure that would silently ruin the
+/// lighting, but it cannot catch someone editing 0.5 to 0.9 in the shader.
+#[test]
+fn every_face_carries_its_own_directional_brightness() {
+    let mut world = World::new();
+    world.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
+
+    let meshes = mesh_chunk(&world, (0, 0));
+    let (_, mesh) = &meshes[0];
+    let vertices = mesh.vertices();
+    assert_eq!(vertices.len(), 24, "one 16x16 quad per face, 4 vertices each");
+
+    let mut seen = std::collections::BTreeSet::new();
+    for quad in vertices.chunks_exact(4) {
+        // A greedy quad is axis-aligned, so exactly one axis is constant across its corners —
+        // that axis is the face normal.
+        let normal_axis = (0..3)
+            .find(|&axis| quad.iter().all(|v| v.position[axis] == quad[0].position[axis]))
+            .expect("a greedy quad must be axis-aligned");
+        let expected = match normal_axis {
+            1 if quad[0].position[1] == SECTION_SIZE as f32 => 0, // up
+            1 => 1,                                              // down
+            2 => 2,                                              // north/south
+            _ => 3,                                              // east/west
+        };
+
+        let index = (quad[0].light >> FACE_SHADE_SHIFT) & 3;
+        assert_eq!(
+            index, expected,
+            "face with normal axis {normal_axis} at {:?} got brightness index {index}",
+            quad[0].position
+        );
+        for v in quad {
+            // The shader reads this flat, so a quad whose corners disagree would take an
+            // arbitrary one of them.
+            assert_eq!((v.light >> FACE_SHADE_SHIFT) & 3, index, "corners must agree");
+            // The packing must not have eaten the occlusion term sharing the same word.
+            assert!(v.light & AO_MASK > 0, "AO must survive the packing");
+        }
+        seen.insert(expected);
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from([0, 1, 2, 3]),
+        "all four of vanilla's brightness classes must appear on a lone cube"
+    );
 }
 
 /// A fluid's reversed copy is the one face allowed off the lattice — inward, never outward.

@@ -73,6 +73,36 @@ enum Direction {
     ZNegative,
 }
 
+impl Direction {
+    /// Which of vanilla's four fixed face brightnesses this face takes.
+    ///
+    /// Minecraft multiplies every face by a constant that depends only on its direction — up 1.0,
+    /// down 0.5, north/south 0.8, east/west 0.6 (`LightUtil`/`FaceInfo` shading). It is what makes
+    /// a cube read as a cube under a single sky light: without it every face of a block is the
+    /// same colour and the geometry goes flat. The engine had no directional term at all; its only
+    /// shading input was the per-vertex occluder count below, which varies with *position* rather
+    /// than facing, so it produced blotches instead of form.
+    ///
+    /// Returned as an index rather than a factor because it is packed into the light word and
+    /// resolved in the shader — see [`FACE_SHADE_SHIFT`].
+    #[inline]
+    fn shade_index(self) -> u32 {
+        match self {
+            Direction::YPositive => 0,
+            Direction::YNegative => 1,
+            Direction::ZPositive | Direction::ZNegative => 2,
+            Direction::XPositive | Direction::XNegative => 3,
+        }
+    }
+}
+
+/// The vertex `light` word is `ao | face_shade_index << FACE_SHADE_SHIFT`: the low byte is the
+/// interpolated per-vertex occlusion, the next two bits pick the flat per-face brightness. Packed
+/// into the existing `u32` attribute so this costs no extra vertex bandwidth — `square.wgsl`
+/// unpacks both halves and must agree with these constants.
+pub const FACE_SHADE_SHIFT: u32 = 8;
+pub const AO_MASK: u32 = 0xFF;
+
 #[inline]
 fn unpack_coords(
     primary_axis: usize,
@@ -380,7 +410,8 @@ fn emit_quad(
             }
         }
         let shade = (255u32.saturating_sub(occluders * 28)).max(72);
-        shade
+        debug_assert!(shade <= AO_MASK, "AO must fit the low byte of the light word");
+        shade | (dir.shade_index() << FACE_SHADE_SHIFT)
     };
     let v = |position: [f32; 3], uv: [f32; 2]| Vertex {
         position,

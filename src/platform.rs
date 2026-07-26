@@ -1,5 +1,24 @@
 /// Runtime tuning — tighter on wasm for browser memory and single-threaded meshing.
 
+/// One diagnostic line, on whichever target this is running.
+///
+/// ⚠️ **`println!` reaches nobody in a browser.** The wasm build installs
+/// `console_error_panic_hook` and no stdout redirect, so every `println!` in the engine — the
+/// entire `profile` line included — is silently dropped there. That is why cross-platform
+/// differences have historically been hard to chase from the browser side: the numbers the native
+/// build prints simply do not exist in a tab. Anything that has to be readable on both targets
+/// must go through here.
+pub fn log_line(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(message));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        println!("{message}");
+    }
+}
+
 /// Render distance, in chunks.
 ///
 /// **Cut hard when the surface band was dropped**, native 40 -> 20 and wasm 16 -> 12, because
