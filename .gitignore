@@ -3,3 +3,20 @@ Cargo.lock
 notes.md
 # Generated preview images from examples/preview.rs
 terrain_preview_*.png
+
+# Build output and local scratch.
+/dist
+/logs
+/.cursor
+
+# The Nebula resource pack. Only the 23 block textures the engine actually loads are committed
+# (86 KB of a 14.6 MB, 2096-file pack) along with pack.mcmeta and the readme carrying its licence
+# terms -- see ATTRIBUTION.md. Those files are already tracked, so this rule does not affect them;
+# it keeps the ~1800 unused textures from showing up as untracked noise.
+#
+# ⚠️ Adding a new block texture therefore needs `git add -f <path>`, or it will be silently
+# ignored. Keep the full pack in place locally: expanding the palette is then just a copy.
+/resource_pack/
+
+# Keep the unpacked upstream archive out of history (46 MB).
+/Nebula*.zip
