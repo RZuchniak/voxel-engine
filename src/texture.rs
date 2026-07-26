@@ -180,6 +180,30 @@ fn embedded_png(pack_file: &str) -> Option<&'static [u8]> {
             include_bytes!("../resource_pack/assets/minecraft/textures/block/end_stone.png")
         }
         "ice.png" => include_bytes!("../resource_pack/assets/minecraft/textures/block/ice.png"),
+        // The grass top is synthesised from these two (see `load_grass_top_layer`), so the overlay
+        // has to be embedded even though no layer maps to it directly.
+        "grass_block_side_overlay.png" => include_bytes!(
+            "../resource_pack/assets/minecraft/textures/block/grass_block_side_overlay.png"
+        ),
+        // These five exist in the pack but were never embedded, so they were real textures
+        // natively and flat colours in the browser — the visible half of the reported
+        // "looks different between wasm and native". The other thirteen `mc::` layers
+        // (sandstone, red_sand, mycelium_top, calcite, packed_ice, powder_snow, the seven
+        // terracottas) are absent from the pack entirely and so are flat on *both* targets;
+        // adding them here would not compile.
+        "lava_still.png" => {
+            include_bytes!("../resource_pack/assets/minecraft/textures/block/lava_still.png")
+        }
+        "red_sandstone.png" => {
+            include_bytes!("../resource_pack/assets/minecraft/textures/block/red_sandstone.png")
+        }
+        "podzol_top.png" => {
+            include_bytes!("../resource_pack/assets/minecraft/textures/block/podzol_top.png")
+        }
+        "coarse_dirt.png" => {
+            include_bytes!("../resource_pack/assets/minecraft/textures/block/coarse_dirt.png")
+        }
+        "mud.png" => include_bytes!("../resource_pack/assets/minecraft/textures/block/mud.png"),
         _ => return None,
     })
 }
@@ -191,30 +215,121 @@ fn load_raw_layer(pack_file: &str, fallback: [u8; 4]) -> Vec<u8> {
         .unwrap_or_else(|| fallback_rgba(fallback))
 }
 
-fn load_grass_top_layer(fallback: [u8; 4]) -> Vec<u8> {
+#[inline]
+fn luminance(px: &[u8]) -> f32 {
+    (px[0] as f32 * 0.299 + px[1] as f32 * 0.587 + px[2] as f32 * 0.114) / 255.0
+}
+
+/// Synthesise the grass-block top, which this resource pack does not ship.
+///
+/// `grass_block_top.png` is absent: the pack is texture-*only*, so it overrides what it wants and
+/// inherits the rest from vanilla — and this engine has no vanilla layer to inherit from. The top
+/// therefore has to be built from other art in the pack.
+///
+/// **The previous attempt used the wrong two sources.** Its detail mask was `grass.png`, which in a
+/// pre-1.20.3 pack is the **short-grass plant sprite**, not a block texture: rows 0..=10 are fully
+/// transparent and only rows 11..=15 carry a grayscale tuft. Since transparent pixels fell through
+/// to a flat colour, the result was flat over its upper 11/16 and mottled across the lower 5/16 —
+/// the horizontal banding that top faces visibly showed. Its base colour was also a single pixel
+/// sampled from the side texture, so the whole face was one hue.
+///
+/// The two sources that *are* right for this:
+/// - **`grass_block_side.png`'s green rows** are finished, fully-opaque green grass art. (This pack
+///   is stylised: the side is green almost to the bottom with dirt only in the last rows, the
+///   inverse of vanilla's thin fringe.) Their mean gives the hue.
+/// - **`grass_block_side_overlay.png`** is the pack's real grayscale grass overlay, opaque for
+///   rows 0..=12. Its luminance, normalised about its own mean, gives the detail.
+///
+/// Only the overlay contributes texture — modulating already-noisy green by a second noise field
+/// reads as mush. The overlay is tiled rather than stretched, because resampling 13 rows to 16
+/// smears vertically, and a top face is seen from directly above where that would be obvious.
+///
+/// `pub` so `examples/diag_texture_probe` can dump the result: this is generated art, and the only
+/// way to judge it is to look at it.
+pub fn load_grass_top_layer(fallback: [u8; 4]) -> Vec<u8> {
     let side = load_raw_layer("grass_block_side.png", fallback);
-    let mut top_color = fallback;
+    let px_at = |data: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let i = ((y * TEX_SIZE + x) * 4) as usize;
+        [data[i], data[i + 1], data[i + 2], data[i + 3]]
+    };
+
+    // Rows where green actually dominates, found rather than hardcoded — the dirt rows at the
+    // bottom must not drag the hue brown, and where the boundary sits is a property of the pack.
+    let mut hue = [0f32; 3];
+    let mut green_rows = 0u32;
     for y in 0..TEX_SIZE {
-        let i = (y * TEX_SIZE * 4) as usize;
-        if side[i + 3] > 200 {
-            top_color = [side[i], side[i + 1], side[i + 2], 255];
-            break;
+        let mut row = [0f32; 3];
+        let mut opaque = 0u32;
+        for x in 0..TEX_SIZE {
+            let p = px_at(&side, x, y);
+            if p[3] > 200 {
+                opaque += 1;
+                for c in 0..3 {
+                    row[c] += p[c] as f32;
+                }
+            }
         }
-    }
-    let overlay = load_raw_layer("grass.png", [255, 255, 255, 255]);
-    let mut out = vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize];
-    for (i, px) in out.chunks_exact_mut(4).enumerate() {
-        let o = &overlay[i * 4..(i + 1) * 4];
-        if o[3] < 10 {
-            px.copy_from_slice(&top_color);
+        if opaque == 0 {
             continue;
         }
-        let lum = (o[0] as f32 * 0.299 + o[1] as f32 * 0.587 + o[2] as f32 * 0.114) / 255.0;
-        let shade = 0.82 + lum * 0.28;
-        px[0] = (top_color[0] as f32 * shade).min(255.0) as u8;
-        px[1] = (top_color[1] as f32 * shade).min(255.0) as u8;
-        px[2] = (top_color[2] as f32 * shade).min(255.0) as u8;
-        px[3] = 255;
+        let mean = [row[0] / opaque as f32, row[1] / opaque as f32, row[2] / opaque as f32];
+        if mean[1] > mean[0] + 20.0 && mean[1] > mean[2] + 20.0 {
+            for c in 0..3 {
+                hue[c] += mean[c];
+            }
+            green_rows += 1;
+        }
+    }
+    if green_rows == 0 {
+        // No green in the side texture at all — nothing sensible to derive a top from.
+        return fallback_rgba(fallback);
+    }
+    for c in 0..3 {
+        hue[c] /= green_rows as f32;
+    }
+
+    let overlay = load_raw_layer("grass_block_side_overlay.png", [255, 255, 255, 255]);
+    let mut detail_rows = 0u32;
+    let mut detail_mean = 0f32;
+    for y in 0..TEX_SIZE {
+        let mut row = 0f32;
+        let mut opaque = 0u32;
+        for x in 0..TEX_SIZE {
+            let p = px_at(&overlay, x, y);
+            if p[3] > 200 {
+                opaque += 1;
+                row += luminance(&p);
+            }
+        }
+        // Only fully-opaque rows: the overlay's lower rows fade out into the fringe, and a
+        // partly-transparent row would bias the mean and tile as a visible band.
+        if opaque == TEX_SIZE {
+            detail_mean += row / opaque as f32;
+            detail_rows += 1;
+        }
+    }
+    if detail_rows == 0 {
+        return fallback_rgba(fallback);
+    }
+    detail_mean /= detail_rows as f32;
+
+    let mut out = vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize];
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            let src = px_at(&overlay, x, y % detail_rows);
+            // Normalised about the mean, so the overlay changes contrast without shifting overall
+            // brightness, and clamped so a bright speckle cannot blow out to white.
+            let shade = if detail_mean > 0.0 {
+                (luminance(&src) / detail_mean).clamp(0.75, 1.25)
+            } else {
+                1.0
+            };
+            let i = ((y * TEX_SIZE + x) * 4) as usize;
+            for c in 0..3 {
+                out[i + c] = (hue[c] * shade).clamp(0.0, 255.0) as u8;
+            }
+            out[i + 3] = 255;
+        }
     }
     out
 }
@@ -264,6 +379,65 @@ fn load_layer_by_index(layer: usize, pack_file: &str, fallback: [u8; 4]) -> Vec<
         _ => {}
     }
     data
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// The synthesised grass top must carry detail in **every** row.
+    ///
+    /// One uniform row is the exact signature of the bug this replaced: the old version masked a
+    /// flat colour with `grass.png` — the short-grass *plant* sprite, whose rows 0..=10 are fully
+    /// transparent — so those rows fell straight through to a single colour and the top face showed
+    /// a hard horizontal band across its upper two-thirds.
+    ///
+    /// Skips rather than fails when the pack is absent: `resource_pack/` is not committed, and
+    /// without it every loader returns a flat fallback, which would fail this for the wrong reason.
+    #[test]
+    fn the_synthesised_grass_top_has_detail_in_every_row() {
+        if !Path::new(BLOCK_TEXTURE_DIR).is_dir() {
+            eprintln!("skipping: {BLOCK_TEXTURE_DIR} is not present");
+            return;
+        }
+        let top = load_grass_top_layer([120, 170, 80, 255]);
+        assert_eq!(top.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
+
+        for y in 0..TEX_SIZE {
+            let mut distinct = std::collections::BTreeSet::new();
+            for x in 0..TEX_SIZE {
+                let i = ((y * TEX_SIZE + x) * 4) as usize;
+                distinct.insert([top[i], top[i + 1], top[i + 2]]);
+                assert_eq!(top[i + 3], 255, "the top face must be fully opaque");
+            }
+            assert!(
+                distinct.len() >= 3,
+                "row {y} of the grass top has only {} distinct colour(s) — the detail mask is not \
+                 reaching it, which is how the old banding looked",
+                distinct.len()
+            );
+        }
+    }
+
+    /// The hue must come from the pack's green, not from the caller's fallback.
+    ///
+    /// Cheap guard against the green-row detection silently finding nothing (in which case the
+    /// function bails to `fallback_rgba` and the top becomes a flat colour again).
+    #[test]
+    fn the_synthesised_grass_top_is_green() {
+        if !Path::new(BLOCK_TEXTURE_DIR).is_dir() {
+            eprintln!("skipping: {BLOCK_TEXTURE_DIR} is not present");
+            return;
+        }
+        // A fallback that is obviously *not* green, so falling back cannot pass this by accident.
+        let top = load_grass_top_layer([200, 0, 200, 255]);
+        for px in top.chunks_exact(4) {
+            assert!(
+                px[1] > px[0] && px[1] > px[2],
+                "grass top pixel {px:?} is not green-dominant"
+            );
+        }
+    }
 }
 
 pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> BlockTextureSet {
