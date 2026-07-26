@@ -1346,8 +1346,15 @@ impl State {
         // Cave culling: walk outward from the camera's section through the connectivity graph,
         // so only sections an actual sightline reaches are drawn. Two disjoint field borrows —
         // the graph is mutated while the visibility map is read.
+        // Skipped until `world_ready`: the draw loop below is the only consumer of
+        // `SectionGraph::reached`, and it is gated on the same flag, so a walk during the
+        // loading screen is computed and thrown away. It is also the *most* expensive walk of
+        // the run — half-loaded terrain has holes, and the flood leaks through them, so it
+        // reaches ~5500 sections against ~3000 in steady state. Measured at ~0.5 ms/frame of
+        // exactly the budget the reveal is waiting on (native 830-950 FPS during loading with
+        // the walk, 1500-1780 without).
         let occlusion_culling = platform::section_occlusion_culling();
-        if occlusion_culling {
+        if occlusion_culling && self.world_ready {
             let camera_section = ((self.camera.position().y.floor() as i32)
                 .div_euclid(SECTION_SIZE as i32)
                 - MIN_SECTION_Y)
@@ -1399,6 +1406,9 @@ impl State {
                 |_| reachable += 1,
             );
             self.reachable_sections_last_frame = reachable;
+        } else {
+            // Keep the profile line honest: no walk ran this frame.
+            self.reachable_sections_last_frame = 0;
         }
 
         {

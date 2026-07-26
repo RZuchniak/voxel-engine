@@ -17,31 +17,72 @@
 /// 40 was never affordable full-depth; that is the number that had to move. It is also more
 /// honest — vanilla's maximum is 32 and its default 12, and the occlusion graph's traversal
 /// cost scales with the volume too (radius 16 is 26k sections against radius 41's 165k).
+/// Native override: **`VOXEL_LOAD_DISTANCE=<chunks>`** (measurement knob, not clamped).
+///
+/// Raising *this* is the only way to put more geometry on screen. Draw distance is bounded by it
+/// in practice — a chunk outside the load radius has no mesh, so there is nothing to draw there —
+/// which is why `VOXEL_DRAW_DISTANCE` alone cannot make the occlusion-graph A/B harder: at load
+/// 20, draw 32 draws exactly what draw 20 draws.
+///
+/// ⚠️ Costs memory linearly in *area*, and a full column is ~196 KB of block data: radius 20 is
+/// ~330 MB resident, radius 28 ~640 MB, radius 32 ~830 MB. Deliberately unclamped so a
+/// measurement can go where the default will not; do not raise the default without redoing the
+/// memory table below.
 #[inline]
-pub const fn load_distance_chunks() -> i32 {
-    if cfg!(target_arch = "wasm32") {
+pub fn load_distance_chunks() -> i32 {
+    #[cfg(target_arch = "wasm32")]
+    {
         12
-    } else {
-        20
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static DISTANCE: OnceLock<i32> = OnceLock::new();
+        *DISTANCE.get_or_init(|| {
+            std::env::var("VOXEL_LOAD_DISTANCE")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(20)
+        })
     }
 }
 
+/// Defaults to the load distance on both targets — drawing further than you load is a no-op, and
+/// the two were already equal (native 20/20, wasm 12/12) before this was written down.
+///
+/// Native override: **`VOXEL_DRAW_DISTANCE=<chunks>`**, for A/B'ing draw-call cost against a
+/// fixed load radius. To actually add geometry, raise `VOXEL_LOAD_DISTANCE` instead (or as well).
 #[inline]
-pub const fn default_section_draw_distance_chunks() -> f32 {
-    if cfg!(target_arch = "wasm32") {
-        12.0
-    } else {
-        20.0
+pub fn default_section_draw_distance_chunks() -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        load_distance_chunks() as f32
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static DISTANCE: OnceLock<f32> = OnceLock::new();
+        *DISTANCE.get_or_init(|| {
+            std::env::var("VOXEL_DRAW_DISTANCE")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or_else(|| load_distance_chunks() as f32)
+        })
     }
 }
 
+/// The ceiling the `[` / `]` keys clamp to. Never below the starting distance, or an overridden
+/// `VOXEL_DRAW_DISTANCE` would be clamped straight back down on the first keypress.
 #[inline]
-pub const fn max_section_draw_distance_chunks() -> f32 {
-    if cfg!(target_arch = "wasm32") {
+pub fn max_section_draw_distance_chunks() -> f32 {
+    let platform_max: f32 = if cfg!(target_arch = "wasm32") {
         16.0
     } else {
         32.0
-    }
+    };
+    platform_max.max(default_section_draw_distance_chunks())
 }
 
 /// How much world is generated *and meshed* before the player is let in.
@@ -440,6 +481,24 @@ mod tests {
         } else {
             assert!(bootstrap_chunk_radius() <= load_distance_chunks());
         }
+    }
+
+    #[test]
+    fn drawing_never_reaches_past_loading() {
+        // Geometry outside the load radius has no mesh, so a draw distance beyond it buys
+        // nothing but a bigger frustum loop. Keeping the *default* equal to the load distance is
+        // what makes `VOXEL_LOAD_DISTANCE` alone enough to scale a measurement.
+        assert_eq!(
+            default_section_draw_distance_chunks(),
+            load_distance_chunks() as f32
+        );
+    }
+
+    #[test]
+    fn the_draw_distance_ceiling_never_clamps_the_starting_distance() {
+        // `max_section_draw_distance_chunks` is what `[` / `]` clamp to. If an override pushed the
+        // start above the ceiling, the first keypress would yank it back down.
+        assert!(max_section_draw_distance_chunks() >= default_section_draw_distance_chunks());
     }
 }
 
