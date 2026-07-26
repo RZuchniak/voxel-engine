@@ -56,8 +56,28 @@ const TEX_SIZE: u32 = 16;
 /// Mip chain for 16×16 tiles (16 → 8 → 4 → 2 → 1).
 const BLOCK_MIP_LEVELS: u32 = 5;
 
+/// Is alpha a binary stencil here, rather than absent or a constant?
+///
+/// Leaves are the case that matters: 0 or 255 only, ~60% covered. Water is *not* — `apply_water_tint`
+/// forces every visible texel to 255 — and ice is a uniform 136, so neither takes the cutout path.
+fn is_cutout(rgba: &[u8]) -> bool {
+    let mut saw_clear = false;
+    let mut saw_opaque = false;
+    for px in rgba.chunks_exact(4) {
+        match px[3] {
+            0 => saw_clear = true,
+            255 => saw_opaque = true,
+            _ => return false,
+        }
+    }
+    saw_clear && saw_opaque
+}
+
 /// Downsample a 16×16 RGBA layer into mip levels (wgpu 26 has no CommandEncoder::generate_mipmap).
 fn build_mip_chain(base: &[u8]) -> Vec<Vec<u8>> {
+    if is_cutout(base) {
+        return build_cutout_mip_chain(base);
+    }
     let mut mips = vec![base.to_vec()];
     let mut current =
         image::RgbaImage::from_raw(TEX_SIZE, TEX_SIZE, base.to_vec()).expect("16x16 layer");
@@ -71,6 +91,93 @@ fn build_mip_chain(base: &[u8]) -> Vec<Vec<u8>> {
             image::imageops::FilterType::Triangle,
         );
         mips.push(current.as_raw().to_vec());
+    }
+    mips
+}
+
+/// Mip chain for an alpha-tested layer, preserving opaque **coverage** at every level.
+///
+/// Averaging alpha destroys a cutout. A mip-1 texel covering one opaque and three clear texels
+/// averages to alpha 64, which passes any sane alpha test — so *every hole closes at the first mip
+/// transition*, which is a hard line at whatever distance minification begins. That is the reported
+/// "the distance at which leaves become opaque is too close, and I can clearly see a line".
+///
+/// Instead, each level keeps exactly the same fraction of texels opaque as the base, choosing the
+/// most-covered ones, and re-quantises alpha to 0/255 (coverage-preserving mipmapping, after
+/// Castano). Staying binary also makes the result independent of the shader's alpha threshold, so
+/// the two cannot drift apart.
+///
+/// Colour is averaged over **covered texels only**: including the clear ones would pull whatever is
+/// behind the cutout into the average and ring a dark halo around every leaf edge at range.
+fn build_cutout_mip_chain(base: &[u8]) -> Vec<Vec<u8>> {
+    let texel_count = (TEX_SIZE * TEX_SIZE) as usize;
+    let coverage =
+        base.chunks_exact(4).filter(|px| px[3] > 0).count() as f32 / texel_count as f32;
+
+    let mut mips = vec![base.to_vec()];
+    let mut current = base.to_vec();
+    let mut size = TEX_SIZE;
+
+    while size > 1 {
+        let next = size / 2;
+        let total = (next * next) as usize;
+        let mut level = vec![0u8; total * 4];
+        let mut covered_fraction = vec![0f32; total];
+        let mut mean = [0u32; 3];
+        let mut mean_n = 0u32;
+
+        for y in 0..next {
+            for x in 0..next {
+                let mut acc = [0u32; 3];
+                let mut opaque = 0u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let i = (((y * 2 + dy) * size + (x * 2 + dx)) * 4) as usize;
+                        if current[i + 3] > 0 {
+                            opaque += 1;
+                            for c in 0..3 {
+                                acc[c] += current[i + c] as u32;
+                            }
+                        }
+                    }
+                }
+                let o = (y * next + x) as usize;
+                covered_fraction[o] = opaque as f32 / 4.0;
+                if opaque > 0 {
+                    for c in 0..3 {
+                        level[o * 4 + c] = (acc[c] / opaque) as u8;
+                        mean[c] += acc[c] / opaque;
+                    }
+                    mean_n += 1;
+                }
+            }
+        }
+
+        // Rank by coverage and keep the base level's share. Ties break on index so the chain is
+        // deterministic — a texture that changes between runs would be maddening to debug.
+        let keep = ((coverage * total as f32).round() as usize).clamp(1, total);
+        let mut order: Vec<usize> = (0..total).collect();
+        order.sort_by(|&a, &b| {
+            covered_fraction[b]
+                .partial_cmp(&covered_fraction[a])
+                .expect("coverage is never NaN")
+                .then(a.cmp(&b))
+        });
+        for (rank, &o) in order.iter().enumerate() {
+            let kept = rank < keep;
+            level[o * 4 + 3] = if kept { 255 } else { 0 };
+            // Kept but with no covered source: give it the level's mean colour rather than the
+            // black it was initialised to.
+            if kept && covered_fraction[o] == 0.0 && mean_n > 0 {
+                for c in 0..3 {
+                    level[o * 4 + c] = (mean[c] / mean_n) as u8;
+                }
+            }
+        }
+
+        mips.push(level.clone());
+        current = level;
+        size = next;
     }
     mips
 }
@@ -417,6 +524,88 @@ mod tests {
                 distinct.len()
             );
         }
+    }
+
+    /// A cutout's mip chain must stay binary and keep its coverage at every level.
+    ///
+    /// The bug: the shared chain averages alpha, so a mip-1 texel covering one opaque and three
+    /// clear texels became alpha 64 — solid under any sane alpha test. Every hole therefore closed
+    /// at the *first* mip transition, giving a hard line at whatever distance minification starts.
+    #[test]
+    fn a_cutout_mip_chain_keeps_binary_alpha_and_its_coverage() {
+        // A synthetic checkerboard rather than the pack, so this holds without `resource_pack/`
+        // and pins the property rather than one texture's numbers.
+        let mut base = vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize];
+        for y in 0..TEX_SIZE {
+            for x in 0..TEX_SIZE {
+                let i = ((y * TEX_SIZE + x) * 4) as usize;
+                base[i] = 40;
+                base[i + 1] = 160;
+                base[i + 2] = 60;
+                base[i + 3] = if (x + y) % 2 == 0 { 255 } else { 0 };
+            }
+        }
+        assert!(is_cutout(&base), "the fixture must take the cutout path");
+
+        let mips = build_mip_chain(&base);
+        assert_eq!(mips.len(), BLOCK_MIP_LEVELS as usize);
+        let base_coverage = 0.5; // exact, by construction
+
+        for (level, data) in mips.iter().enumerate() {
+            let size = (TEX_SIZE >> level).max(1);
+            let texels = (size * size) as usize;
+            assert_eq!(data.len(), texels * 4, "mip {level} is the wrong size");
+
+            let mut opaque = 0usize;
+            for px in data.chunks_exact(4) {
+                assert!(
+                    px[3] == 0 || px[3] == 255,
+                    "mip {level} has alpha {} — averaging alpha is what filled the holes in",
+                    px[3]
+                );
+                if px[3] == 255 {
+                    opaque += 1;
+                }
+            }
+            // Exact where the count divides evenly; rounding costs at most one texel.
+            let expected = (base_coverage * texels as f32).round() as usize;
+            assert!(
+                opaque.abs_diff(expected) <= 1,
+                "mip {level} keeps {opaque}/{texels} opaque, expected ~{expected}"
+            );
+        }
+    }
+
+    /// A cutout mip must not tint towards whatever sits behind the holes.
+    #[test]
+    fn a_cutout_mip_takes_its_colour_only_from_covered_texels() {
+        // Opaque texels are pure green; the clear ones are black. Averaging all four would drag the
+        // green down by half at every level and ring dark halos around the leaves at range.
+        let mut base = vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize];
+        for y in 0..TEX_SIZE {
+            for x in 0..TEX_SIZE {
+                let i = ((y * TEX_SIZE + x) * 4) as usize;
+                if (x + y) % 2 == 0 {
+                    base[i + 1] = 200;
+                    base[i + 3] = 255;
+                }
+            }
+        }
+        let mips = build_mip_chain(&base);
+        let mut checked = 0usize;
+        for (level, data) in mips.iter().enumerate().skip(1) {
+            for px in data.chunks_exact(4).filter(|px| px[3] == 255) {
+                checked += 1;
+                assert_eq!(
+                    px[1], 200,
+                    "mip {level} green dropped to {} — the clear texels are polluting the average",
+                    px[1]
+                );
+            }
+        }
+        // Without this the test passes vacuously on the averaging chain: no texel comes out at
+        // exactly 255 alpha there, so the filter matches nothing and the loop never runs.
+        assert!(checked > 0, "no opaque mip texels were examined");
     }
 
     /// The hue must come from the pack's green, not from the caller's fallback.

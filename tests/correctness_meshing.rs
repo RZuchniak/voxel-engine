@@ -181,6 +181,42 @@ fn every_face_carries_its_own_directional_brightness() {
     );
 }
 
+/// Leaves must not delete the face of a solid block they touch.
+///
+/// Reported as "where leaves touch solid blocks you can see through the world". Leaves are a cutout
+/// — binary alpha, ~60% covered — but were declared `is_opaque`, so the mesher culled the
+/// neighbouring ground's face and the leaf's own holes then looked straight at the sky. The second
+/// half of the same bug is that only non-opaque full cubes are emitted double-sided, so backface
+/// culling removed the far side of even a lone leaf cube; `isolated_solid_section_merges_to_six_quads`
+/// covers the single-block shape, and this covers the interaction.
+#[test]
+fn leaves_do_not_cull_the_face_of_an_adjacent_solid_block() {
+    let mut world = World::new();
+    world.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
+    world.insert_chunk(solid_chunk((1, 0), BlockId::OAK_LEAVES));
+    let with_leaves = quad_count(&world, (0, 0));
+
+    // The same stone chunk with nothing beside it: the shared face must survive in both cases.
+    let mut alone = World::new();
+    alone.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
+    let isolated = quad_count(&alone, (0, 0));
+
+    assert_eq!(
+        with_leaves, isolated,
+        "leaves next to stone removed {} of the stone's quads — a cutout neighbour must not cull",
+        isolated as i64 - with_leaves as i64
+    );
+
+    // And an opaque neighbour still *must* cull, or this "fix" would just disable face culling.
+    let mut opaque = World::new();
+    opaque.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
+    opaque.insert_chunk(solid_chunk((1, 0), BlockId::DIRT));
+    assert!(
+        quad_count(&opaque, (0, 0)) < isolated,
+        "an opaque neighbour must still cull the shared face"
+    );
+}
+
 /// A fluid's reversed copy is the one face allowed off the lattice — inward, never outward.
 ///
 /// Outward is what tore the convex edges open (see above). Inward only moves the face towards a

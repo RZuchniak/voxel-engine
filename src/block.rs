@@ -109,7 +109,14 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("sand", true, true, [8, 8, 8]),
     info("cobblestone", true, true, [9, 9, 9]),
     info("oak_log", true, true, [6, 6, 6]),
-    info("oak_leaves", true, true, [7, 7, 7]),
+    // Leaves are a **cutout**: binary alpha, ~60% covered. They must not be `is_opaque`, for two
+    // separate reasons that both showed up as "you can see through the world" where leaves touch
+    // solid blocks:
+    //   1. `mesh.rs` culls a face whose neighbour `is_full_cube() && is_opaque()`, so leaves were
+    //      deleting the ground's top face, and the leaf's own alpha holes then looked at the sky.
+    //   2. Only non-opaque full cubes get the double-sided treatment. Backface culling removes the
+    //      inside of a cube's far faces, so a *lone* opaque-flagged leaf block was see-through too.
+    info("oak_leaves", true, false, [7, 7, 7]),
     info("oak_planks", true, true, [10, 10, 10]),
     info("water", true, false, [5, 5, 5]),
     info("bedrock", true, true, [11, 11, 11]),

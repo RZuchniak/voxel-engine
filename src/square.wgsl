@@ -86,7 +86,16 @@ fn fs_main(
     let fog_t = smoothstep(fog_start, fog_end, dist);
     let mip_bias = fog_t * 1.0;
     let albedo = textureSampleBias(block_texture, block_sampler, uv, i32(tex_layer), mip_bias);
-    if (albedo.a < 0.01) {
+    // "More than half covered", not "covered at all". The sampler is trilinear, so even though
+    // cutout mips are built binary (`texture::build_cutout_mip_chain`) the filtering between texels
+    // and between levels still yields intermediate alpha; at the old 0.01 threshold every such
+    // partial texel counted as solid, which is what closed the leaf holes at range.
+    //
+    // ⚠️ Nothing blends — the pipeline is `BlendState::REPLACE`, so alpha *only* drives this test.
+    // A translucent-looking block is simply one whose constant alpha clears the threshold: ice is
+    // a uniform 136/255 = 0.533, which passes with only a 3% margin. If a future pack ships ice
+    // below 0.5 it will vanish entirely rather than look wrong, so check here first.
+    if (albedo.a < 0.5) {
         discard;
     }
 
