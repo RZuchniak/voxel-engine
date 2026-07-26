@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use rayon::ThreadPool;
 
 use crate::{
-    mesh::{mesh_chunk_surface, MeshData},
+    mesh::{mesh_chunk, MeshData},
     source::WorldSource,
     visibility::{chunk_visibility, VisibilitySet},
     world::{Chunk, World, SECTION_COUNT},
@@ -154,7 +154,7 @@ impl ChunkStreamer {
         {
             let ready_tx = self.ready_tx.clone();
             self.mesh_pool.spawn(move || {
-                let section_meshes = mesh_chunk_surface(&world, coord);
+                let section_meshes = mesh_chunk(&world, coord);
                 let visibility = world.chunk(coord).map(chunk_visibility);
 
                 let _ = ready_tx.send(MeshedChunk {
@@ -170,7 +170,7 @@ impl ChunkStreamer {
         #[cfg(target_arch = "wasm32")]
         {
             // Remesh uses the main-thread world snapshot; workers only load chunk data.
-            let section_meshes = mesh_chunk_surface(&world, coord);
+            let section_meshes = mesh_chunk(&world, coord);
             let visibility = world.chunk(coord).map(chunk_visibility);
             let _ = self.ready_tx.send(MeshedChunk {
                 coord,

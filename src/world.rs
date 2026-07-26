@@ -99,25 +99,6 @@ impl Chunk {
         None
     }
 
-    /// True when any section within [`platform::surface_mesh_depth_blocks`] of the top needs meshing.
-    pub fn needs_surface_mesh(&self) -> bool {
-        let Some(surface_max_y) = self.max_nonempty_world_y() else {
-            return false;
-        };
-        let depth = crate::platform::surface_mesh_depth_blocks();
-        self.populated_section_indices().any(|idx| {
-            Self::section_near_surface(idx, surface_max_y, depth)
-                && self.section(idx).is_some_and(|s| s.has_any_non_air())
-        })
-    }
-
-    /// Section is close enough to the chunk surface to worth meshing (skip caves/deep stone).
-    pub fn section_near_surface(section_index: usize, surface_max_y: i32, depth_blocks: i32) -> bool {
-        let section_base = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
-        let section_top = section_base + SECTION_SIZE as i32;
-        section_top >= surface_max_y - depth_blocks
-    }
-
     fn section_index_from_world_y(world_y: i32) -> Option<usize> {
         let section_y = world_y.div_euclid(SECTION_SIZE as i32);
         let idx = section_y - MIN_SECTION_Y;

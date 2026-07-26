@@ -57,7 +57,7 @@ const CEILING_MARGIN: i32 = 32;
 /// `depth` blocks below it. Blocks outside the band are left as air.
 ///
 /// This is the streaming path. It exists because the renderer already refuses to mesh
-/// anything more than [`crate::platform::surface_mesh_depth_blocks`] below a chunk's top
+/// anything more than [`crate::platform::surface_band_depth_blocks`] below a chunk's top
 /// (24 on wasm, 48 native) — so generating the other ~300 blocks was work that could never
 /// be seen. **It is a rendering optimisation, not a parity one**: deep terrain and caves
 /// genuinely are not generated, so never point a parity harness at this function.
@@ -293,28 +293,33 @@ mod tests {
     /// The streaming path must be indistinguishable from the exact one wherever the
     /// renderer can actually see. This is the guard on `CEILING_MARGIN`: if the margin is
     /// ever too small, the band gets truncated and this fails.
+    ///
+    /// Both shipped depths are checked — 64 native, 40 on wasm. The browser runs the
+    /// shallower band, so pinning only the native one would leave the build people actually
+    /// see the least tested.
     #[test]
     fn surface_band_matches_full_generation_where_it_is_visible() {
         let ow = Overworld::new(SEED);
         let surface = SurfaceSystem::new(SEED);
-        const DEPTH: i32 = 64;
 
-        for (cx, cz) in [(0, 0), (3, -2), (-5, 4), (7, 7)] {
-            let full = generate_chunk(&ow, &surface, cx, cz);
-            let banded = generate_chunk_surface(&ow, &surface, cx, cz, DEPTH);
-            for lz in 0..16usize {
-                for lx in 0..16usize {
-                    let top = (MIN_Y..MIN_Y + HEIGHT)
-                        .rev()
-                        .find(|&y| full.get(lx, y, lz) != Block::Air);
-                    let Some(top) = top else { continue };
-                    // Everything from the terrain top down to `depth` below it must agree.
-                    for y in (top - DEPTH).max(MIN_Y)..=top {
-                        assert_eq!(
-                            banded.get(lx, y, lz),
-                            full.get(lx, y, lz),
-                            "chunk ({cx},{cz}) column ({lx},{lz}) y={y}: band differs from full"
-                        );
+        for depth in [40i32, 64] {
+            for (cx, cz) in [(0, 0), (3, -2), (-5, 4), (7, 7)] {
+                let full = generate_chunk(&ow, &surface, cx, cz);
+                let banded = generate_chunk_surface(&ow, &surface, cx, cz, depth);
+                for lz in 0..16usize {
+                    for lx in 0..16usize {
+                        let top = (MIN_Y..MIN_Y + HEIGHT)
+                            .rev()
+                            .find(|&y| full.get(lx, y, lz) != Block::Air);
+                        let Some(top) = top else { continue };
+                        // Everything from the terrain top down to `depth` below it must agree.
+                        for y in (top - depth).max(MIN_Y)..=top {
+                            assert_eq!(
+                                banded.get(lx, y, lz),
+                                full.get(lx, y, lz),
+                                "depth {depth}, chunk ({cx},{cz}) column ({lx},{lz}) y={y}:                                  band differs from full"
+                            );
+                        }
                     }
                 }
             }

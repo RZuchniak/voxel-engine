@@ -128,10 +128,18 @@ impl SectionGraph {
     /// that really exists. `admits` is the caller's frustum and distance test; a section that
     /// fails it is neither drawn nor traversed, which is safe because anything visible through
     /// it would be further away and also outside the frustum.
+    ///
+    /// `smart_cull` is vanilla's flag of the same name. Pass `false` when the camera is inside
+    /// an opaque block: connectivity is then meaningless — the eye is in a cell no sightline
+    /// leaves — and the walk degrades to a plain frustum flood fill. Without this a noclipping
+    /// camera underground draws *nothing*, since the camera's section and all six of its
+    /// neighbours are solid rock with no faces to emit. Vanilla does exactly this for
+    /// spectators (`LevelRenderer.setupRender`: `isSolidRender` ⇒ `flag = false`).
     pub fn walk(
         &mut self,
         origin: SectionKey,
         radius: i32,
+        smart_cull: bool,
         visibility: impl Fn(SectionKey) -> VisibilitySet,
         admits: impl Fn(SectionKey) -> bool,
         mut visit: impl FnMut(SectionKey),
@@ -164,22 +172,30 @@ impl SectionGraph {
 
         while let Some(node) = self.queue.pop_front() {
             visit(node.key);
-            let set = visibility(node.key);
+            // Nothing reads connectivity when smart culling is off, and the lookup is a hash
+            // probe per section per frame.
+            let set = if smart_cull {
+                visibility(node.key)
+            } else {
+                VisibilitySet::EMPTY
+            };
 
             for step in FACINGS {
-                // Leaving through the face we came in by is walking back down the path.
-                if node.entered_by == Some(step) {
-                    continue;
-                }
-                // Never undo a direction already taken. Without this the search wanders
-                // sideways and back, and the frontier stops shrinking.
-                if node.steps_taken & (1 << step.opposite().index()) != 0 {
-                    continue;
-                }
-                // The camera's section is entered from nowhere, so every direction is open.
-                if let Some(entry) = node.entered_by {
-                    if !set.connects(entry, step) {
+                if smart_cull {
+                    // Leaving through the face we came in by is walking back down the path.
+                    if node.entered_by == Some(step) {
                         continue;
+                    }
+                    // Never undo a direction already taken. Without this the search wanders
+                    // sideways and back, and the frontier stops shrinking.
+                    if node.steps_taken & (1 << step.opposite().index()) != 0 {
+                        continue;
+                    }
+                    // The camera's section is entered from nowhere, so every direction is open.
+                    if let Some(entry) = node.entered_by {
+                        if !set.connects(entry, step) {
+                            continue;
+                        }
                     }
                 }
 
@@ -284,7 +300,7 @@ mod tests {
     ) -> std::collections::HashSet<SectionKey> {
         let mut graph = SectionGraph::new();
         let mut seen = std::collections::HashSet::new();
-        graph.walk(origin, radius, visibility, |_| true, |key| {
+        graph.walk(origin, radius, true, visibility, |_| true, |key| {
             seen.insert(key);
         });
         seen
@@ -393,7 +409,56 @@ mod tests {
         graph.walk(
             ((0, 0), 12),
             3,
+            true,
             |_| VisibilitySet::EMPTY,
+            |key| key.0.0 >= 0,
+            |key| {
+                seen.insert(key);
+            },
+        );
+        assert!(seen.iter().all(|key| key.0.0 >= 0));
+        assert!(seen.contains(&((3, 0), 12)));
+    }
+
+    #[test]
+    fn a_camera_inside_rock_falls_back_to_the_frustum() {
+        // The engine's camera noclips, so underground it is usually *inside stone*. Smart
+        // culling then reaches the camera's section and its six solid neighbours and stops —
+        // none of which have any geometry, so the screen goes empty. With `smart_cull` off the
+        // walk must instead fill the whole admitted volume.
+        let origin = ((0, 0), 4);
+        let radius = 3;
+        let solid_world = |_: SectionKey| VisibilitySet::OPAQUE;
+
+        assert_eq!(
+            walked(origin, radius, solid_world).len(),
+            7,
+            "smart culling: the camera's section plus its six walls"
+        );
+
+        let mut graph = SectionGraph::new();
+        let mut seen = std::collections::HashSet::new();
+        graph.walk(origin, radius, false, solid_world, |_| true, |key| {
+            seen.insert(key);
+        });
+        assert_eq!(
+            seen.len(),
+            ((2 * radius + 1) * (2 * radius + 1)) as usize * SECTION_COUNT,
+            "without smart culling every admitted section is reached, rock or not"
+        );
+    }
+
+    #[test]
+    fn the_frustum_still_prunes_without_smart_culling() {
+        // Dropping connectivity must not drop the caller's test — that is the only thing
+        // bounding the flood fill when the camera is buried.
+        let mut graph = SectionGraph::new();
+        let mut seen = std::collections::HashSet::new();
+        graph.walk(
+            ((0, 0), 12),
+            3,
+            false,
+            |_| VisibilitySet::OPAQUE,
             |key| key.0.0 >= 0,
             |key| {
                 seen.insert(key);

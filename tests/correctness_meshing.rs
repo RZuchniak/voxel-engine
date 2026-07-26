@@ -6,7 +6,7 @@
 
 use voxel_engine::{
     block::BlockId,
-    mesh::mesh_chunk_surface,
+    mesh::mesh_chunk,
     world::{Chunk, World, SECTION_SIZE},
 };
 
@@ -24,7 +24,7 @@ fn solid_chunk(coord: (i32, i32), block: BlockId) -> Chunk {
 }
 
 fn quad_count(world: &World, coord: (i32, i32)) -> usize {
-    mesh_chunk_surface(world, coord)
+    mesh_chunk(world, coord)
         .iter()
         .map(|(_, mesh)| mesh.indices().len() / 6)
         .sum()
@@ -35,7 +35,7 @@ fn isolated_solid_section_merges_to_six_quads() {
     let mut world = World::new();
     world.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
 
-    let meshes = mesh_chunk_surface(&world, (0, 0));
+    let meshes = mesh_chunk(&world, (0, 0));
     assert_eq!(meshes.len(), 1, "only one section is populated");
 
     let (_, mesh) = &meshes[0];
@@ -68,13 +68,13 @@ fn neighbour_presence_culls_the_shared_face() {
 fn air_chunk_produces_no_mesh() {
     let mut world = World::new();
     world.insert_chunk(Chunk::new((0, 0)));
-    assert!(mesh_chunk_surface(&world, (0, 0)).is_empty());
+    assert!(mesh_chunk(&world, (0, 0)).is_empty());
 }
 
 #[test]
 fn missing_chunk_produces_no_mesh() {
     let world = World::new();
-    assert!(mesh_chunk_surface(&world, (42, -7)).is_empty());
+    assert!(mesh_chunk(&world, (42, -7)).is_empty());
 }
 
 #[test]
@@ -88,4 +88,100 @@ fn transparent_neighbour_does_not_cull() {
         6,
         "a non-opaque neighbour must not cull the shared face"
     );
+}
+
+/// Opaque geometry must land exactly on the block lattice, so faces meet at their shared edges.
+///
+/// This used to fail: every quad was pushed 0.002 blocks out along its own normal. Two
+/// perpendicular faces of the same block then both moved away from the edge between them, so at
+/// every **convex** edge the two planes missed each other and left a 0.002-wide slot running the
+/// length of the edge. You see straight through it, and against the sky clear colour that reads
+/// as a bright hairline outlining every block — visible natively and in the browser.
+///
+/// Off-lattice positions are the whole signature, so that is what this checks. Faces that share
+/// an edge with bit-identical vertices rasterize watertight, which is why no offset is needed.
+#[test]
+fn opaque_faces_land_on_the_block_lattice() {
+    let mut world = World::new();
+    world.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
+
+    let meshes = mesh_chunk(&world, (0, 0));
+    assert!(!meshes.is_empty(), "the solid section must produce geometry");
+    for (_, mesh) in &meshes {
+        for vertex in mesh.vertices() {
+            for (axis, value) in vertex.position.iter().enumerate() {
+                assert_eq!(
+                    *value,
+                    value.round(),
+                    "axis {axis} of {:?} is off the lattice by {}",
+                    vertex.position,
+                    (value - value.round()).abs()
+                );
+            }
+        }
+    }
+}
+
+/// A fluid's reversed copy is the one face allowed off the lattice — inward, never outward.
+///
+/// Outward is what tore the convex edges open (see above). Inward only moves the face towards a
+/// viewer who is already inside the fluid, so it cannot open a seam on the outside silhouette.
+#[test]
+fn a_fluid_back_face_is_inset_never_expanded() {
+    let mut world = World::new();
+    world.insert_chunk(solid_chunk((0, 0), BlockId::WATER));
+
+    let meshes = mesh_chunk(&world, (0, 0));
+    assert!(!meshes.is_empty(), "the water section must produce geometry");
+    // The section spans world y 0..15, so the top face sits at y = 16 and the bottom at y = 0.
+    // Every vertex must be inside or on that slab: nothing may poke out past the block bounds.
+    for (_, mesh) in &meshes {
+        for vertex in mesh.vertices() {
+            let [x, y, z] = vertex.position;
+            assert!(
+                (0.0..=16.0).contains(&x)
+                    && (0.0..=16.0).contains(&y)
+                    && (0.0..=16.0).contains(&z),
+                "{:?} lies outside the block volume — a face was expanded outward",
+                vertex.position
+            );
+        }
+    }
+}
+
+/// The mesher must draw every column's surface, whatever the terrain does inside one chunk.
+///
+/// This used to fail: the mesher kept only sections within a fixed depth of the chunk's
+/// *highest* block, so on a slope the columns that started lower fell out of that band and
+/// their ground was never meshed — scattered holes across steep hillsides, far worse in the
+/// browser (24-block band) than natively (48). The band is gone; this pins the property that
+/// replaced it.
+#[test]
+fn steep_chunk_meshes_every_column_top() {
+    // A ramp across the chunk: 40 blocks of relief, deeper than any band ever was.
+    let mut chunk = Chunk::new((0, 0));
+    let mut tops = [0i32; SECTION_SIZE * SECTION_SIZE];
+    for z in 0..SECTION_SIZE {
+        for x in 0..SECTION_SIZE {
+            let top = 60 + (x as i32 + z as i32) * 40 / 30;
+            tops[z * SECTION_SIZE + x] = top;
+            for y in 20..=top {
+                chunk.set_block_world(x, y, z, BlockId::STONE);
+            }
+        }
+    }
+
+    let mut world = World::new();
+    world.insert_chunk(chunk);
+    let meshed: Vec<usize> = mesh_chunk(&world, (0, 0))
+        .into_iter()
+        .map(|(idx, _)| idx)
+        .collect();
+    for &top in &tops {
+        let section_index = (top.div_euclid(SECTION_SIZE as i32) + 4) as usize;
+        assert!(
+            meshed.contains(&section_index),
+            "section {section_index} holding a column top at y={top} was not meshed"
+        );
+    }
 }

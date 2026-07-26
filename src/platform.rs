@@ -1,29 +1,46 @@
 /// Runtime tuning — tighter on wasm for browser memory and single-threaded meshing.
 
+/// Render distance, in chunks.
+///
+/// **Cut hard when the surface band was dropped**, native 40 -> 20 and wasm 16 -> 12, because
+/// a chunk is now the full `-64..320` column rather than a shell around the surface. A fully
+/// populated chunk is `24 sections x 4096 blocks x 2 bytes = 196 KB` of block data, against
+/// roughly 16-32 KB banded — so residency is ~8x per chunk:
+///
+/// | radius | chunks | block data |
+/// |---|---|---|
+/// | 40 (old native) | 6561 | **1.29 GB** |
+/// | 20 (native) | 1681 | 330 MB |
+/// | 16 | 1089 | 214 MB |
+/// | 12 (wasm) | 625 | 122 MB |
+///
+/// 40 was never affordable full-depth; that is the number that had to move. It is also more
+/// honest — vanilla's maximum is 32 and its default 12, and the occlusion graph's traversal
+/// cost scales with the volume too (radius 16 is 26k sections against radius 41's 165k).
 #[inline]
 pub const fn load_distance_chunks() -> i32 {
     if cfg!(target_arch = "wasm32") {
-        16
+        12
     } else {
-        40
+        20
     }
 }
 
 #[inline]
 pub const fn default_section_draw_distance_chunks() -> f32 {
     if cfg!(target_arch = "wasm32") {
-        16.0
+        12.0
     } else {
-        40.0
+        20.0
     }
 }
 
 #[inline]
 pub const fn max_section_draw_distance_chunks() -> f32 {
     if cfg!(target_arch = "wasm32") {
-        28.0
+        16.0
     } else {
-        64.0
+        32.0
     }
 }
 
@@ -33,17 +50,27 @@ pub const fn max_section_draw_distance_chunks() -> f32 {
 /// world is revealed, so raising it trades a longer wait for a cleaner arrival — fewer
 /// frame-time dips and less pop-in while the rest streams in behind you.
 ///
-/// Native default is 12 (625 chunks, ~17 s with the Minecraft-parity generator, after which
-/// the world holds 98–132 FPS immediately). Override with `VOXEL_LOADING_RADIUS=<chunks>` —
-/// 16 buys a wider finished area for ~46 s; 0 disables the wait entirely.
+/// **On wasm this is the whole render distance**, deliberately. It used to be 3 (49 chunks)
+/// against a load radius of 12 (625), so the reveal was followed by ~576 chunks arriving at
+/// once — generated off-thread, but meshed and uploaded on the main thread, which is what made
+/// the first stretch of play choppy until the queue reached zero. Building the full radius up
+/// front moves that work behind the loading screen, where frame time is free. It costs a
+/// 10–20 s wait; `?loading_radius=<chunks>` in the page URL overrides it (0 disables the wait).
 ///
-/// The wait is dominated by **main-thread meshing** (~4.6 ms/chunk), not by generation or
-/// rendering — see the load-profile notes in HANDOFF.md before trying to tune it.
+/// Native default stays 12 of a 20 radius, overridable with `VOXEL_LOADING_RADIUS=<chunks>`:
+/// native meshes on a worker pool, so its post-reveal burst is far cheaper.
 #[inline]
 pub fn bootstrap_chunk_radius() -> i32 {
     #[cfg(target_arch = "wasm32")]
     {
-        3
+        use std::sync::OnceLock;
+        static RADIUS: OnceLock<i32> = OnceLock::new();
+        *RADIUS.get_or_init(|| {
+            url_query_param("loading_radius")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .map(|v| v.clamp(0, load_distance_chunks()))
+                .unwrap_or_else(load_distance_chunks)
+        })
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -57,6 +84,18 @@ pub fn bootstrap_chunk_radius() -> i32 {
                 .unwrap_or(12)
         })
     }
+}
+
+/// One `?key=value` from the page URL — the browser's stand-in for an env var.
+#[cfg(target_arch = "wasm32")]
+fn url_query_param(key: &str) -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.to_string())
 }
 
 #[inline]
@@ -144,23 +183,23 @@ pub const fn bootstrap_ready_drain_budget_per_frame() -> usize {
 
 /// Minecraft's cave culling: only draw sections a sightline actually reaches.
 ///
-/// **Off by default until generation stops banding.** The graph works — it cuts drawn sections
-/// by 37–45% — but it cannot pay for itself yet. `generate_chunk_surface` leaves everything
-/// below the surface with no block data, and a section with no data has to be treated as
-/// transparent, so the walk explores ~21k sections of nothing every frame and costs more time
-/// than the skipped draws save (274 → 227 FPS at loading radius 12).
+/// **On by default.** This is now the *only* thing keeping the underground off the screen —
+/// chunks are generated full-depth (`mc::chunk::generate_chunk`) and every populated section
+/// is meshed, so without the walk you would draw the whole column.
 ///
-/// Once chunks are generated full-depth the ground below is opaque rock, the walk terminates at
-/// the surface, and both halves of that trade reverse. Flip this default then.
+/// It was off while generation banded, and correctly so: a section with no block data has to
+/// be treated as transparent, so over a hollow shell the walk fell through the ground and
+/// explored ~21k sections of nothing every frame, costing more than the skipped draws saved
+/// (274 → 227 FPS). With solid rock underneath, the walk terminates at the surface instead.
 ///
-/// `VOXEL_SECTION_CULLING=1` enables it for measurement. A bug here shows up as terrain
+/// `VOXEL_SECTION_CULLING=0` disables it for measurement. A bug here shows up as terrain
 /// popping out of existence, so compare `reachable_sections` and `visible_draws` in the profile
 /// line rather than trying to catch it by eye.
 #[inline]
 pub fn section_occlusion_culling() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        false
+        true
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -168,8 +207,8 @@ pub fn section_occlusion_culling() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var("VOXEL_SECTION_CULLING")
-                .map(|v| v.trim() == "1")
-                .unwrap_or(false)
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true)
         })
     }
 }
@@ -293,18 +332,141 @@ pub const MAX_PENDING_LOAD_BACKLOG: usize = 128;
 pub const PENDING_BACKLOG_REMESH_THRESHOLD: usize = 24;
 pub const PENDING_BACKLOG_EXTRA_PRI_REMESH: usize = 4;
 pub const PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH: usize = 3;
-pub const TARGET_FRAME_TIME_US: u128 = 33_333;
 pub const MIN_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 4.0;
-pub const SURFACE_LOD_DEPTH_BLOCKS: i32 = 48;
-pub const FAR_DETAIL_RING: u8 = 2;
 
-/// How far below the highest block in a chunk we still build GPU meshes.
-/// Skips caves and deep stone — major win on wasm.
+/// The frame time streaming is allowed to cost before it starts giving budget back.
+///
+/// Wasm is stricter (50 FPS vs 30) because everything that costs frame time there — meshing,
+/// GPU upload, the occlusion walk — is on the one thread, so overrunning is the *only* way the
+/// browser build can go choppy. On native, meshing is on a pool and 30 FPS is the older,
+/// looser floor that the upload ladder was tuned around.
 #[inline]
-pub const fn surface_mesh_depth_blocks() -> i32 {
+pub const fn target_frame_time_us() -> u128 {
     if cfg!(target_arch = "wasm32") {
-        24
+        20_000
     } else {
-        48
+        33_333
+    }
+}
+
+/// Never back off past this fraction: streaming has to keep making progress, or a heavy frame
+/// becomes a permanent stall and the world stops filling in.
+const MIN_STREAMING_BUDGET_SCALE: f32 = 0.15;
+
+/// How much of the per-frame streaming budget to spend, given how far the *last* frame overran
+/// [`target_frame_time_us`].
+///
+/// A no-op (1.0) whenever there is frame-time headroom, so it costs nothing in the steady
+/// state; it only engages once uploading and meshing are themselves what is making frames
+/// long. Full budget at the target, [`MIN_STREAMING_BUDGET_SCALE`] at twice it, linear
+/// between. This replaced a native-only three-step ladder that wasm never reached — which is
+/// why the browser build had *no* frame-rate floor at all while the post-reveal queue drained.
+pub fn streaming_budget_scale(frame_over_us: u128) -> f32 {
+    if frame_over_us == 0 {
+        return 1.0;
+    }
+    let over = frame_over_us as f32 / target_frame_time_us() as f32;
+    (1.0 - over).clamp(MIN_STREAMING_BUDGET_SCALE, 1.0)
+}
+
+/// Apply [`streaming_budget_scale`] to a count, never reaching zero.
+pub fn scale_budget(base: usize, scale: f32) -> usize {
+    ((base as f32 * scale).round() as usize).max(1)
+}
+
+/// Apply [`streaming_budget_scale`] to a millisecond budget, never reaching zero.
+pub fn scale_time_budget(base_ms: u128, scale: f32) -> u128 {
+    if base_ms == u128::MAX {
+        return base_ms;
+    }
+    ((base_ms as f32 * scale).round() as u128).max(1)
+}
+
+/// Finished chunks still queued for GPU upload when the loading screen is allowed to end.
+///
+/// The readiness scan counts a tile as meshed when its result *arrives*, which is before it is
+/// uploaded — so without this the reveal could fire with hundreds of meshes still queued, and
+/// they would land as exactly the burst of frame time the loading screen exists to absorb.
+/// Nothing new is requested once the radius is full, so the queue drains in a few frames.
+pub const REVEAL_MAX_PENDING_UPLOADS: usize = 0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_backoff_is_free_when_frames_have_headroom() {
+        // The steady state must pay nothing for the floor — a frame inside the target gets the
+        // whole budget, so this cannot explain away a slow build.
+        assert_eq!(streaming_budget_scale(0), 1.0);
+        assert_eq!(scale_budget(12, streaming_budget_scale(0)), 12);
+        assert_eq!(scale_time_budget(16, streaming_budget_scale(0)), 16);
+    }
+
+    #[test]
+    fn streaming_backoff_tightens_as_frames_run_long() {
+        let target = target_frame_time_us();
+        let half = streaming_budget_scale(target / 2);
+        let double = streaming_budget_scale(target);
+        assert!((half - 0.5).abs() < 1e-3, "half a target over => half budget, got {half}");
+        assert_eq!(double, MIN_STREAMING_BUDGET_SCALE, "a whole target over => the floor");
+        assert!(half > double);
+    }
+
+    #[test]
+    fn streaming_backoff_never_stalls_streaming_completely() {
+        // A budget that reaches zero is a permanent stall: no uploads means no shorter frames
+        // means no uploads. Every budget has to keep at least one unit of progress.
+        let worst = streaming_budget_scale(u128::MAX / 2);
+        assert_eq!(worst, MIN_STREAMING_BUDGET_SCALE);
+        assert!(scale_budget(1, worst) >= 1);
+        assert!(scale_budget(12, worst) >= 1);
+        assert!(scale_time_budget(1, worst) >= 1);
+        assert!(scale_time_budget(16, worst) >= 1);
+    }
+
+    #[test]
+    fn an_unbounded_time_budget_stays_unbounded() {
+        // Bootstrap uploads pass `u128::MAX`; scaling it must not wrap it to something tiny.
+        assert_eq!(scale_time_budget(u128::MAX, 0.5), u128::MAX);
+    }
+
+    #[test]
+    fn the_loading_screen_covers_the_whole_render_distance_on_wasm() {
+        // The point of the change: nothing is left to stream in when the world is revealed, so
+        // there is no post-reveal burst of main-thread meshing and uploading.
+        if cfg!(target_arch = "wasm32") {
+            assert_eq!(bootstrap_chunk_radius(), load_distance_chunks());
+        } else {
+            assert!(bootstrap_chunk_radius() <= load_distance_chunks());
+        }
+    }
+}
+
+/// How much of an imported Anvil chunk to decode, below its lowest column top.
+///
+/// **This no longer touches the procedural path or the mesher** — seeded worlds generate the
+/// full `-64..320` column and every populated section is meshed. It survives only as a memory
+/// bound on zip imports, where a full NBT decode of every chunk in the load radius is real
+/// browser memory (see `surface_only_chunk_load`).
+///
+/// `VOXEL_MESH_DEPTH=<blocks>` overrides it on native.
+#[inline]
+pub fn surface_band_depth_blocks() -> i32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        24
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static DEPTH: OnceLock<i32> = OnceLock::new();
+        *DEPTH.get_or_init(|| {
+            std::env::var("VOXEL_MESH_DEPTH")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .map(|v| v.max(0))
+                .unwrap_or(48)
+        })
     }
 }

@@ -141,22 +141,20 @@ pub fn mesh_section(world: &World, chunk_coord: (i32, i32), section_index: usize
     }
 }
 
-/// Mesh only sections near the chunk surface (skips caves and deep underground).
-pub fn mesh_chunk_surface(world: &World, chunk_coord: (i32, i32)) -> Vec<(usize, MeshData)> {
-    use crate::world::Chunk;
-
+/// Mesh every populated section of a chunk.
+///
+/// The mesher deliberately has **no depth heuristic of its own**: it draws exactly what the
+/// source handed it. Deciding here how much of a chunk is worth meshing means guessing at
+/// what the camera can see from block data alone, and every such guess has been wrong —
+/// anchored at the chunk's highest block it dropped the ground under every slope. Occlusion
+/// is [`crate::cull::SectionGraph`]'s job; trimming, where a source wants it, belongs to the
+/// source.
+pub fn mesh_chunk(world: &World, chunk_coord: (i32, i32)) -> Vec<(usize, MeshData)> {
     let Some(chunk) = world.chunk(chunk_coord) else {
         return Vec::new();
     };
-    let Some(surface_max_y) = chunk.max_nonempty_world_y() else {
-        return Vec::new();
-    };
-    let depth = crate::platform::surface_mesh_depth_blocks();
     let mut out = Vec::new();
     for section_index in chunk.populated_section_indices() {
-        if !Chunk::section_near_surface(section_index, surface_max_y, depth) {
-            continue;
-        }
         if let Some(mesh) = mesh_section(world, chunk_coord, section_index) {
             out.push((section_index, mesh));
         }
@@ -460,21 +458,35 @@ fn emit_quad(
         }
     };
 
-    shift_corners(&mut corners, dir, FACE_EXPAND);
+    // Corners stay exactly on the block lattice — see `BACK_FACE_INSET` for why nudging a face
+    // along its own normal is not a free "hide the seams" trick but the cause of them.
     mesh.push_quad(corners);
 
     if double_sided {
-        // Reversing the corner cycle flips the winding, so this copy survives backface
-        // culling exactly when the front one does not. Shifting it to the far side of the
-        // plane rather than leaving it coincident keeps the two out of a z-fight.
+        // Reversing the corner cycle flips the winding, so this copy survives backface culling
+        // exactly when the front one does not — meaning only ever one of the pair rasterizes
+        // and the two cannot z-fight. The inset is only insurance for culling being turned off,
+        // and it is invisible because it moves the face towards a viewer already inside the
+        // fluid.
         let mut back = corners;
         back.reverse();
-        shift_corners(&mut back, dir, -2.0 * FACE_EXPAND);
+        shift_corners(&mut back, dir, -BACK_FACE_INSET);
         mesh.push_quad(back);
     }
 }
 
-const FACE_EXPAND: f32 = 0.002;
+/// How far the reversed copy of a fluid surface sits *inside* the block.
+///
+/// Every face used to be pushed out along its normal by this much, on the theory that it hid
+/// seams. It did the opposite: two perpendicular faces of the same block each moved away from
+/// their shared edge, so at every **convex** edge the planes miss each other and leave a slot of
+/// this width running the length of the edge. You see straight through it — against the sky
+/// clear colour that reads as a bright hairline outlining every block, which is exactly the
+/// reported bug. Concave edges were fine, which is why it only showed on silhouettes.
+///
+/// Faces that meet on the lattice rasterize watertight: adjacent triangles sharing an edge with
+/// bit-identical vertices have no gap by the rasterization rules. There was nothing to hide.
+const BACK_FACE_INSET: f32 = 0.002;
 
 fn shift_corners(corners: &mut [Vertex; 4], dir: Direction, amount: f32) {
     let (nx, ny, nz) = match dir {

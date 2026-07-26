@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use voxel_engine::{
-    mesh::mesh_chunk_surface,
+    mesh::mesh_chunk,
     source::{SeededProceduralSource, WorldSource},
     world::World,
 };
@@ -52,7 +52,7 @@ fn collect(seed: i64) -> Counters {
     }
 
     for &coord in MEASURED {
-        for (_, mesh) in mesh_chunk_surface(&world, coord) {
+        for (_, mesh) in mesh_chunk(&world, coord) {
             counters.sections_meshed += 1;
             counters.quads += mesh.indices().len() / 6;
             counters.vertices += mesh.vertices().len();
@@ -100,13 +100,18 @@ fn work_volume_baseline() {
     // now emit a second, reversed copy of each face so their surfaces still render from
     // inside. That is +4 quads here, 0.1% — the cost is bounded by how much fluid *surface*
     // a chunk has, not by how much fluid.
+    // Re-recorded again when the surface band was dropped: chunks are now generated
+    // full-depth and *every* populated section is meshed, so sections_meshed 18 -> 34 and
+    // quads 3930 -> 5753 (1.46x). The underground is kept off the screen by the section
+    // occlusion graph instead (`platform::section_occlusion_culling`), which is where that
+    // cost is paid back — this counter measures work built, not work drawn.
     let expected = Counters {
         chunks_generated: 18,
-        sections_meshed: 18,
-        quads: 3930,
-        vertices: 15720,
-        indices: 23580,
-        mesh_bytes: 534480,
+        sections_meshed: 34,
+        quads: 5753,
+        vertices: 23012,
+        indices: 34518,
+        mesh_bytes: 782408,
     };
 
     let mut report: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

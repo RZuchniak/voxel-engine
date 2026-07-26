@@ -1,14 +1,16 @@
-//! Does the mesher's triangle winding agree with `cull_mode: Some(Face::Back)`?
+//! Are there holes in solid geometry where two faces meet?
 //!
-//! Backface culling is a one-line pipeline change whose correctness is purely visual: get the
-//! winding backwards and the world renders inside-out, which no CPU-side assertion would
-//! notice. So this renders an actual mesher-produced quad headlessly, through the same
-//! transform `square.wgsl` uses (`view_proj * (world_pos - camera_pos)`, camera-relative), and
-//! looks at the pixels.
+//! Renders a solid 16³ block of stone headlessly, angled so the convex edge between its +X face
+//! and its top face crosses the frame, then looks for **background pixels with covered pixels
+//! both above and below them in the same column** (and the same by row). A convex solid cannot
+//! have a hole in its silhouette, so every one of those is a seam you can see through.
 //!
-//! The two directions together pin the convention down: a face must be drawn when viewed from
-//! its outside and culled when viewed from its inside. Asserting only the first would still
-//! pass with culling disabled entirely.
+//! This is the pixel-level version of `correctness_meshing::opaque_faces_land_on_the_block_lattice`.
+//! It stays a diagnostic rather than a test because the seam is *sub-pixel* — 0.002 blocks wide —
+//! so whether it lands on a pixel centre depends on the exact camera, and a test that can pass by
+//! luck is worse than no test. The lattice check is the deterministic guard.
+//!
+//! Run: `cargo run --release --example diag_face_seams`
 
 use voxel_engine::{
     block::BlockId,
@@ -17,10 +19,8 @@ use voxel_engine::{
     Vertex,
 };
 
-const TARGET: u32 = 64;
+const TARGET: u32 = 512;
 
-/// Positions-only shader matching `square.wgsl`'s vertex stage; the fragment stage just marks
-/// coverage, since this test is about which triangles survive culling, not what they look like.
 const SHADER: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
@@ -51,9 +51,6 @@ fn solid_chunk(coord: (i32, i32)) -> Chunk {
     chunk
 }
 
-/// Camera-relative view + perspective, exactly as `Camera::build_view_projection_matrix` builds
-/// it. Duplicated rather than driven through `Camera` because `Camera` has no "look at an
-/// arbitrary point" constructor, and the property under test is the matrix's handedness.
 fn view_proj(eye: [f32; 3], target: [f32; 3]) -> cgmath::Matrix4<f32> {
     use cgmath::{EuclideanSpace, Point3, Vector3};
     let eye = Point3::new(eye[0], eye[1], eye[2]);
@@ -67,9 +64,17 @@ fn view_proj(eye: [f32; 3], target: [f32; 3]) -> cgmath::Matrix4<f32> {
     proj * view
 }
 
-/// Renders the quads of a solid chunk with backface culling on, and returns how many pixels
-/// were covered. `None` when no GPU adapter is available.
-fn covered_pixels(eye: [f32; 3], target: [f32; 3]) -> Option<u32> {
+fn wgpu_buffer(device: &wgpu::Device, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents,
+        usage,
+    })
+}
+
+/// One bit per pixel: was it covered by geometry?
+fn render_coverage(eye: [f32; 3], target: [f32; 3]) -> Option<Vec<bool>> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         compatible_surface: None,
@@ -93,15 +98,17 @@ fn covered_pixels(eye: [f32; 3], target: [f32; 3]) -> Option<u32> {
         vertices.extend_from_slice(mesh.vertices());
         indices.extend(mesh.indices().iter().map(|i| i + base));
     }
-    assert!(!indices.is_empty(), "solid chunk must produce geometry");
 
     let mut uniform = [0f32; 20];
     uniform[..16].copy_from_slice(AsRef::<[f32; 16]>::as_ref(&view_proj(eye, target)));
     uniform[16..19].copy_from_slice(&eye);
 
-    let uniform_buffer = wgpu_buffer(&device, bytemuck::cast_slice(&uniform), wgpu::BufferUsages::UNIFORM);
-    let vertex_buffer = wgpu_buffer(&device, bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
-    let index_buffer = wgpu_buffer(&device, bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
+    let uniform_buffer =
+        wgpu_buffer(&device, bytemuck::cast_slice(&uniform), wgpu::BufferUsages::UNIFORM);
+    let vertex_buffer =
+        wgpu_buffer(&device, bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
+    let index_buffer =
+        wgpu_buffer(&device, bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -160,7 +167,6 @@ fn covered_pixels(eye: [f32; 3], target: [f32; 3]) -> Option<u32> {
             })],
             compilation_options: Default::default(),
         }),
-        // The property under test.
         primitive: wgpu::PrimitiveState {
             polygon_mode: wgpu::PolygonMode::Fill,
             cull_mode: Some(wgpu::Face::Back),
@@ -174,7 +180,11 @@ fn covered_pixels(eye: [f32; 3], target: [f32; 3]) -> Option<u32> {
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: TARGET, height: TARGET, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: TARGET,
+            height: TARGET,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -183,7 +193,6 @@ fn covered_pixels(eye: [f32; 3], target: [f32; 3]) -> Option<u32> {
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
-    // 64 px * 4 bytes = 256, already the required copy alignment.
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: (TARGET * TARGET * 4) as u64,
@@ -229,52 +238,77 @@ fn covered_pixels(eye: [f32; 3], target: [f32; 3]) -> Option<u32> {
                 rows_per_image: Some(TARGET),
             },
         },
-        wgpu::Extent3d { width: TARGET, height: TARGET, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: TARGET,
+            height: TARGET,
+            depth_or_array_layers: 1,
+        },
     );
     queue.submit(Some(encoder.finish()));
 
     readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     let _ = device.poll(wgpu::PollType::Wait);
     let data = readback.slice(..).get_mapped_range();
-    let lit = data.chunks_exact(4).filter(|px| px[0] > 128).count() as u32;
+    let coverage: Vec<bool> = data.chunks_exact(4).map(|px| px[0] > 128).collect();
     drop(data);
     readback.unmap();
-    Some(lit)
+    Some(coverage)
 }
 
-fn wgpu_buffer(device: &wgpu::Device, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
-    use wgpu::util::DeviceExt;
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents,
-        usage,
-    })
+/// Uncovered pixels that have covered pixels on both sides along one axis. The rendered object
+/// is convex, so its silhouette is convex too: any such pixel is a hole in the surface.
+fn holes(coverage: &[bool], by_column: bool) -> usize {
+    let n = TARGET as usize;
+    let at = |x: usize, y: usize| coverage[y * n + x];
+    let mut found = 0;
+    for outer in 0..n {
+        let line: Vec<bool> = (0..n)
+            .map(|inner| {
+                if by_column {
+                    at(outer, inner)
+                } else {
+                    at(inner, outer)
+                }
+            })
+            .collect();
+        let Some(first) = line.iter().position(|c| *c) else {
+            continue;
+        };
+        let last = line.iter().rposition(|c| *c).unwrap();
+        found += line[first..=last].iter().filter(|c| !**c).count();
+    }
+    found
 }
 
-#[test]
-fn outward_faces_survive_backface_culling() {
-    // Looking at the chunk's +X side from outside it.
-    let Some(outside) = covered_pixels([40.0, 8.0, 8.0], [8.0, 8.0, 8.0]) else {
-        eprintln!("no GPU adapter; skipping");
-        return;
-    };
-    assert!(
-        outside > 500,
-        "a solid chunk viewed from outside should cover the view, got {outside} px"
-    );
-}
+fn main() {
+    // Angled at the convex edge where the +X face meets the top face, so it crosses the frame
+    // diagonally and a long run of pixel centres can fall into any gap.
+    let views: [([f32; 3], [f32; 3], &str); 3] = [
+        ([26.0, 26.0, 8.0], [16.0, 16.0, 8.0], "+X/top edge, head on"),
+        ([30.0, 24.0, 30.0], [8.0, 16.0, 8.0], "top corner, three faces"),
+        ([24.0, 20.0, 22.0], [12.0, 14.0, 12.0], "shallow angle across two edges"),
+    ];
 
-#[test]
-fn inward_faces_are_culled() {
-    // Same geometry, camera inside the solid block looking out: every face now presents its
-    // back, so backface culling should leave the frame empty. If the winding were inverted
-    // this is the assertion that fails.
-    let Some(inside) = covered_pixels([8.0, 8.0, 8.0], [40.0, 8.0, 8.0]) else {
-        eprintln!("no GPU adapter; skipping");
-        return;
-    };
-    assert_eq!(
-        inside, 0,
-        "faces seen from behind must be culled, got {inside} px"
+    let mut total = 0;
+    for (eye, target, label) in views {
+        let Some(coverage) = render_coverage(eye, target) else {
+            eprintln!("no GPU adapter available; cannot measure");
+            return;
+        };
+        let covered = coverage.iter().filter(|c| **c).count();
+        let col = holes(&coverage, true);
+        let row = holes(&coverage, false);
+        total += col + row;
+        println!(
+            "{label:<34} covered {covered:>6} px   holes: {col} by column, {row} by row"
+        );
+    }
+    println!(
+        "\n{}",
+        if total == 0 {
+            "no see-through seams".to_string()
+        } else {
+            format!("{total} see-through pixels inside the silhouette")
+        }
     );
 }

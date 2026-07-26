@@ -4,7 +4,7 @@
 //!
 //! Run: `cargo run --release --example diag_chunk_borders`
 
-use voxel_engine::mesh::mesh_chunk_surface;
+use voxel_engine::mesh::mesh_chunk;
 use voxel_engine::platform;
 use voxel_engine::source::{SeededProceduralSource, WorldSource};
 use voxel_engine::world::{Chunk, MIN_SECTION_Y, SECTION_COUNT, SECTION_SIZE, World};
@@ -86,8 +86,8 @@ fn main() {
 
     println!(
         "mesh depth = {} blocks, generation depth = {} blocks\n",
-        platform::surface_mesh_depth_blocks(),
-        platform::surface_mesh_depth_blocks() + 16
+        platform::surface_band_depth_blocks(),
+        platform::surface_band_depth_blocks() + 16
     );
 
     for center in centers {
@@ -100,8 +100,8 @@ fn main() {
         let mut alone = World::new();
         alone.insert_chunk(source.load_chunk(center).expect("generate"));
 
-        let with_neighbours = mesh_chunk_surface(&world, center);
-        let without = mesh_chunk_surface(&alone, center);
+        let with_neighbours = mesh_chunk(&world, center);
+        let without = mesh_chunk(&alone, center);
 
         let chunk = world.chunk(center).expect("center chunk");
         let (data_lo, data_hi) = data_extent(chunk);

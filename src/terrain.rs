@@ -95,7 +95,7 @@ impl TerrainGenerator {
 pub fn generate_chunk(generator: &TerrainGenerator, coord: (i32, i32)) -> Chunk {
     let (chunk_x, chunk_z) = coord;
     let mut chunk = Chunk::new(coord);
-    let depth = platform::surface_mesh_depth_blocks().max(4);
+    let depth = platform::surface_band_depth_blocks().max(4);
 
     for local_z in 0..SECTION_SIZE {
         for local_x in 0..SECTION_SIZE {

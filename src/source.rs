@@ -63,11 +63,12 @@ impl SeededProceduralSource {
 impl WorldSource for SeededProceduralSource {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
         let (cx, cz) = coord;
-        // Generate only what can be meshed. A margin over the mesh depth keeps the band's
-        // bottom face out of the meshed region, so the cut never shows.
-        let depth = crate::platform::surface_mesh_depth_blocks() + 16;
-        let generated =
-            crate::mc::chunk::generate_chunk_surface(&self.overworld, &self.surface, cx, cz, depth);
+        // The **whole** column, `-64..320`, exactly as Minecraft generates it. The renderer
+        // avoids drawing the underground with the section occlusion graph
+        // (`platform::section_occlusion_culling`), not by omitting it — a surface band is a
+        // stand-in for that algorithm, and it shows: caves cut off in mid-air, a hollow shell
+        // from below, and terrain that falls out of the band on slopes.
+        let generated = crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, cx, cz);
         let mut out = Chunk::new(coord);
         for lz in 0..16usize {
             for lx in 0..16usize {
@@ -134,16 +135,15 @@ impl WorldSource for ProceduralSource {
     }
 }
 
-fn decode_section(out: &mut Chunk, section: SectionNbt) -> Option<i32> {
+fn decode_section(out: &mut Chunk, section: SectionNbt) {
     let Some(block_states) = section.block_states else {
-        return None;
+        return;
     };
     let palette = block_states.palette;
     if palette.is_empty() {
-        return None;
+        return;
     }
     let y_base = section.y * 16;
-    let mut section_max_y: Option<i32> = None;
     if let Some(data) = block_states.data {
         let indices = fastanvil::expand_blockstates(&data, palette.len());
         for idx in 0..4096usize {
@@ -158,31 +158,26 @@ fn decode_section(out: &mut Chunk, section: SectionNbt) -> Option<i32> {
             let lx = idx & 0xF;
             let lz = (idx >> 4) & 0xF;
             let ly = (idx >> 8) & 0xF;
-            let wy = y_base + ly as i32;
-            out.set_block_world(lx, wy, lz, block);
-            section_max_y = Some(section_max_y.map(|max_y| max_y.max(wy)).unwrap_or(wy));
+            out.set_block_world(lx, y_base + ly as i32, lz, block);
         }
     } else {
         let block = map_block_name(&palette[0].name);
         if block == BlockId::AIR {
-            return None;
+            return;
         }
         for ly in 0..16usize {
             for lz in 0..16usize {
                 for lx in 0..16usize {
-                    let wy = y_base + ly as i32;
-                    out.set_block_world(lx, wy, lz, block);
-                    section_max_y = Some(section_max_y.map(|max_y| max_y.max(wy)).unwrap_or(wy));
+                    out.set_block_world(lx, y_base + ly as i32, lz, block);
                 }
             }
         }
     }
-    section_max_y
 }
 
 fn decode_java_chunk(coord: (i32, i32), raw: &[u8]) -> Result<Chunk> {
     let surface_only =
-        crate::platform::surface_only_chunk_load() && crate::platform::surface_mesh_depth_blocks() > 0;
+        crate::platform::surface_only_chunk_load() && crate::platform::surface_band_depth_blocks() > 0;
     decode_java_chunk_inner(coord, raw, surface_only)
 }
 
@@ -199,22 +194,41 @@ fn decode_java_chunk_inner(coord: (i32, i32), raw: &[u8], surface_only: bool) ->
         sections.sort_by(|a, b| b.y.cmp(&a.y));
     }
 
-    let depth = crate::platform::surface_mesh_depth_blocks();
-    let mut surface_max_y: Option<i32> = None;
+    let depth = crate::platform::surface_band_depth_blocks();
+    // Decode top-down and stop `depth` below the chunk's **lowest** column top, not its
+    // highest block. A chunk's own relief is not bounded by `depth`, so trimming against the
+    // maximum throws away the visible ground of every sloped chunk — the same mistake the
+    // mesher used to make before the band was removed from it. Until every column
+    // has found its surface there is no floor to measure from, so nothing is trimmed.
+    let mut column_tops = [i32::MIN; 256];
+    let mut columns_found = 0usize;
     for section in sections {
-        if surface_only {
-            if let Some(max_y) = surface_max_y {
-                if section.y * 16 + 15 < max_y - depth {
-                    break;
-                }
+        let section_y = section.y;
+        if surface_only && columns_found == column_tops.len() {
+            let lowest = column_tops.iter().copied().min().expect("all columns found");
+            if section_y * 16 + 15 < lowest - depth {
+                break;
             }
         }
-        if let Some(section_max_y) = decode_section(&mut out, section) {
-            surface_max_y = Some(
-                surface_max_y
-                    .map(|max_y| max_y.max(section_max_y))
-                    .unwrap_or(section_max_y),
-            );
+        decode_section(&mut out, section);
+        if !surface_only || columns_found == column_tops.len() {
+            continue;
+        }
+        let base = section_y * 16;
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let column = (lz * 16 + lx) as usize;
+                if column_tops[column] != i32::MIN {
+                    continue;
+                }
+                for ly in (0..16i32).rev() {
+                    if !out.block_at_local(lx, base + ly, lz).is_air() {
+                        column_tops[column] = base + ly;
+                        columns_found += 1;
+                        break;
+                    }
+                }
+            }
         }
     }
     Ok(out)
@@ -604,6 +618,66 @@ mod tests {
     fn from_zip_is_case_insensitive() {
         let zip = make_zip(&[("World/Region/R.0.0.MCA", b"region")]);
         MemoryAnvilSource::from_zip(&zip).unwrap();
+    }
+
+    /// The surface-only decode must not drop a column's top block. It trims against the
+    /// chunk's *lowest* column top; trimming against the highest (as it used to) threw away
+    /// the visible ground of every chunk whose relief exceeded the mesh depth.
+    ///
+    /// Sweeps a whole region rather than a handful of chunks, and asserts it actually saw
+    /// relief past the depth — most chunks are gentle enough that the two anchors agree, so
+    /// a small sample makes this test pass for the wrong reason.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn surface_only_decode_keeps_every_column_top() {
+        use fastanvil::Region;
+        use std::fs::File;
+
+        let path = Path::new("saves/Basic_World/region/r.0.0.mca");
+        if !path.exists() {
+            return; // the bundled save is optional
+        }
+        let mut region = Region::from_stream(BufReader::new(File::open(path).unwrap())).unwrap();
+        let depth = crate::platform::surface_band_depth_blocks();
+
+        let mut checked = 0usize;
+        let mut worst_relief = 0i32;
+        for local_z in 0..32usize {
+            for local_x in 0..32usize {
+                let Some(raw) = region.read_chunk(local_x, local_z).unwrap() else {
+                    continue;
+                };
+                let coord = (local_x as i32, local_z as i32);
+                let full = decode_java_chunk_inner(coord, &raw, false).unwrap();
+                let trimmed = decode_java_chunk_inner(coord, &raw, true).unwrap();
+
+                let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+                for lz in 0..16i32 {
+                    for lx in 0..16i32 {
+                        let top = (-64..320)
+                            .rev()
+                            .find(|&y| !full.block_at_local(lx, y, lz).is_air());
+                        let Some(top) = top else { continue };
+                        lo = lo.min(top);
+                        hi = hi.max(top);
+                        checked += 1;
+                        assert_eq!(
+                            trimmed.block_at_local(lx, top, lz),
+                            full.block_at_local(lx, top, lz),
+                            "chunk {coord:?} column ({lx},{lz}) top y={top} lost by the surface trim"
+                        );
+                    }
+                }
+                if lo <= hi {
+                    worst_relief = worst_relief.max(hi - lo);
+                }
+            }
+        }
+        assert!(checked > 0, "expected generated chunks in the bundled save");
+        assert!(
+            worst_relief > depth,
+            "sampled only gentle chunks (worst relief {worst_relief} <= depth {depth});              this test would pass without exercising the trim"
+        );
     }
 
     #[test]

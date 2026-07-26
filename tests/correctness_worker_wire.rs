@@ -97,8 +97,8 @@ fn roundtripped_chunk_meshes_identically() {
         direct.insert_chunk(chunk);
     }
 
-    let a = voxel_engine::mesh::mesh_chunk_surface(&direct, coord);
-    let b = voxel_engine::mesh::mesh_chunk_surface(&viaworker, coord);
+    let a = voxel_engine::mesh::mesh_chunk(&direct, coord);
+    let b = voxel_engine::mesh::mesh_chunk(&viaworker, coord);
 
     assert_eq!(a.len(), b.len(), "section count differs");
     for ((ai, am), (bi, bm)) in a.iter().zip(b.iter()) {

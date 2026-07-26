@@ -1,7 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use crate::{
-    mesh::mesh_chunk_surface,
+    mesh::mesh_chunk,
     source::{MemoryAnvilSource, SeededProceduralSource, WorldSource},
     worker_protocol::{WorkerJob, WorkerReply, ChunkWire, SectionMeshWire},
     world::World,
@@ -74,7 +74,7 @@ fn remesh_chunk(cx: i32, cz: i32) -> Result<Vec<SectionMeshWire>, String> {
             }
         }
 
-        let section_meshes = mesh_chunk_surface(&world, coord)
+        let section_meshes = mesh_chunk(&world, coord)
             .into_iter()
             .map(|(section_index, mesh)| SectionMeshWire::from_mesh(section_index, &mesh))
             .collect();

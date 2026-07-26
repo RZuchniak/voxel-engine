@@ -194,7 +194,6 @@ struct ChunkGpuMesh {
     index_capacity: u64,
     bounds_min: cgmath::Vector3<f32>,
     bounds_max: cgmath::Vector3<f32>,
-    surface_max_y: i32,
 }
 
 struct State {
@@ -256,6 +255,12 @@ struct State {
     chunk_visibility: HashMap<(i32, i32), [visibility::VisibilitySet; SECTION_COUNT]>,
     /// Reused across frames; owns the traversal's scratch buffers.
     section_graph: cull::SectionGraph,
+    /// Fraction of the streaming budget the last frame was allowed to spend. Below 1.0 means
+    /// the frame-rate floor is holding streaming back. For the profile line.
+    streaming_scale_last_frame: f32,
+    /// Whether the last traversal used connectivity or fell back to a frustum flood fill
+    /// because the camera was inside an opaque block. For the profile line.
+    smart_cull_last_frame: bool,
     /// Sections the traversal reached last frame, for the profile line.
     reachable_sections_last_frame: usize,
     /// Seed-mode world: chunks are generated rather than read from a save, which is far more
@@ -272,7 +277,7 @@ impl State {
         need.max(256).next_power_of_two()
     }
 
-    /// The chunk plus its four neighbours — everything `mesh_chunk_surface` can reach when it
+    /// The chunk plus its four neighbours — everything `mesh_chunk` can reach when it
     /// tests a block's neighbour across a chunk border.
     fn mesh_snapshot(world: &World, coord: (i32, i32)) -> World {
         let mut local_world = World::new();
@@ -364,12 +369,6 @@ impl State {
             return;
         }
 
-        let surface_max_y = self
-            ._world
-            .chunk(coord)
-            .and_then(|c| c.max_nonempty_world_y())
-            .unwrap_or(max_y - 1);
-
         let cx = coord.0 as f32 * SECTION_SIZE as f32;
         let cz = coord.1 as f32 * SECTION_SIZE as f32;
         let bounds_min = cgmath::Vector3::new(cx, min_y as f32, cz);
@@ -391,7 +390,6 @@ impl State {
                         section_draws,
                         bounds_min,
                         bounds_max,
-                        surface_max_y,
                         ..existing
                     },
                 );
@@ -428,7 +426,6 @@ impl State {
                 index_capacity: i_cap,
                 bounds_min,
                 bounds_max,
-                surface_max_y,
             },
         );
     }
@@ -444,28 +441,6 @@ impl State {
             && dz.abs() <= platform::load_distance_chunks() + platform::UNLOAD_MARGIN_CHUNKS
     }
 
-    fn chunk_detail_ring(&self, chunk_coord: (i32, i32)) -> u8 {
-        let camera_pos = self.camera.position();
-        let center = cgmath::Vector3::new(
-            chunk_coord.0 as f32 * SECTION_SIZE as f32 + 8.0,
-            camera_pos.y,
-            chunk_coord.1 as f32 * SECTION_SIZE as f32 + 8.0,
-        );
-        let horizontal = cgmath::Vector2::new(center.x - camera_pos.x, center.z - camera_pos.z);
-        let chunk_dist = horizontal.magnitude() / SECTION_SIZE as f32;
-        let near = self.section_draw_distance_chunks * 0.5;
-        let mid = self.section_draw_distance_chunks * 0.8;
-        if chunk_dist <= near {
-            0
-        } else if chunk_dist <= mid {
-            1
-        } else if chunk_dist <= self.section_draw_distance_chunks {
-            2
-        } else {
-            3
-        }
-    }
-
     fn chunk_within_draw_distance(&self, chunk_coord: (i32, i32)) -> bool {
         let camera_pos = self.camera.position();
         let cx = chunk_coord.0 as f32 * SECTION_SIZE as f32 + 8.0;
@@ -473,18 +448,6 @@ impl State {
         let horizontal = cgmath::Vector2::new(cx - camera_pos.x, cz - camera_pos.z);
         let max_distance = SECTION_SIZE as f32 * self.section_draw_distance_chunks;
         horizontal.magnitude2() <= max_distance * max_distance
-    }
-
-    fn section_passes_surface_lod(
-        ring: u8,
-        section_world_y: i32,
-        surface_max_y: i32,
-    ) -> bool {
-        if ring < platform::FAR_DETAIL_RING {
-            return true;
-        }
-        let section_top = section_world_y + SECTION_SIZE as i32;
-        section_top >= surface_max_y - platform::SURFACE_LOD_DEPTH_BLOCKS
     }
 
     fn chunk_visible(&self, frustum: &cull::Frustum, chunk_coord: (i32, i32), mesh: &ChunkGpuMesh) -> bool {
@@ -787,6 +750,8 @@ impl State {
             chunks_meshed: 0,
             chunk_visibility: HashMap::new(),
             section_graph: cull::SectionGraph::new(),
+            streaming_scale_last_frame: 1.0,
+            smart_cull_last_frame: true,
             reachable_sections_last_frame: 0,
             procedural_world,
         };
@@ -826,7 +791,7 @@ impl State {
         self.profile_accum += self.delta;
         if self.profile_accum > 1_000_000 {
             println!(
-                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={}",
+                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={} smart_cull={} stream_scale={:.2}",
                 self.started_at.elapsed().as_secs_f64(),
                 self.world_ready,
                 self.fps_ema,
@@ -843,6 +808,8 @@ impl State {
                 self.chunks_meshed,
                 self.resident_quads(),
                 self.reachable_sections_last_frame,
+                self.smart_cull_last_frame,
+                self.streaming_scale_last_frame,
             );
             self.profile_accum = 0;
         }
@@ -869,7 +836,7 @@ impl State {
     fn chunk_needs_gpu_mesh(&self, coord: (i32, i32)) -> bool {
         self._world
             .chunk(coord)
-            .is_some_and(|ch| ch.needs_surface_mesh())
+            .is_some_and(|ch| ch.needs_rendered_mesh())
     }
 
     /// Spawn neighborhood tile: data present, optional GPU mesh if non-empty, and no in-flight mesh work.
@@ -935,7 +902,7 @@ impl State {
     /// How many tiles in the loading radius are finished terrain — memoised.
     ///
     /// `chunk_bootstrap_tile_ready` ends up walking section block arrays via
-    /// `needs_surface_mesh`, and the uncached version ran it over every tile in the loading
+    /// `needs_rendered_mesh`, and the uncached version ran it over every tile in the loading
     /// radius twice a frame (once to test the gate, once for the HUD). At radius 16 that is
     /// 1089 tiles × 2, and it was the main reason loading throughput decayed from ~69 to
     /// ~9 chunks/s as the radius filled.
@@ -966,6 +933,14 @@ impl State {
         let px = (self.camera.position().x.floor() as i32).div_euclid(SECTION_SIZE as i32);
         let pz = (self.camera.position().z.floor() as i32).div_euclid(SECTION_SIZE as i32);
         if self.bootstrap_ready_tiles_cached(px, pz) == Self::bootstrap_tile_count() {
+            // Every tile is generated and meshed — but a tile counts as meshed when its result
+            // *arrives*, not when it reaches the GPU. Revealing with a deep upload queue hands
+            // the player exactly the frame-time burst the loading screen exists to absorb, so
+            // wait for it to drain too. Nothing new is requested at this point, so this costs
+            // a few frames, not a phase.
+            if self.pending_ready.len() > platform::REVEAL_MAX_PENDING_UPLOADS {
+                return;
+            }
             self.world_ready = true;
             self.bootstrap_ready_cache.clear();
             println!(
@@ -985,8 +960,13 @@ impl State {
         let frame_over = if bootstrap {
             0
         } else {
-            self.delta.saturating_sub(platform::TARGET_FRAME_TIME_US)
+            self.delta.saturating_sub(platform::target_frame_time_us())
         };
+        // One number for the whole frame's streaming work: uploads and inline meshing both give
+        // budget back when the previous frame ran long, which is what holds a floor under the
+        // frame rate while a deep queue drains.
+        let streaming_scale = platform::streaming_budget_scale(frame_over);
+        self.streaming_scale_last_frame = streaming_scale;
         let forward = self.camera.forward();
 
         let stream_radius = if bootstrap {
@@ -1093,29 +1073,29 @@ impl State {
         }
         self.trim_pending_ready_queue();
 
+        // Uploading is main-thread work, so it is throttled by how much frame time the *last*
+        // frame had left over. During bootstrap there is no frame to protect — the loading
+        // screen is the only thing on it — so it runs flat out.
         let (upload_budget_dynamic, upload_time_budget_dynamic) = if bootstrap {
             (
                 platform::bootstrap_max_chunk_uploads_per_frame(),
                 u128::MAX,
             )
-        } else if self.procedural_world {
-            (
-                platform::procedural_max_chunk_uploads_per_frame(),
-                platform::max_upload_time_budget_ms(),
-            )
-        } else if cfg!(target_arch = "wasm32") {
-            (
-                platform::max_chunk_uploads_per_frame(),
-                platform::max_upload_time_budget_ms(),
-            )
-        } else if frame_over > 10_000 {
-            (2, 1)
-        } else if frame_over > 5_000 {
-            (3, platform::max_upload_time_budget_ms())
         } else {
+            let (base_uploads, base_time) = if self.procedural_world {
+                (
+                    platform::procedural_max_chunk_uploads_per_frame(),
+                    platform::max_upload_time_budget_ms(),
+                )
+            } else {
+                (
+                    platform::max_chunk_uploads_per_frame(),
+                    platform::max_upload_time_budget_ms(),
+                )
+            };
             (
-                platform::max_chunk_uploads_per_frame(),
-                platform::max_upload_time_budget_ms(),
+                platform::scale_budget(base_uploads, streaming_scale),
+                platform::scale_time_budget(base_time, streaming_scale),
             )
         };
 
@@ -1236,10 +1216,18 @@ impl State {
         } else {
             0
         };
-        let remesh_time_budget = if self.procedural_world {
+        let base_remesh_time_budget = if self.procedural_world {
             platform::procedural_remesh_time_budget_ms()
         } else {
             platform::remesh_time_budget_ms()
+        };
+        // On wasm this budget *is* the meshing cost — there is no mesh pool, so
+        // `dispatch_remesh_work` runs inline right here. Scaling it with the frame time is the
+        // other half of the frame-rate floor.
+        let remesh_time_budget = if bootstrap {
+            base_remesh_time_budget
+        } else {
+            platform::scale_time_budget(base_remesh_time_budget, streaming_scale)
         };
         let remesh_start = Instant::now();
         let base_pri_budget = if self.procedural_world {
@@ -1366,12 +1354,25 @@ impl State {
                 .clamp(0, SECTION_COUNT as i32 - 1) as usize;
             let cp = self.camera.position();
             let camera_origin = cgmath::Vector3::new(cp.x, cp.y, cp.z);
+            // The camera noclips, so it spends most of its time underground *inside stone*.
+            // Connectivity says nothing there — the eye is in a cell no sightline leaves, and
+            // the walk dies after the camera's six solid neighbours, drawing an empty world.
+            // Vanilla drops smart culling for exactly this case; the walk becomes a plain
+            // frustum flood fill and the caves in range are drawn.
+            let camera_block = self._world.block_at(
+                cp.x.floor() as i32,
+                cp.y.floor() as i32,
+                cp.z.floor() as i32,
+            );
+            let smart_cull = !(camera_block.is_opaque() && camera_block.is_full_cube());
+            self.smart_cull_last_frame = smart_cull;
             let graph = &mut self.section_graph;
             let visibility_map = &self.chunk_visibility;
             let mut reachable = 0usize;
             graph.walk(
                 ((player_chunk_x, player_chunk_z), camera_section),
                 draw_radius,
+                smart_cull,
                 |key| {
                     visibility_map
                         .get(&key.0)
@@ -1448,15 +1449,11 @@ impl State {
                     if !self.chunk_visible(&frustum, chunk_coord, mesh) {
                         continue;
                     }
-                    let ring = self.chunk_detail_ring(chunk_coord);
                     render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
                     let mut chunk_drew = false;
                     for draw in &mesh.section_draws {
-                        if !Self::section_passes_surface_lod(ring, draw.section_world_y, mesh.surface_max_y) {
-                            continue;
-                        }
                         if occlusion_culling {
                             let section_index = (draw.section_world_y.div_euclid(SECTION_SIZE as i32)
                                 - MIN_SECTION_Y) as usize;
@@ -1529,8 +1526,16 @@ impl State {
                 .take(filled.min(bar_width))
                 .chain(std::iter::repeat('-').take(bar_width.saturating_sub(filled)))
                 .collect();
+            // The bar reaches 100% before the reveal does: the gate also waits for the upload
+            // queue to drain, so say which of the two is still running rather than looking
+            // stuck at 100%.
+            let waiting_on = if boot_n == boot_total {
+                "Uploading the last meshes…"
+            } else {
+                "Revealing once the whole area is built"
+            };
             format!(
-                "Building terrain…\n[{}] {:.0}%{}\n{}/{} chunks ready ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\nRevealing once the whole area is built",
+                "Building terrain…\n[{}] {:.0}%{}\n{}/{} chunks ready ({}×{} around you)\nData loaded: {} · Mesh queue: {}{}\n{}",
                 bar,
                 pct,
                 eta,
@@ -1541,6 +1546,7 @@ impl State {
                 self._world.chunks().count(),
                 self.pending_ready.len(),
                 worker_line,
+                waiting_on,
             )
         };
         self.hud
