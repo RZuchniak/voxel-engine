@@ -44,7 +44,69 @@ pub struct SeededProceduralSource {
     seed: i64,
     overworld: crate::mc::overworld::Overworld,
     surface: crate::mc::surface::SurfaceSystem,
+    terrain_cache: Mutex<TerrainCache>,
 }
+
+/// Undecorated terrain, keyed by chunk coord.
+///
+/// **This exists to make trees affordable.** Trees cross chunk boundaries, so producing chunk C
+/// requires decorating its whole 3×3 neighbourhood, which without a cache would generate every
+/// chunk's terrain nine times (~37.6 ms each → ~340 ms/chunk). The streamer requests chunks in a
+/// spiral, so a neighbour is almost always still resident from a nearby request.
+///
+/// Bounded and evicted in insertion order rather than by true LRU: the access pattern is a
+/// moving front, so the oldest entry is also the one furthest from where generation is working.
+/// A real LRU would cost a touch on every hit to defend against an access pattern this workload
+/// does not have.
+struct TerrainCache {
+    entries: HashMap<(i32, i32), std::sync::Arc<crate::mc::chunk::ChunkBlocks>>,
+    order: std::collections::VecDeque<(i32, i32)>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl TerrainCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, coord: (i32, i32)) -> Option<std::sync::Arc<crate::mc::chunk::ChunkBlocks>> {
+        match self.entries.get(&coord) {
+            Some(entry) => {
+                self.hits += 1;
+                Some(std::sync::Arc::clone(entry))
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, coord: (i32, i32), blocks: std::sync::Arc<crate::mc::chunk::ChunkBlocks>) {
+        if self.entries.insert(coord, blocks).is_none() {
+            self.order.push_back(coord);
+            while self.order.len() > self.capacity {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
+/// How many undecorated chunks to keep. A chunk column is ~885 KB as `ChunkBlocks` (one byte per
+/// block over the full −64..320 range), so 256 entries is roughly **220 MB** — chosen to comfortably
+/// cover the 3×3 working set of several concurrently-generating worker threads without becoming a
+/// second memory budget to manage. Lower it before raising the load distance.
+const TERRAIN_CACHE_CAPACITY: usize = 256;
 
 impl SeededProceduralSource {
     pub fn new(seed: i64) -> Self {
@@ -52,11 +114,43 @@ impl SeededProceduralSource {
             seed,
             overworld: crate::mc::overworld::Overworld::new(seed),
             surface: crate::mc::surface::SurfaceSystem::new(seed),
+            terrain_cache: Mutex::new(TerrainCache::new(TERRAIN_CACHE_CAPACITY)),
         }
     }
 
     pub fn seed(&self) -> i64 {
         self.seed
+    }
+
+    /// Undecorated terrain for one chunk, from the cache when possible.
+    fn terrain(&self, coord: (i32, i32)) -> std::sync::Arc<crate::mc::chunk::ChunkBlocks> {
+        if let Ok(mut cache) = self.terrain_cache.lock() {
+            if let Some(hit) = cache.get(coord) {
+                return hit;
+            }
+        }
+        // Generated **outside** the lock: this is ~37 ms of pure CPU and holding the mutex across
+        // it would serialise the whole worker pool onto one thread. Two threads racing on the
+        // same coord will both generate it, which wastes work once but is far cheaper than
+        // serialising every generation in the process.
+        let blocks = std::sync::Arc::new(crate::mc::chunk::generate_chunk(
+            &self.overworld,
+            &self.surface,
+            coord.0,
+            coord.1,
+        ));
+        if let Ok(mut cache) = self.terrain_cache.lock() {
+            cache.insert(coord, std::sync::Arc::clone(&blocks));
+        }
+        blocks
+    }
+
+    /// Cache hit/miss counters, for `examples/bench_mc_chunk`.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.terrain_cache
+            .lock()
+            .map(|cache| (cache.hits, cache.misses))
+            .unwrap_or((0, 0))
     }
 }
 
@@ -68,13 +162,43 @@ impl WorldSource for SeededProceduralSource {
         // (`platform::section_occlusion_culling`), not by omitting it — a surface band is a
         // stand-in for that algorithm, and it shows: caves cut off in mid-air, a hollow shell
         // from below, and terrain that falls out of the band on slopes.
-        let generated = crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, cx, cz);
+        // Terrain for the whole 3×3 neighbourhood, because decoration is a 3×3 pass: a tree's
+        // trunk sits in one chunk and its foliage routinely lands in the next, so this chunk's
+        // final contents depend on its neighbours' trees as much as its own. The cache is what
+        // keeps that from costing nine generations — see `TerrainCache`.
+        let mut terrain = Vec::with_capacity(9);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                terrain.push(((cx + dx, cz + dz), self.terrain((cx + dx, cz + dz))));
+            }
+        }
+        let neighbours: Vec<crate::mc::decorate::NeighbourTerrain<'_>> = terrain
+            .iter()
+            .map(|((nx, nz), blocks)| crate::mc::decorate::NeighbourTerrain {
+                chunk_x: *nx,
+                chunk_z: *nz,
+                blocks: blocks.as_ref(),
+            })
+            .collect();
+        let decorated = crate::mc::decorate::decorate_centre(self.seed, cx, cz, &neighbours);
+
+        let generated = &terrain[4].1; // the centre, for its biome grid
+        debug_assert_eq!(terrain[4].0, coord, "index 4 must be the centre of the 3x3");
         let mut out = Chunk::new(coord);
+        // 16 bytes of biome index per chunk — what makes grass, leaves and water take their
+        // biome's colour instead of one global green. Free: the generator already resolved these
+        // while applying surface rules.
+        let mut biomes = [0u8; crate::world::BIOME_CELLS];
+        for (cell, name) in generated.surface_biomes.iter().enumerate() {
+            biomes[cell] = crate::biome_tint::biome_index(name);
+        }
+        out.set_biomes(biomes);
         for lz in 0..16usize {
             for lx in 0..16usize {
                 for y in crate::mc::chunk::MIN_Y..crate::mc::chunk::MIN_Y + crate::mc::chunk::HEIGHT
                 {
-                    let block = generated.get(lx, y, lz);
+                    let block =
+                        decorated[((y - crate::mc::chunk::MIN_Y) as usize) * 256 + lz * 16 + lx];
                     if block != crate::mc::surface::Block::Air {
                         out.set_block_world(lx, y, lz, block.block_id());
                     }

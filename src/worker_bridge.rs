@@ -146,6 +146,55 @@ impl WorkerBridgeInner {
         self.ready_worker_indices().len() * crate::platform::max_worker_jobs_in_flight()
     }
 
+    /// Chunks per side of a worker-affinity tile. See [`Self::pick_worker`].
+    ///
+    /// 8 was measured, not guessed: a 4-chunk tile leaves 12 of its 16 chunks on a boundary and
+    /// still needing another worker's neighbours, while 8 leaves only 28 of 64. 16 measured
+    /// identically to 8, so this takes the smaller one — bigger tiles make the load lumpier,
+    /// since a whole tile lands on one worker.
+    const WORKER_TILE: i32 = 8;
+
+    /// Which worker should generate this chunk.
+    ///
+    /// **Not round-robin, and that matters a lot.** Generating a chunk requires the terrain of
+    /// its whole 3×3 neighbourhood (trees cross chunk borders — see `mc::decorate`), and every
+    /// web worker has its **own** `SeededProceduralSource` with its own `TerrainCache`; nothing
+    /// is shared between them. Under round-robin a worker receives every Nth chunk of the
+    /// streaming spiral, so it almost never already holds a neighbour and regenerates all nine.
+    ///
+    /// Measured by `examples/diag_trees`'s dispatch simulation — terrain generations per chunk,
+    /// where 1.00× means the cache is doing its job and 9.00× means it is not:
+    ///
+    /// | workers | round-robin | tiled (8) |
+    /// |---|---|---|
+    /// | 1 | 1.33× | 1.33× |
+    /// | 4 | 4.08× | **1.71×** |
+    /// | 8 | 5.66× | **1.71×** |
+    ///
+    /// That 5.66× is what the browser was actually paying per chunk once trees landed, and it is
+    /// the cause of the reported freezes — not the meshing of the trees themselves, which costs
+    /// only about 1.6× the quads of a bare chunk.
+    ///
+    /// Native is unaffected either way: its thread pool shares a single source and cache, which
+    /// is exactly why this only ever showed up in the browser.
+    ///
+    /// Falls back to round-robin when the preferred worker is busy, so affinity never stalls the
+    /// queue behind one worker.
+    fn pick_worker(&mut self, ready_workers: &[usize], coord: (i32, i32)) -> usize {
+        let total = self.workers.len().max(1);
+        let tile_x = coord.0.div_euclid(Self::WORKER_TILE);
+        let tile_z = coord.1.div_euclid(Self::WORKER_TILE);
+        // A cheap spatial hash; the constants are odd so neighbouring tiles do not collide.
+        let hash = (tile_x as i64).wrapping_mul(0x9E37_79B9) ^ (tile_z as i64).wrapping_mul(0x85EB_CA6B);
+        let preferred = hash.rem_euclid(total as i64) as usize;
+        if ready_workers.contains(&preferred) {
+            return preferred;
+        }
+        let fallback = ready_workers[self.next_worker % ready_workers.len()];
+        self.next_worker = self.next_worker.wrapping_add(1);
+        fallback
+    }
+
     fn dispatch_next_jobs(&mut self) {
         let ready_workers = self.ready_worker_indices();
         if ready_workers.is_empty() {
@@ -155,8 +204,7 @@ impl WorkerBridgeInner {
             let Some(job) = self.job_queue.pop_front() else {
                 break;
             };
-            let worker_index = ready_workers[self.next_worker % ready_workers.len()];
-            self.next_worker = self.next_worker.wrapping_add(1);
+            let worker_index = self.pick_worker(&ready_workers, Self::job_coord(&job));
             let payload = encode_job(&job);
             let payload_array = js_sys::Uint8Array::from(payload.as_slice());
             let payload_buffer = payload_array.buffer();

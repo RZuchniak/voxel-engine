@@ -61,6 +61,13 @@ pub enum Block {
     LightGrayTerracotta,
     Cinnabar,
     Sulfur,
+    // Tree blocks. Placed by `mc::tree` during decoration, never by surface rules.
+    OakLog,
+    OakLeaves,
+    BirchLog,
+    BirchLeaves,
+    SpruceLog,
+    SpruceLeaves,
 }
 
 impl Block {
@@ -100,6 +107,12 @@ impl Block {
             // No dedicated render blocks for the sulfur-cave pair; they only appear deep
             // underground, where stone reads fine.
             Block::Cinnabar | Block::Sulfur => Id::STONE,
+            Block::OakLog => Id::OAK_LOG,
+            Block::OakLeaves => Id::OAK_LEAVES,
+            Block::BirchLog => Id::BIRCH_LOG,
+            Block::BirchLeaves => Id::BIRCH_LEAVES,
+            Block::SpruceLog => Id::SPRUCE_LOG,
+            Block::SpruceLeaves => Id::SPRUCE_LEAVES,
         }
     }
 
@@ -137,6 +150,12 @@ impl Block {
             Block::LightGrayTerracotta => "light_gray_terracotta",
             Block::Cinnabar => "cinnabar",
             Block::Sulfur => "sulfur",
+            Block::OakLog => "oak_log",
+            Block::OakLeaves => "oak_leaves",
+            Block::BirchLog => "birch_log",
+            Block::BirchLeaves => "birch_leaves",
+            Block::SpruceLog => "spruce_log",
+            Block::SpruceLeaves => "spruce_leaves",
         }
     }
 }

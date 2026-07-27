@@ -1,3 +1,5 @@
+use crate::biome_tint::TintKind;
+
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u16);
@@ -46,6 +48,11 @@ impl BlockId {
     pub const BROWN_TERRACOTTA: BlockId = BlockId(32);
     pub const RED_TERRACOTTA: BlockId = BlockId(33);
     pub const LIGHT_GRAY_TERRACOTTA: BlockId = BlockId(34);
+    // Tree species, placed by `mc::tree`. Oak already existed at id 6/7.
+    pub const BIRCH_LOG: BlockId = BlockId(35);
+    pub const BIRCH_LEAVES: BlockId = BlockId(36);
+    pub const SPRUCE_LOG: BlockId = BlockId(37);
+    pub const SPRUCE_LEAVES: BlockId = BlockId(38);
 
     #[inline]
     pub fn info(self) -> &'static BlockInfo {
@@ -99,6 +106,20 @@ impl BlockId {
             Face::Side => tex[2],
         }
     }
+
+    /// What biome colour, if any, modulates this face.
+    ///
+    /// Per-face rather than per-block because a grass block is both: its top and side are tinted
+    /// grass, while its bottom is plain dirt and must not be.
+    #[inline]
+    pub fn tint(self, face: Face) -> TintKind {
+        let tints = self.info().tints;
+        match face {
+            Face::Top => tints[0],
+            Face::Bottom => tints[1],
+            Face::Side => tints[2],
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -110,6 +131,11 @@ pub struct BlockInfo {
     /// separates them.
     pub occludes_faces: bool,
     pub textures: [u32; 3], // top, bottom, side
+    /// Biome colour modulation per face, same order as `textures`. Almost every block is
+    /// [`TintKind::None`], and that matters for more than correctness: an untinted face resolves
+    /// to a biome-independent palette index, so greedy runs of stone never break at a biome
+    /// boundary. Only [`info_tinted`] sets anything else.
+    pub tints: [TintKind; 3],
 }
 
 const fn info(name: &'static str, full: bool, opaque: bool, textures: [u32; 3]) -> BlockInfo {
@@ -119,6 +145,26 @@ const fn info(name: &'static str, full: bool, opaque: bool, textures: [u32; 3]) 
         is_opaque: opaque,
         occludes_faces: opaque,
         textures,
+        tints: [TintKind::None; 3],
+    }
+}
+
+/// A block whose faces take a biome colour. `tints` is per-face: grass is tinted on top and
+/// side but not on its dirt underside.
+const fn info_tinted(
+    name: &'static str,
+    full: bool,
+    opaque: bool,
+    textures: [u32; 3],
+    tints: [TintKind; 3],
+) -> BlockInfo {
+    BlockInfo {
+        name,
+        is_full_cube: full,
+        is_opaque: opaque,
+        occludes_faces: opaque,
+        textures,
+        tints,
     }
 }
 
@@ -135,6 +181,7 @@ const fn info_solid_looking(name: &'static str, textures: [u32; 3]) -> BlockInfo
         is_opaque: false,
         occludes_faces: true,
         textures,
+        tints: [TintKind::None; 3],
     }
 }
 
@@ -143,7 +190,16 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("air", false, false, [0, 0, 0]),
     info("stone", true, true, [1, 1, 1]),
     info("dirt", true, true, [2, 2, 2]),
-    info("grass", true, true, [3, 2, 4]),
+    // Top and side take the biome's grass colour; the bottom is the dirt texture and must not.
+    // The side is one baked texture of grass-over-dirt, so its *per-texel* tint mask (the alpha
+    // channel, see `texture::neutralise_tintable_layer`) is what keeps the dirt rows brown.
+    info_tinted(
+        "grass",
+        true,
+        true,
+        [3, 2, 4],
+        [TintKind::Grass, TintKind::None, TintKind::Grass],
+    ),
     info("sand", true, true, [8, 8, 8]),
     info("cobblestone", true, true, [9, 9, 9]),
     info("oak_log", true, true, [6, 6, 6]),
@@ -154,9 +210,9 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     //      deleting the ground's top face, and the leaf's own alpha holes then looked at the sky.
     //   2. Only non-opaque full cubes get the double-sided treatment. Backface culling removes the
     //      inside of a cube's far faces, so a *lone* opaque-flagged leaf block was see-through too.
-    info("oak_leaves", true, false, [7, 7, 7]),
+    info_tinted("oak_leaves", true, false, [7, 7, 7], [TintKind::Foliage; 3]),
     info("oak_planks", true, true, [10, 10, 10]),
-    info("water", true, false, [5, 5, 5]),
+    info_tinted("water", true, false, [5, 5, 5], [TintKind::Water; 3]),
     info("bedrock", true, true, [11, 11, 11]),
     info("deepslate", true, true, [12, 12, 12]),
     info("gravel", true, true, [13, 13, 13]),
@@ -183,4 +239,10 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("brown_terracotta", true, true, [33, 33, 33]),
     info("red_terracotta", true, true, [34, 34, 34]),
     info("light_gray_terracotta", true, true, [35, 35, 35]),
+    // Birch and spruce. Leaves are cutouts and foliage-tinted, exactly like oak — see the note
+    // on `oak_leaves` above for why they must not be flagged opaque.
+    info("birch_log", true, true, [36, 36, 36]),
+    info_tinted("birch_leaves", true, false, [37, 37, 37], [TintKind::Foliage; 3]),
+    info("spruce_log", true, true, [38, 38, 38]),
+    info_tinted("spruce_leaves", true, false, [39, 39, 39], [TintKind::Foliage; 3]),
 ];

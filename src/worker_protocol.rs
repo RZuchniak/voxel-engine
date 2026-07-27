@@ -34,6 +34,11 @@ pub struct ChunkWire {
     pub cx: i32,
     pub cz: i32,
     pub sections: Vec<(usize, Vec<u16>)>,
+    /// The chunk's 4×4 biome grid. 16 bytes against a payload of ~8 KB per populated section,
+    /// so it is free on the wire. `#[serde(default)]` because a worker built before this field
+    /// existed still decodes — it simply delivers untinted chunks.
+    #[serde(default)]
+    pub biomes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +64,23 @@ impl ChunkWire {
                 (section_index, blocks)
             })
             .collect();
-        Self { cx, cz, sections }
+        Self {
+            cx,
+            cz,
+            sections,
+            biomes: chunk.biomes().map(|b| b.to_vec()),
+        }
     }
 
     pub fn into_chunk(self) -> Chunk {
         let mut chunk = Chunk::new((self.cx, self.cz));
+        // A wrong-length grid means a protocol mismatch, not a partially-tinted chunk — drop it
+        // and render untinted rather than indexing off the end of the array.
+        if let Some(biomes) = self.biomes {
+            if let Ok(grid) = <[u8; crate::world::BIOME_CELLS]>::try_from(biomes.as_slice()) {
+                chunk.set_biomes(grid);
+            }
+        }
         for (section_index, blocks) in self.sections {
             let mut section = Section::new();
             for (idx, block_id) in blocks.into_iter().enumerate() {

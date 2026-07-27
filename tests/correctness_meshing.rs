@@ -7,9 +7,10 @@
 use std::collections::BTreeSet;
 
 use voxel_engine::{
+    biome_tint::{self, TintKind},
     block::BlockId,
-    mesh::{mesh_chunk, AO_MASK, FACE_SHADE_SHIFT},
-    world::{Chunk, World, SECTION_SIZE},
+    mesh::{mesh_chunk, AO_MASK, FACE_SHADE_SHIFT, TINT_MASK, TINT_SHIFT},
+    world::{Chunk, World, BIOME_CELLS, SECTION_SIZE},
 };
 
 /// Fill one 16x16x16 section (world y 0..15) of `coord` with `block`.
@@ -345,4 +346,167 @@ fn steep_chunk_meshes_every_column_top() {
             "section {section_index} holding a column top at y={top} was not meshed"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Biome tint
+//
+// Grass, foliage and water take their colour from the biome, delivered as an 8-bit palette index
+// packed into bits 10..17 of the vertex `light` word. Everything below guards a property that is
+// invisible in a screenshot until it is wrong across a whole biome.
+// ---------------------------------------------------------------------------------------------
+
+/// The tint index a vertex carries.
+fn tint_of(vertex: &voxel_engine::Vertex) -> u8 {
+    ((vertex.light >> TINT_SHIFT) & TINT_MASK) as u8
+}
+
+/// Every distinct tint index in a chunk's mesh.
+fn tints_in(world: &World, coord: (i32, i32)) -> BTreeSet<u8> {
+    mesh_chunk(world, coord)
+        .iter()
+        .flat_map(|(_, mesh)| mesh.vertices().iter().map(tint_of))
+        .collect()
+}
+
+/// A grass block in a swamp must not be painted with plains' green.
+///
+/// This is the whole feature in one assertion: the biome reaches the mesh, and two different
+/// biomes produce two different colours. Before tinting existed both came out identical, which
+/// is why a swamp, a jungle and a savanna were indistinguishable.
+#[test]
+fn grass_takes_its_colour_from_the_biome() {
+    let tint_for = |biome: &str| -> BTreeSet<u8> {
+        let mut chunk = solid_chunk((0, 0), BlockId::GRASS);
+        chunk.set_biomes([biome_tint::biome_index(biome); BIOME_CELLS]);
+        let mut world = World::new();
+        world.insert_chunk(chunk);
+        tints_in(&world, (0, 0))
+    };
+
+    let swamp = tint_for("swamp");
+    let plains = tint_for("plains");
+
+    let expected_swamp =
+        biome_tint::palette_index(biome_tint::biome_index("swamp"), TintKind::Grass);
+    assert!(
+        swamp.contains(&expected_swamp),
+        "swamp grass carries {swamp:?}, expected to include {expected_swamp}"
+    );
+    assert_ne!(
+        swamp, plains,
+        "swamp and plains grass produced the same tint — the biome is not reaching the mesher"
+    );
+    // Exactly two tints, and which two is the point: the top and the four sides take the biome's
+    // grass colour, while the **bottom** is plain dirt and must stay neutral. Tinting a grass
+    // block wholesale would turn its underside green, which is visible from any overhang.
+    assert_eq!(
+        swamp,
+        BTreeSet::from([biome_tint::NEUTRAL, expected_swamp]),
+        "a grass block should carry its biome's grass tint on top and sides, and neutral on its \
+         dirt underside"
+    );
+}
+
+/// Stone must be biome-independent — and this is a performance property, not just a visual one.
+///
+/// If an untinted block's palette index varied with biome, every greedy run of stone would break
+/// at each 4-block biome cell boundary. Underground is the overwhelming majority of the world's
+/// geometry, so that would be a large and completely invisible cost.
+#[test]
+fn untinted_blocks_are_neutral_whatever_the_biome() {
+    for biome in ["swamp", "jungle", "badlands", "warm_ocean"] {
+        let mut chunk = solid_chunk((0, 0), BlockId::STONE);
+        chunk.set_biomes([biome_tint::biome_index(biome); BIOME_CELLS]);
+        let mut world = World::new();
+        world.insert_chunk(chunk);
+        assert_eq!(
+            tints_in(&world, (0, 0)),
+            BTreeSet::from([biome_tint::NEUTRAL]),
+            "stone in {biome} is not neutral — greedy runs will break at biome boundaries"
+        );
+    }
+}
+
+/// A chunk from a source with no biome data must still get a colour — not white.
+///
+/// The Anvil zip-import path supplies no biomes, and this is the one place where "fall back to
+/// neutral" is the *wrong* answer. Tintable texture layers are neutralised to grayscale at load
+/// on the assumption that a biome colours them, so an untinted grass block renders **grey**.
+/// Imported worlds would have come out with grey grass, grey leaves and grey water — a
+/// regression on a headline feature, and one that no procedurally-generated test would catch
+/// because those chunks always carry biomes.
+#[test]
+fn a_chunk_without_biome_data_falls_back_to_the_default_biome() {
+    let mut world = World::new();
+    world.insert_chunk(solid_chunk((0, 0), BlockId::GRASS));
+
+    let expected = biome_tint::palette_index(biome_tint::DEFAULT_BIOME, TintKind::Grass);
+    let tints = tints_in(&world, (0, 0));
+    assert!(
+        tints.contains(&expected),
+        "a biome-less chunk's grass carries {tints:?}, expected the default biome's {expected}"
+    );
+    assert_ne!(
+        tints,
+        BTreeSet::from([biome_tint::NEUTRAL]),
+        "grass with no biome data must not render untinted — the texture is grayscale, so \
+         neutral means grey grass"
+    );
+}
+
+/// A biome boundary inside one chunk must split the greedy quad that crosses it.
+///
+/// Merging across it would paint one biome's grass with its neighbour's colour in a straight
+/// line along the merge axis — subtle enough to survive a screenshot, so it needs a test.
+#[test]
+fn a_biome_boundary_breaks_a_greedy_run() {
+    let mut uniform = solid_chunk((0, 0), BlockId::GRASS);
+    uniform.set_biomes([biome_tint::biome_index("plains"); BIOME_CELLS]);
+
+    // Split the 4x4 biome grid down the middle: plains on one side, swamp on the other.
+    let mut split_grid = [biome_tint::biome_index("plains"); BIOME_CELLS];
+    for cell in 0..BIOME_CELLS {
+        if cell % 4 >= 2 {
+            split_grid[cell] = biome_tint::biome_index("swamp");
+        }
+    }
+    let mut split = solid_chunk((0, 0), BlockId::GRASS);
+    split.set_biomes(split_grid);
+
+    let quads_of = |chunk: Chunk| {
+        let mut world = World::new();
+        world.insert_chunk(chunk);
+        quad_count(&world, (0, 0))
+    };
+
+    let uniform_quads = quads_of(uniform);
+    let split_quads = quads_of(split);
+    assert!(
+        split_quads > uniform_quads,
+        "a chunk spanning two biomes produced {split_quads} quads, no more than the {uniform_quads} \
+         of a single-biome chunk — the tint is not part of the merge key"
+    );
+}
+
+/// The shader hardcodes the palette length; a mismatch is a GPU-side error or silent miscolouring.
+///
+/// WGSL cannot import a Rust constant, so the two are pinned to each other here rather than
+/// discovered at run time in a browser.
+#[test]
+fn the_shader_agrees_with_the_rust_palette_length() {
+    let shader = include_str!("../src/square.wgsl");
+    let declared = shader
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("const PALETTE_LEN: u32 = ")?;
+            rest.trim_end_matches(';').trim_end_matches('u').parse::<usize>().ok()
+        })
+        .expect("square.wgsl must declare `const PALETTE_LEN: u32 = <n>u;`");
+    assert_eq!(
+        declared,
+        biome_tint::PALETTE_LEN,
+        "square.wgsl says {declared} palette entries, biome_tint says {}",
+        biome_tint::PALETTE_LEN
+    );
 }

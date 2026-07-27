@@ -48,6 +48,13 @@ pub const BLOCK_TEXTURE_FILES: &[&str] = &[
     "brown_terracotta.png",    // 33
     "red_terracotta.png",      // 34
     "light_gray_terracotta.png", // 35
+    // Tree species (`mc::tree`). This pack ships no `birch_log.png` / `spruce_log.png` side
+    // texture — only `_top` and `stripped_` variants — so those two fall back to flat bark
+    // colours. The leaves it does ship, and they are cutouts like oak's.
+    "birch_log.png",             // 36
+    "birch_leaves.png",          // 37
+    "spruce_log.png",            // 38
+    "spruce_leaves.png",         // 39
 ];
 
 pub const BLOCK_TEXTURE_DIR: &str = "resource_pack/assets/minecraft/textures/block";
@@ -73,9 +80,28 @@ fn is_cutout(rgba: &[u8]) -> bool {
     saw_clear && saw_opaque
 }
 
+/// A block texture layer plus how its alpha channel is to be read.
+///
+/// The flag cannot be recovered by inspecting pixels, which is why it is carried explicitly.
+/// After [`neutralise_tintable_layer`] a grass side has alpha 0 on its dirt texels and 255 on its
+/// grass texels — indistinguishable from a cutout stencil, and treating it as one would run the
+/// `discard` test and punch the dirt rows out of every grass block in the world. Alpha means
+/// *coverage* for a cutout and *tint mask* for a tintable layer, and only the loader knows which
+/// it just wrote.
+pub struct LoadedLayer {
+    pub pixels: Vec<u8>,
+    /// True when alpha is an opacity stencil (leaves); false when it is a per-texel tint mask.
+    pub alpha_is_coverage: bool,
+}
+
 /// Downsample a 16×16 RGBA layer into mip levels (wgpu 26 has no CommandEncoder::generate_mipmap).
-fn build_mip_chain(base: &[u8]) -> Vec<Vec<u8>> {
-    if is_cutout(base) {
+///
+/// `alpha_is_coverage` selects the filter, and the distinction is load-bearing: a coverage
+/// stencil must be downsampled by [`build_cutout_mip_chain`] to keep its holes open, while a tint
+/// mask is a continuous quantity that *should* be averaged — a texel straddling a grass/dirt
+/// boundary is genuinely half-tinted.
+fn build_mip_chain(base: &[u8], alpha_is_coverage: bool) -> Vec<Vec<u8>> {
+    if alpha_is_coverage && is_cutout(base) {
         return build_cutout_mip_chain(base);
     }
     let mut mips = vec![base.to_vec()];
@@ -181,10 +207,6 @@ fn build_cutout_mip_chain(base: &[u8]) -> Vec<Vec<u8>> {
     }
     mips
 }
-
-/// Approximate default biome tints (pack expects `textures/colormap/*.png`).
-const FOLIAGE_TINT: [f32; 3] = [0.45, 0.72, 0.22];
-const WATER_TINT: [f32; 3] = [0.22, 0.48, 0.92];
 
 fn fallback_rgba(color: [u8; 4]) -> Vec<u8> {
     let mut out = vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize];
@@ -441,51 +463,197 @@ pub fn load_grass_top_layer(fallback: [u8; 4]) -> Vec<u8> {
     out
 }
 
-/// Grayscale foliage masks → multiply by biome green (colormap not loaded).
-fn apply_foliage_tint(pixels: &mut [u8]) {
+/// Target mean brightness of a neutralised layer.
+///
+/// A tinted layer must be a *modulation field around 1.0*, not a colour: the biome tint supplies
+/// the colour and the texture supplies only the detail. Normalising to exactly 1.0 would clip
+/// every above-average texel, so the mean lands slightly below white — which is also where
+/// vanilla's own grayscale grass art sits.
+const NEUTRAL_MEAN: f32 = 0.85;
+
+#[inline]
+fn luminance_of(px: &[u8]) -> f32 {
+    px[0] as f32 * 0.299 + px[1] as f32 * 0.587 + px[2] as f32 * 0.114
+}
+
+/// Strip a tintable layer's baked-in colour, leaving a grayscale detail field, and record in
+/// **alpha** which texels the biome tint applies to.
+///
+/// Two things forced this. First, the pack's grass and foliage art is *already green*, so the old
+/// code baked a fixed green in at load (`apply_foliage_tint`/`apply_water_tint`, now gone) —
+/// multiplying that by a biome colour would apply the hue twice and come out dark and muddy.
+/// Second, `grass_block_side.png` is a single baked tile of grass over dirt, so tinting whole
+/// texels would turn its dirt rows green.
+///
+/// Both are solved by one encoding: RGB becomes normalised luminance, and alpha becomes a
+/// per-texel **tint mask** (255 = take the biome colour, 0 = keep the texture's own colour). The
+/// shader blends between them, so a grass side's dirt rows stay brown while its grass rows follow
+/// the biome.
+///
+/// ⚠️ Repurposing alpha is only safe because nothing blends (`BlendState::REPLACE`) and these
+/// layers are not cutouts. Leaves *are* a cutout — alpha there is coverage and drives `discard` —
+/// so they take [`neutralise_cutout_colour`] and are tinted uniformly instead.
+///
+/// `tint_green_only` restricts the mask to green-dominant texels, which is what separates a grass
+/// side's grass from its dirt. Layers that are wholly tintable (water, the synthesised grass top)
+/// pass `false` and get a full mask.
+fn neutralise_tintable_layer(pixels: &mut [u8], tint_green_only: bool) {
+    let is_tintable = |px: &[u8]| -> bool {
+        if !tint_green_only {
+            return true;
+        }
+        // Green-dominant by a clear margin — the per-texel form of the row test
+        // `load_grass_top_layer` uses to find this same pack's grass rows.
+        px[1] as i32 > px[0] as i32 + 12 && px[1] as i32 > px[2] as i32 + 12
+    };
+
+    // Mean over the texels that will actually be tinted. Including the untinted ones would let a
+    // grass side's dark dirt rows drag its grass rows brighter to compensate.
+    let mut sum = 0f32;
+    let mut count = 0u32;
+    for px in pixels.chunks_exact(4) {
+        if px[3] >= 10 && is_tintable(px) {
+            sum += luminance_of(px);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    let mean = sum / count as f32;
+    if mean <= 0.0 {
+        return;
+    }
+
     for px in pixels.chunks_exact_mut(4) {
         if px[3] < 10 {
-            px[3] = 0;
+            px.copy_from_slice(&[0, 0, 0, 0]);
             continue;
         }
-        let lum = (px[0] as f32 * 0.299 + px[1] as f32 * 0.587 + px[2] as f32 * 0.114) / 255.0;
-        let boost = 1.15 + lum * 0.35;
-        px[0] = (lum * 255.0 * FOLIAGE_TINT[0] * boost).min(255.0) as u8;
-        px[1] = (lum * 255.0 * FOLIAGE_TINT[1] * boost).min(255.0) as u8;
-        px[2] = (lum * 255.0 * FOLIAGE_TINT[2] * boost).min(255.0) as u8;
+        if !is_tintable(px) {
+            px[3] = 0; // untinted: the shader keeps this texel's own colour
+            continue;
+        }
+        let level = ((luminance_of(px) / mean) * NEUTRAL_MEAN * 255.0).clamp(0.0, 255.0) as u8;
+        px[0] = level;
+        px[1] = level;
+        px[2] = level;
         px[3] = 255;
     }
 }
 
-/// Grayscale water mask → multiply by water blue (colormap not loaded).
-fn apply_water_tint(pixels: &mut [u8]) {
+/// Neutralise a cutout layer's colour while leaving its alpha stencil intact.
+///
+/// Same idea as [`neutralise_tintable_layer`] minus the mask: a cutout's alpha is already spoken
+/// for by the `discard` test, so these layers are tinted uniformly and the shader is told which
+/// they are via [`cutout_layer_mask`].
+fn neutralise_cutout_colour(pixels: &mut [u8]) {
+    let mut sum = 0f32;
+    let mut count = 0u32;
+    for px in pixels.chunks_exact(4) {
+        if px[3] > 0 {
+            sum += luminance_of(px);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    let mean = sum / count as f32;
+    if mean <= 0.0 {
+        return;
+    }
     for px in pixels.chunks_exact_mut(4) {
-        if px[3] < 10 {
-            px[3] = 0;
+        if px[3] == 0 {
             continue;
         }
-        let lum = (px[0] as f32 * 0.299 + px[1] as f32 * 0.587 + px[2] as f32 * 0.114) / 255.0;
-        let boost = 1.1 + lum * 0.25;
-        px[0] = (lum * 255.0 * WATER_TINT[0] * boost).min(255.0) as u8;
-        px[1] = (lum * 255.0 * WATER_TINT[1] * boost).min(255.0) as u8;
-        px[2] = (lum * 255.0 * WATER_TINT[2] * boost).min(255.0) as u8;
-        px[3] = 255;
+        let level = ((luminance_of(px) / mean) * NEUTRAL_MEAN * 255.0).clamp(0.0, 255.0) as u8;
+        px[0] = level;
+        px[1] = level;
+        px[2] = level;
     }
 }
 
-fn load_layer_by_index(layer: usize, pack_file: &str, fallback: [u8; 4]) -> Vec<u8> {
-    let mut data = match layer {
+/// Which texture layers are alpha-tested cutouts, as a bitmask the shader can index.
+///
+/// The shader needs this to know how to read a layer's alpha: for a cutout it is coverage (run
+/// the `discard`, tint the whole texel), for everything else it is the per-texel tint mask (no
+/// discard, blend towards the biome colour). Derived from the loaded pixels rather than
+/// hardcoding layer 7, so a pack shipping a cutout for some other block cannot desync the two.
+///
+/// Four `u32`s rather than a `u64` because WGSL uniforms pad to 16 bytes anyway; 128 bits covers
+/// the 36 layers with room to spare.
+/// The fragment shader's `TintUniform`: the biome palette followed by the cutout bitmask.
+///
+/// Laid out by hand rather than through a `#[repr(C)]` struct because the palette is a 166-entry
+/// array and the two members are both 16-byte aligned, so a flat concatenation already matches
+/// WGSL's uniform layout rules for `array<vec4<f32>, N>` + `vec4<u32>`.
+///
+/// Cost: **one ~2.7 KB uniform buffer for the whole world**, written once at startup. Biome
+/// colour adds no per-chunk, per-frame or per-vertex allocation anywhere — a quad carries an
+/// 8-bit index into this, packed into vertex bits that were already being paid for.
+fn create_tint_uniform(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layers: &[LoadedLayer],
+) -> wgpu::Buffer {
+    let palette = crate::biome_tint::palette();
+    let mut bytes: Vec<u8> = Vec::with_capacity(palette.len() * 16 + 16);
+    for entry in &palette {
+        bytes.extend_from_slice(bytemuck::cast_slice(entry));
+    }
+    bytes.extend_from_slice(bytemuck::cast_slice(&cutout_layer_mask(layers)));
+
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Biome Tint Uniform"),
+        size: bytes.len() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, &bytes);
+    buffer
+}
+
+pub fn cutout_layer_mask(layers: &[LoadedLayer]) -> [u32; 4] {
+    let mut mask = [0u32; 4];
+    for (index, layer) in layers.iter().enumerate().take(128) {
+        if layer.alpha_is_coverage {
+            mask[index / 32] |= 1 << (index % 32);
+        }
+    }
+    mask
+}
+
+fn load_layer_by_index(layer: usize, pack_file: &str, fallback: [u8; 4]) -> LoadedLayer {
+    let mut pixels = match layer {
         3 => load_grass_top_layer(fallback),
-        5 => load_raw_layer(pack_file, fallback),
-        7 => load_raw_layer(pack_file, fallback),
         _ => load_raw_layer(pack_file, fallback),
     };
+    // Whether alpha is a coverage stencil is decided from the layer as loaded, *before* any
+    // neutralisation rewrites it — afterwards a tint mask looks exactly like a stencil.
+    let mut alpha_is_coverage = is_cutout(&pixels);
     match layer {
-        5 => apply_water_tint(&mut data),
-        7 => apply_foliage_tint(&mut data),
+        // Grass top: wholly grass, so the whole tile takes the biome colour.
+        3 => {
+            neutralise_tintable_layer(&mut pixels, false);
+            alpha_is_coverage = false;
+        }
+        // Grass side: grass over dirt in one tile, so only its green texels are tinted and the
+        // rest keep their own colour. This is the layer that makes the flag necessary.
+        4 => {
+            neutralise_tintable_layer(&mut pixels, true);
+            alpha_is_coverage = false;
+        }
+        // Water: wholly tintable.
+        5 => {
+            neutralise_tintable_layer(&mut pixels, false);
+            alpha_is_coverage = false;
+        }
+        // Leaves: a cutout, so the mask cannot live in alpha — tinted uniformly instead.
+        7 => neutralise_cutout_colour(&mut pixels),
         _ => {}
     }
-    data
+    LoadedLayer { pixels, alpha_is_coverage }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -547,7 +715,7 @@ mod tests {
         }
         assert!(is_cutout(&base), "the fixture must take the cutout path");
 
-        let mips = build_mip_chain(&base);
+        let mips = build_mip_chain(&base, true);
         assert_eq!(mips.len(), BLOCK_MIP_LEVELS as usize);
         let base_coverage = 0.5; // exact, by construction
 
@@ -591,7 +759,7 @@ mod tests {
                 }
             }
         }
-        let mips = build_mip_chain(&base);
+        let mips = build_mip_chain(&base, true);
         let mut checked = 0usize;
         for (level, data) in mips.iter().enumerate().skip(1) {
             for px in data.chunks_exact(4).filter(|px| px[3] == 255) {
@@ -629,10 +797,25 @@ mod tests {
     }
 }
 
-pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> BlockTextureSet {
-    let mut layers = Vec::with_capacity(BLOCK_TEXTURE_FILES.len());
-    for (layer, pack_file) in BLOCK_TEXTURE_FILES.iter().enumerate() {
-        let fallback = match *pack_file {
+/// Load one block texture layer exactly as [`create_block_textures`] does — same file, same
+/// fallback colour, same neutralisation.
+///
+/// `pub` for `examples/diag_texture_probe`, which reproduces the fragment shader's colour maths
+/// on these bytes. Biome tint is generated art plus a colour table, and the only way to judge
+/// either is to look at the result; going through the real loader is what makes the dump
+/// trustworthy rather than an approximation of it.
+pub fn load_block_layer(layer: usize) -> LoadedLayer {
+    let pack_file = BLOCK_TEXTURE_FILES
+        .get(layer)
+        .copied()
+        .unwrap_or(BLOCK_TEXTURE_FILES[0]);
+    load_layer_by_index(layer, pack_file, fallback_for(pack_file))
+}
+
+/// Flat colour used when a pack does not ship a texture. Several of the parity generator's
+/// blocks are absent from this pack entirely and render as these.
+fn fallback_for(pack_file: &str) -> [u8; 4] {
+    match pack_file {
             "stone.png" => [128, 128, 128, 255],
             "dirt.png" => [120, 86, 58, 255],
             "grass_block_side.png" => [96, 131, 75, 255],
@@ -667,10 +850,21 @@ pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> Bloc
             "yellow_terracotta.png" => [186, 133, 35, 255],
             "brown_terracotta.png" => [77, 51, 36, 255],
             "red_terracotta.png" => [143, 61, 47, 255],
-            "light_gray_terracotta.png" => [135, 107, 98, 255],
-            _ => [255, 0, 255, 255],
-        };
-        layers.push(load_layer_by_index(layer, pack_file, fallback));
+        "light_gray_terracotta.png" => [135, 107, 98, 255],
+        // Birch/spruce bark: absent from this pack, so these are the operative colours rather
+        // than a last-resort magenta.
+        "birch_log.png" => [216, 214, 207, 255],
+        "spruce_log.png" => [88, 63, 34, 255],
+        "birch_leaves.png" => [128, 167, 85, 255],
+        "spruce_leaves.png" => [97, 130, 97, 255],
+        _ => [255, 0, 255, 255],
+    }
+}
+
+pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> BlockTextureSet {
+    let mut layers = Vec::with_capacity(BLOCK_TEXTURE_FILES.len());
+    for layer in 0..BLOCK_TEXTURE_FILES.len() {
+        layers.push(load_block_layer(layer));
     }
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -688,8 +882,11 @@ pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> Bloc
         view_formats: &[],
     });
 
-    for (layer, data) in layers.iter().enumerate() {
-        for (mip_level, mip_data) in build_mip_chain(data).into_iter().enumerate() {
+    for (layer, loaded) in layers.iter().enumerate() {
+        for (mip_level, mip_data) in build_mip_chain(&loaded.pixels, loaded.alpha_is_coverage)
+            .into_iter()
+            .enumerate()
+        {
             let mip_size = (TEX_SIZE >> mip_level).max(1);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -760,8 +957,20 @@ pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> Bloc
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
+
+    let tint_buffer = create_tint_uniform(device, queue, &layers);
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Block Texture Bind Group"),
@@ -774,6 +983,10 @@ pub fn create_block_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> Bloc
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: tint_buffer.as_entire_binding(),
             },
         ],
     });

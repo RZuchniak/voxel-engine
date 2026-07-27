@@ -13,9 +13,37 @@ use super::surface::{Block, SurfaceSystem};
 pub const MIN_Y: i32 = -64;
 pub const HEIGHT: i32 = 384;
 
+/// Quart cells along one horizontal chunk axis — biomes live on a 4-block lattice.
+pub const SURFACE_BIOME_AXIS: usize = 4;
+/// Entries in [`ChunkBlocks::surface_biomes`].
+pub const SURFACE_BIOME_CELLS: usize = SURFACE_BIOME_AXIS * SURFACE_BIOME_AXIS;
+
 /// A generated chunk: 16×16×384 blocks, indexed `[(y - MIN_Y) * 256 + z * 16 + x]`.
 pub struct ChunkBlocks {
     pub blocks: Vec<Block>,
+    /// The biome at each of the chunk's 4×4 quart columns, sampled **at that column's surface**,
+    /// indexed `[qz * 4 + qx]`. This is what drives grass/foliage/water tint in the renderer.
+    ///
+    /// Deliberately 2D and deliberately 16 entries. The full 3D grid is 4×4×96 = 1536 cells, and
+    /// filling it costs **9.4 ms/chunk on top of 37.6** (measured by `examples/bench_mc_chunk`,
+    /// whose `biome lookups only` line is exactly that grid) — a 25% tax on generation, which
+    /// lands directly on the loading screen. 16 cells is 1% of that, and most of them are already
+    /// resident in `BiomeCache` because the surface rules just queried them.
+    ///
+    /// What this gives up: cave biomes get their column's *surface* tint rather than their own
+    /// (nothing tintable is generated underground yet), and water does not change colour with
+    /// depth. Both are invisible today; if lush caves ever grow foliage, this becomes 3D.
+    pub surface_biomes: [&'static str; SURFACE_BIOME_CELLS],
+    /// `Heightmap.Types.WORLD_SURFACE` — one above the highest non-air block, **fluids
+    /// included**. Indexed `[lz * 16 + lx]`.
+    pub world_surface: [i32; 256],
+    /// `Heightmap.Types.OCEAN_FLOOR` — one above the highest non-air, **non-fluid** block.
+    ///
+    /// This is what trees are placed on (`PlacementUtils.HEIGHTMAP_OCEAN_FLOOR`), and the
+    /// difference from [`Self::world_surface`] is exactly the water depth that
+    /// `SurfaceWaterDepthFilter` rejects on. Both are "first free position above the surface"
+    /// (`Heightmap.getFirstAvailable` returns `y + 1`), not the surface block's own Y.
+    pub ocean_floor: [i32; 256],
 }
 
 impl ChunkBlocks {
@@ -210,7 +238,51 @@ fn generate_range(
         }
     }
 
-    ChunkBlocks { blocks }
+    // The tint grid. Sampled from the *same* `biome_cache` the surface rules just used, so a
+    // cell whose column had any solid block in it is already resident and costs a array index;
+    // only all-air/all-fluid columns (open ocean, sky) pay for a real lookup. 16 cells either
+    // way — see the note on `ChunkBlocks::surface_biomes` for why this is not the 3D grid.
+    let mut surface_biomes = [""; SURFACE_BIOME_CELLS];
+    for qz in 0..SURFACE_BIOME_AXIS {
+        for qx in 0..SURFACE_BIOME_AXIS {
+            let lx = qx * 4;
+            let lz = qz * 4;
+            // Clamp: a column with no solid block at all reads `MIN_Y - 1`, which is outside
+            // the world and would index the cache out of bounds.
+            let surface_y = heights[lz * 16 + lx].clamp(MIN_Y, MIN_Y + HEIGHT - 1);
+            surface_biomes[qz * SURFACE_BIOME_AXIS + qx] = biome_cache.get(
+                ow,
+                chunk_x * 16 + lx as i32,
+                surface_y,
+                chunk_z * 16 + lz as i32,
+            );
+        }
+    }
+
+    // The two heightmaps feature placement needs. Computed after surface rules so they see the
+    // finished column (grass/sand rather than the stone the density stage left).
+    let mut world_surface = [MIN_Y; 256];
+    let mut ocean_floor = [MIN_Y; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let column = lz * 16 + lx;
+            for y in (y_lo..=y_hi).rev() {
+                let block = blocks[ChunkBlocks::index(lx, y, lz)];
+                if block == Block::Air {
+                    continue;
+                }
+                if world_surface[column] == MIN_Y {
+                    world_surface[column] = y + 1;
+                }
+                if block != Block::Water && block != Block::Lava {
+                    ocean_floor[column] = y + 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    ChunkBlocks { blocks, surface_biomes, world_surface, ocean_floor }
 }
 
 /// `SteepMaterialCondition` — a 4-block height jump to a neighbour. Neighbour lookups are

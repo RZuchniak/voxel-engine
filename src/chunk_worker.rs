@@ -56,6 +56,7 @@ fn load_chunk(cx: i32, cz: i32) -> Result<ChunkWire, String> {
                     cx,
                     cz,
                     sections: Vec::new(),
+                    biomes: None,
                 };
             }
         };

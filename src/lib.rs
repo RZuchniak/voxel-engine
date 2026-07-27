@@ -4,6 +4,7 @@
 //! Modules migrate here incrementally — see the plan in
 //! `.claude/plans/` for the intended final layout.
 
+pub mod biome_tint;
 pub mod block;
 pub mod camera;
 pub mod cull;

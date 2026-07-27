@@ -47,10 +47,21 @@ impl Section {
     }
 }
 
+/// Quart cells along one horizontal chunk axis; see [`Chunk::biomes`].
+pub const BIOME_AXIS: usize = 4;
+pub const BIOME_CELLS: usize = BIOME_AXIS * BIOME_AXIS;
+
 #[derive(Clone)]
 pub struct Chunk {
     coord: (i32, i32),
     sections: Vec<Option<Section>>,
+    /// Biome index (into `biome_tint::BIOME_TINTS`) for each 4×4 quart column, `[qz * 4 + qx]`.
+    ///
+    /// **16 bytes per chunk**, against ~196 KB of block data — a rounding error, which is the
+    /// whole reason the tint grid is stored per column rather than per block. `None` when the
+    /// source did not supply biomes (the Anvil import path), in which case faces fall back to
+    /// [`crate::biome_tint::NEUTRAL`] and render exactly as they did before tinting existed.
+    biomes: Option<[u8; BIOME_CELLS]>,
 }
 
 impl Chunk {
@@ -58,11 +69,31 @@ impl Chunk {
         Self {
             coord,
             sections: (0..SECTION_COUNT).map(|_| None).collect(),
+            biomes: None,
         }
     }
 
     pub fn coord(&self) -> (i32, i32) {
         self.coord
+    }
+
+    pub fn set_biomes(&mut self, biomes: [u8; BIOME_CELLS]) {
+        self.biomes = Some(biomes);
+    }
+
+    pub fn biomes(&self) -> Option<&[u8; BIOME_CELLS]> {
+        self.biomes.as_ref()
+    }
+
+    /// The biome index covering a chunk-local column, or `None` if this chunk carries no biome
+    /// data. Out-of-range coordinates clamp rather than wrap: the mesher reads a chunk's
+    /// neighbours by world coordinate, and a wrap would tint a border quad with the colour from
+    /// the far side of the chunk.
+    pub fn biome_at_local(&self, local_x: i32, local_z: i32) -> Option<u8> {
+        let biomes = self.biomes.as_ref()?;
+        let qx = (local_x.clamp(0, SECTION_SIZE as i32 - 1) / 4) as usize;
+        let qz = (local_z.clamp(0, SECTION_SIZE as i32 - 1) / 4) as usize;
+        Some(biomes[qz * BIOME_AXIS + qx])
     }
 
     pub fn section(&self, section_index: usize) -> Option<&Section> {
@@ -193,6 +224,18 @@ impl World {
             return BlockId::AIR;
         };
         chunk.block_at_local(local_x, world_y, local_z)
+    }
+
+    /// The biome index at a world column, or `None` outside loaded chunks / for sources that do
+    /// not supply biomes. Horizontal only — see [`Chunk::biomes`].
+    pub fn biome_at(&self, world_x: i32, world_z: i32) -> Option<u8> {
+        let chunk_x = world_x.div_euclid(SECTION_SIZE as i32);
+        let chunk_z = world_z.div_euclid(SECTION_SIZE as i32);
+        let local_x = world_x.rem_euclid(SECTION_SIZE as i32);
+        let local_z = world_z.rem_euclid(SECTION_SIZE as i32);
+        self.chunks
+            .get(&(chunk_x, chunk_z))?
+            .biome_at_local(local_x, local_z)
     }
 
     #[allow(dead_code)]

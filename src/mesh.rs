@@ -1,7 +1,8 @@
 use crate::{
-    block::Face,
+    biome_tint::{self, TintKind},
+    block::{BlockId, Face},
     Vertex,
-    world::{MIN_SECTION_Y, SECTION_SIZE, World},
+    world::{BIOME_AXIS, BIOME_CELLS, MIN_SECTION_Y, SECTION_SIZE, World},
 };
 
 pub struct MeshData {
@@ -96,12 +97,66 @@ impl Direction {
     }
 }
 
-/// The vertex `light` word is `ao | face_shade_index << FACE_SHADE_SHIFT`: the low byte is the
-/// interpolated per-vertex occlusion, the next two bits pick the flat per-face brightness. Packed
-/// into the existing `u32` attribute so this costs no extra vertex bandwidth — `square.wgsl`
-/// unpacks both halves and must agree with these constants.
+/// The vertex `light` word packs three independent things into one existing `u32` attribute, so
+/// none of them costs any extra vertex bandwidth. `square.wgsl` unpacks all three and must agree
+/// with these constants.
+///
+/// | bits | meaning |
+/// |---|---|
+/// | 0..7 | per-vertex ambient occlusion, interpolated |
+/// | 8..9 | face direction → vanilla's fixed per-face brightness, flat |
+/// | 10..17 | biome tint palette index (`biome_tint::palette_index`), flat |
+/// | 18..31 | free |
+///
+/// Packing the tint here rather than adding a vertex attribute is the reason biome colour is
+/// free at render time: `Vertex` stays 28 bytes, so resident mesh memory and upload bandwidth
+/// are unchanged (a 4th attribute would have been +14%).
 pub const FACE_SHADE_SHIFT: u32 = 8;
 pub const AO_MASK: u32 = 0xFF;
+pub const TINT_SHIFT: u32 = 10;
+pub const TINT_MASK: u32 = 0xFF;
+
+/// A chunk's 4×4 biome grid, resolved once per meshing pass.
+///
+/// Every tint query the mesher makes is for a block **inside** the chunk being meshed — the
+/// greedy growth loops never step outside the section, and the neighbour reads that do
+/// (`wx + ox`) are for face culling, not colour. So the grid can be fetched once and indexed
+/// directly, and tinting adds **no per-cell hash lookups** to the mesher's hot loop.
+#[derive(Clone, Copy)]
+struct ChunkTints {
+    biomes: Option<[u8; BIOME_CELLS]>,
+}
+
+impl ChunkTints {
+    fn for_chunk(world: &World, chunk_coord: (i32, i32)) -> Self {
+        Self {
+            biomes: world.chunk(chunk_coord).and_then(|c| c.biomes().copied()),
+        }
+    }
+
+    /// The palette index for a face of `block` at a chunk-local column.
+    ///
+    /// Returns [`biome_tint::NEUTRAL`] for untinted blocks *without touching the biome grid* —
+    /// which is what keeps a run of stone from breaking into separate quads at a biome boundary,
+    /// and is why the quad-count cost of this feature is confined to grass, leaves and water.
+    #[inline]
+    fn index(self, block: BlockId, face: Face, local_x: usize, local_z: usize) -> u8 {
+        let kind = block.tint(face);
+        if kind == TintKind::None {
+            return biome_tint::NEUTRAL;
+        }
+        let biome = match self.biomes {
+            Some(biomes) => biomes[(local_z / 4) * BIOME_AXIS + (local_x / 4)],
+            // A source with no biome grid — the Anvil zip import — must still get a *colour*.
+            // Falling through to NEUTRAL here would be white, and since the tintable layers are
+            // now neutralised to grayscale (`texture::neutralise_tintable_layer`) that renders
+            // imported worlds with grey grass, grey leaves and grey water. The default biome
+            // reproduces the single global green/blue those layers used to have baked in.
+            None => biome_tint::DEFAULT_BIOME,
+        };
+        biome_tint::palette_index(biome, kind)
+    }
+}
 
 #[inline]
 fn unpack_coords(
@@ -218,6 +273,7 @@ fn mesh_direction(
     let world_chunk_x = chunk_coord.0 * SECTION_SIZE as i32;
     let world_chunk_z = chunk_coord.1 * SECTION_SIZE as i32;
     let section_world_y = (section_index as i32 + MIN_SECTION_Y) * SECTION_SIZE as i32;
+    let tints = ChunkTints::for_chunk(world, chunk_coord);
 
     for primary in 0usize..SECTION_SIZE {
         let mut merged = [[false; SECTION_SIZE]; SECTION_SIZE];
@@ -270,6 +326,7 @@ fn mesh_direction(
                     _ => Face::Side,
                 };
                 let tex_layer = block.texture_layer(face);
+                let tint = tints.index(block, face, sx, sz);
 
                 let mut width = 1usize;
                 while secondary + width < SECTION_SIZE && !merged[secondary + width][tertiary] {
@@ -286,6 +343,12 @@ fn mesh_direction(
                     let nwz = world_chunk_z + nz as i32;
                     let nblock = world.block_at(nwx, nwy, nwz);
                     if nblock != block {
+                        break;
+                    }
+                    // Colour is part of a quad's identity: merging across a biome boundary would
+                    // paint one biome's grass with the neighbour's colour. Free for untinted
+                    // blocks, which both sides resolve to NEUTRAL.
+                    if tints.index(nblock, face, nx, nz) != tint {
                         break;
                     }
                     let nneighbor = world.block_at(nwx + ox, nwy + oy, nwz + oz);
@@ -319,6 +382,9 @@ fn mesh_direction(
                         if nblock != block {
                             break 'grow;
                         }
+                        if tints.index(nblock, face, nx, nz) != tint {
+                            break 'grow;
+                        }
                         let nneighbor = world.block_at(nwx + ox, nwy + oy, nwz + oz);
                         if nneighbor == nblock {
                             break 'grow;
@@ -349,6 +415,7 @@ fn mesh_direction(
                     width,
                     height,
                     tex_layer,
+                    tint,
                     world_chunk_x as f32,
                     section_world_y as f32,
                     world_chunk_z as f32,
@@ -375,6 +442,7 @@ fn emit_quad(
     width: usize,
     height: usize,
     tex_layer: u32,
+    tint: u8,
     base_x: f32,
     base_y: f32,
     base_z: f32,
@@ -422,7 +490,7 @@ fn emit_quad(
         }
         let shade = (255u32.saturating_sub(occluders * 28)).max(72);
         debug_assert!(shade <= AO_MASK, "AO must fit the low byte of the light word");
-        shade | (dir.shade_index() << FACE_SHADE_SHIFT)
+        shade | (dir.shade_index() << FACE_SHADE_SHIFT) | ((tint as u32) << TINT_SHIFT)
     };
     let v = |position: [f32; 3], uv: [f32; 2]| Vertex {
         position,
