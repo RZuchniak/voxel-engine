@@ -2,8 +2,34 @@ use std::collections::VecDeque;
 
 use cgmath::{InnerSpace, Matrix, Matrix4, Vector3, Vector4};
 
+use crate::block::BlockId;
 use crate::visibility::{Facing, VisibilitySet, FACINGS};
-use crate::world::SECTION_COUNT;
+use crate::world::{MIN_SECTION_Y, SECTION_COUNT, SECTION_SIZE};
+
+/// Which vertical section a world Y falls in, and whether it had to be clamped to reach one.
+///
+/// The world is only `-64..320`, so a noclipping camera can leave it in either direction. Clamping
+/// is the only sane thing to do with the index, but the caller must know it happened — see
+/// [`smart_cull_from_camera`].
+pub fn camera_section_index(world_y: i32) -> (usize, bool) {
+    let raw = world_y.div_euclid(SECTION_SIZE as i32) - MIN_SECTION_Y;
+    let clamped = raw.clamp(0, SECTION_COUNT as i32 - 1);
+    (clamped as usize, raw != clamped)
+}
+
+/// Should the walk apply vanilla's `smartCull` restrictions, given where the camera is?
+///
+/// Dropped when **the camera is inside an opaque full cube**: it sits in a cell no sightline leaves,
+/// so the walk dies after the six solid neighbours and the world renders empty. Vanilla gates on the
+/// same condition (`LevelRenderer.setupRender`: `isSolidRender` ⇒ `flag = false`). With it false the
+/// walk degrades to a plain frustum flood fill, which the caller's `admits` test still bounds.
+///
+/// Note the camera being *outside the world* is a different problem with a different fix — it is
+/// where the walk **starts** that is wrong there, not what it may step through. See
+/// `SectionGraph::walk`'s `seed_whole_layer`.
+pub fn smart_cull_from_camera(camera_block: BlockId) -> bool {
+    !(camera_block.is_opaque() && camera_block.is_full_cube())
+}
 
 /// View-projection frustum for axis-aligned bounding box tests.
 pub struct Frustum {
@@ -140,6 +166,7 @@ impl SectionGraph {
         origin: SectionKey,
         radius: i32,
         smart_cull: bool,
+        seed_whole_layer: bool,
         visibility: impl Fn(SectionKey) -> VisibilitySet,
         admits: impl Fn(SectionKey) -> bool,
         mut visit: impl FnMut(SectionKey),
@@ -159,16 +186,62 @@ impl SectionGraph {
         if origin.1 >= SECTION_COUNT {
             return;
         }
-        if let Some(slot) = self.slot(origin_chunk, origin) {
-            self.state[slot] = REACHED;
+        if seed_whole_layer {
+            // The camera is outside the world vertically, so `origin` is a *clamped* section — the
+            // bedrock slab below, or the top slice above. Seeding one section there cannot work:
+            // from under the world the slab's nearby sections are steeply overhead and fail the
+            // frustum, and a rejected section stops the flood from ever reaching the far sections
+            // that genuinely are in view. The symptom is that the world only appears once you look
+            // up sharply enough to bring the nearby sections into the frustum.
+            //
+            // Vanilla seeds the whole layer for exactly this case
+            // (`SectionOcclusionGraph.initializeQueueForFullUpdate`). Connectivity still applies
+            // from each seed onwards, so this widens where the walk *starts*, not what it admits.
+            //
+            // Each seed is entered through the face nearest the camera, travelling inward — from
+            // below the world you enter the bedrock layer through its bottom and head up. That
+            // matters: `entered_by: None` (what the camera's own section gets) waives the
+            // connectivity test entirely, which would step out of every seed in all six directions
+            // and pull in a whole extra layer of sections nothing can see.
+            let travelling = if origin.1 == 0 {
+                Facing::PosY
+            } else {
+                Facing::NegY
+            };
+            for dx in -radius..=radius {
+                for dz in -radius..=radius {
+                    let key: SectionKey =
+                        ((origin_chunk.0 + dx, origin_chunk.1 + dz), origin.1);
+                    let Some(slot) = self.slot(origin_chunk, key) else {
+                        continue;
+                    };
+                    if self.state[slot] != UNSEEN {
+                        continue;
+                    }
+                    if !admits(key) {
+                        self.state[slot] = REJECTED;
+                        continue;
+                    }
+                    self.state[slot] = REACHED;
+                    self.queue.push_back(Node {
+                        key,
+                        entered_by: Some(travelling.opposite()),
+                        steps_taken: 1 << travelling.opposite().index(),
+                    });
+                }
+            }
+        } else {
+            if let Some(slot) = self.slot(origin_chunk, origin) {
+                self.state[slot] = REACHED;
+            }
+            // The camera's own section is always drawn and always traversable in every direction:
+            // there is no face we entered it by, and the camera may well be inside solid rock.
+            self.queue.push_back(Node {
+                key: origin,
+                entered_by: None,
+                steps_taken: 0,
+            });
         }
-        // The camera's own section is always drawn and always traversable in every direction:
-        // there is no face we entered it by, and the camera may well be inside solid rock.
-        self.queue.push_back(Node {
-            key: origin,
-            entered_by: None,
-            steps_taken: 0,
-        });
 
         while let Some(node) = self.queue.pop_front() {
             visit(node.key);
@@ -300,7 +373,7 @@ mod tests {
     ) -> std::collections::HashSet<SectionKey> {
         let mut graph = SectionGraph::new();
         let mut seen = std::collections::HashSet::new();
-        graph.walk(origin, radius, true, visibility, |_| true, |key| {
+        graph.walk(origin, radius, true, false, visibility, |_| true, |key| {
             seen.insert(key);
         });
         seen
@@ -410,6 +483,7 @@ mod tests {
             ((0, 0), 12),
             3,
             true,
+            false,
             |_| VisibilitySet::EMPTY,
             |key| key.0.0 >= 0,
             |key| {
@@ -438,13 +512,88 @@ mod tests {
 
         let mut graph = SectionGraph::new();
         let mut seen = std::collections::HashSet::new();
-        graph.walk(origin, radius, false, solid_world, |_| true, |key| {
+        graph.walk(origin, radius, false, false, solid_world, |_| true, |key| {
             seen.insert(key);
         });
         assert_eq!(
             seen.len(),
             ((2 * radius + 1) * (2 * radius + 1)) as usize * SECTION_COUNT,
             "without smart culling every admitted section is reached, rock or not"
+        );
+    }
+
+    /// Leaving the world vertically must be detected, so the caller can seed the whole layer.
+    ///
+    /// The camera block down in the void is **air**, so the inside-rock test cannot notice this —
+    /// which is why it needs its own signal rather than being folded into `smart_cull`.
+    #[test]
+    fn leaving_the_world_vertically_is_detected() {
+        assert!(
+            !BlockId::AIR.is_opaque(),
+            "the void reads as air, which is why the inside-rock test misses this"
+        );
+        assert!(smart_cull_from_camera(BlockId::AIR));
+        assert!(!smart_cull_from_camera(BlockId::STONE));
+
+        // Inside the world, nothing is clamped.
+        assert_eq!(camera_section_index(100).1, false);
+        assert_eq!(camera_section_index(-64).1, false, "lowest block in the world");
+        assert_eq!(camera_section_index(319).1, false, "highest block in the world");
+
+        // Outside it, in either direction, and clamped to the near layer.
+        assert_eq!(camera_section_index(-65), (0, true), "clamps to the bedrock layer");
+        assert_eq!(camera_section_index(-80), (0, true));
+        assert_eq!(camera_section_index(320), (SECTION_COUNT - 1, true));
+        assert_eq!(camera_section_index(400), (SECTION_COUNT - 1, true));
+    }
+
+    /// Below bedrock the walk must start from the whole layer, not the one clamped section.
+    ///
+    /// Reported as "below bedrock the bedrock only renders in my current chunk and the adjacent
+    /// ones", and then more precisely: it appears only once you look up past roughly 30°. That angle
+    /// is the tell. The slab is directly *overhead*, so its nearby sections fall outside a 45° fov
+    /// and fail the frustum — and **a frustum-rejected section stops the flood from reaching the far
+    /// sections behind it**, which are the ones actually in view at a shallow angle. Widening the
+    /// seed is the fix; `smart_cull` is a different question and stays on.
+    ///
+    /// Modelled here with an `admits` that rejects everything near the origin, exactly as the
+    /// frustum does when the slab is overhead, and solid rock everywhere so connectivity alone can
+    /// never carry the walk outward.
+    #[test]
+    fn seeding_the_whole_layer_reaches_sections_the_origin_cannot() {
+        let solid = |_: SectionKey| VisibilitySet::OPAQUE;
+        // Only sections at least 2 chunks away in x are "in the frustum".
+        let admits = |key: SectionKey| key.0.0.abs() >= 2;
+        let far: SectionKey = ((3, 0), 0);
+
+        let mut graph = SectionGraph::new();
+        let mut seen = std::collections::HashSet::new();
+        graph.walk(((0, 0), 0), 4, true, false, solid, admits, |key| {
+            seen.insert(key);
+        });
+        assert!(
+            !seen.contains(&far),
+            "single-section seeding cannot escape the rejected ring — this is the bug"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        graph.walk(((0, 0), 0), 4, true, true, solid, admits, |key| {
+            seen.insert(key);
+        });
+        assert!(
+            seen.contains(&far),
+            "seeding the layer must reach the visible far sections"
+        );
+        assert!(graph.reached(far));
+        // Still bounded by `admits` — seeding wider must not become "draw everything".
+        assert!(
+            seen.iter().all(|key| key.0.0.abs() >= 2),
+            "the frustum test must still prune the seeds"
+        );
+        // And it seeds only the one layer; connectivity is solid, so nothing else is reachable.
+        assert!(
+            seen.iter().all(|key| key.1 == 0),
+            "only the clamped layer is seeded"
         );
     }
 
@@ -457,6 +606,7 @@ mod tests {
         graph.walk(
             ((0, 0), 12),
             3,
+            false,
             false,
             |_| VisibilitySet::OPAQUE,
             |key| key.0.0 >= 0,

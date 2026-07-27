@@ -72,6 +72,24 @@ impl BlockId {
         self.info().is_full_cube
     }
 
+    /// Does this block hide the face of the neighbour behind it?
+    ///
+    /// Deliberately **not** `is_opaque`, which also governs sight lines in the occlusion graph and
+    /// the per-vertex lighting. Face culling needs its own answer, because whether a face is
+    /// *visible* and whether a block *transmits light* are different questions:
+    ///
+    /// - **Fluids do not occlude.** Water and lava have to let the block they touch draw its face,
+    ///   or the boundary is left with no surface at all.
+    /// - **Cutouts do not occlude.** Leaves have holes; culling behind them shows the sky.
+    /// - **Ice does occlude**, despite not being `is_opaque` — see [`info_solid_looking`].
+    ///
+    /// Overloading `is_opaque` for this is what produced two separate reported bugs: leaves
+    /// deleting the ground's face, and water z-fighting against ice.
+    #[inline]
+    pub fn occludes_faces(self) -> bool {
+        self.info().occludes_faces
+    }
+
     #[inline]
     pub fn texture_layer(self, face: Face) -> u32 {
         let tex = self.info().textures;
@@ -88,6 +106,9 @@ pub struct BlockInfo {
     pub name: &'static str,
     pub is_full_cube: bool,
     pub is_opaque: bool,
+    /// See [`BlockId::occludes_faces`]. Defaults to `is_opaque`; only [`info_solid_looking`]
+    /// separates them.
+    pub occludes_faces: bool,
     pub textures: [u32; 3], // top, bottom, side
 }
 
@@ -96,6 +117,23 @@ const fn info(name: &'static str, full: bool, opaque: bool, textures: [u32; 3]) 
         name,
         is_full_cube: full,
         is_opaque: opaque,
+        occludes_faces: opaque,
+        textures,
+    }
+}
+
+/// A full cube that is drawn solid but is not light-opaque, so it hides its neighbour's face while
+/// still letting sight lines through the occlusion graph.
+///
+/// Ice is the only such block today. **Nothing blends in this renderer** (`BlendState::REPLACE`), so
+/// ice rasterises as a solid cube whatever its alpha says; if it did not occlude, it and the water
+/// beside it would each emit a face on their shared plane and the two would z-fight.
+const fn info_solid_looking(name: &'static str, textures: [u32; 3]) -> BlockInfo {
+    BlockInfo {
+        name,
+        is_full_cube: true,
+        is_opaque: false,
+        occludes_faces: true,
         textures,
     }
 }
@@ -125,7 +163,7 @@ pub static BLOCK_TABLE: &[BlockInfo] = &[
     info("snow_block", true, true, [14, 14, 14]),
     info("netherrack", true, true, [15, 15, 15]),
     info("end_stone", true, true, [16, 16, 16]),
-    info("ice", true, false, [17, 17, 17]),
+    info_solid_looking("ice", [17, 17, 17]),
     // `mc::chunk` palette. Lava is non-opaque so it glows through like water does.
     info("lava", true, false, [18, 18, 18]),
     info("sandstone", true, true, [19, 19, 19]),

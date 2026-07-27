@@ -1366,23 +1366,17 @@ impl State {
         // the walk, 1500-1780 without).
         let occlusion_culling = platform::section_occlusion_culling();
         if occlusion_culling && self.world_ready {
-            let camera_section = ((self.camera.position().y.floor() as i32)
-                .div_euclid(SECTION_SIZE as i32)
-                - MIN_SECTION_Y)
-                .clamp(0, SECTION_COUNT as i32 - 1) as usize;
             let cp = self.camera.position();
+            let camera_y = cp.y.floor() as i32;
+            // `outside_world` means the section index had to be clamped, so the origin is not where
+            // the camera is — flying under bedrock or over the build limit. That calls for seeding
+            // the whole layer rather than for dropping connectivity; see `SectionGraph::walk`.
+            let (camera_section, camera_outside_world) = cull::camera_section_index(camera_y);
             let camera_origin = cgmath::Vector3::new(cp.x, cp.y, cp.z);
-            // The camera noclips, so it spends most of its time underground *inside stone*.
-            // Connectivity says nothing there — the eye is in a cell no sightline leaves, and
-            // the walk dies after the camera's six solid neighbours, drawing an empty world.
-            // Vanilla drops smart culling for exactly this case; the walk becomes a plain
-            // frustum flood fill and the caves in range are drawn.
-            let camera_block = self._world.block_at(
-                cp.x.floor() as i32,
-                cp.y.floor() as i32,
-                cp.z.floor() as i32,
-            );
-            let smart_cull = !(camera_block.is_opaque() && camera_block.is_full_cube());
+            let camera_block =
+                self._world
+                    .block_at(cp.x.floor() as i32, camera_y, cp.z.floor() as i32);
+            let smart_cull = cull::smart_cull_from_camera(camera_block);
             self.smart_cull_last_frame = smart_cull;
             let graph = &mut self.section_graph;
             let visibility_map = &self.chunk_visibility;
@@ -1391,6 +1385,7 @@ impl State {
                 ((player_chunk_x, player_chunk_z), camera_section),
                 draw_radius,
                 smart_cull,
+                camera_outside_world,
                 |key| {
                     visibility_map
                         .get(&key.0)

@@ -217,6 +217,72 @@ fn leaves_do_not_cull_the_face_of_an_adjacent_solid_block() {
     );
 }
 
+/// A boundary between two different see-through full cubes must carry exactly one face.
+///
+/// Reported as water and ice "fighting" where they touch, resolving in the water's favour as you
+/// approach — the signature of z-fighting. Both were non-opaque full cubes, so neither culled the
+/// other, and both are emitted double-sided: four quads on one plane, two of them visible.
+///
+/// Ice now occludes (`info_solid_looking`), which handles water↔ice the way vanilla does — the ice
+/// face survives and the water's is culled. The `block.0 > neighbour.0` tie-break in the mesher
+/// covers the pairs where *neither* occludes, such as water↔lava.
+#[test]
+fn two_see_through_blocks_share_exactly_one_face() {
+    for (a, b) in [
+        (BlockId::WATER, BlockId::ICE),
+        (BlockId::WATER, BlockId::LAVA),
+        (BlockId::OAK_LEAVES, BlockId::WATER),
+    ] {
+        let mut world = World::new();
+        world.insert_chunk(solid_chunk((0, 0), a));
+        world.insert_chunk(solid_chunk((1, 0), b));
+
+        // The shared plane is x = 16. Count front faces there from either chunk; the double-sided
+        // reversed copies sit 0.002 inside their own block, so they are not on the plane itself.
+        let mut on_plane = 0usize;
+        for coord in [(0, 0), (1, 0)] {
+            for (_, mesh) in mesh_chunk(&world, coord) {
+                for quad in mesh.vertices().chunks_exact(4) {
+                    if quad.iter().all(|v| v.position[0] == SECTION_SIZE as f32) {
+                        on_plane += 1;
+                    }
+                }
+            }
+        }
+        let a_name = a.info().name;
+        let b_name = b.info().name;
+        assert_eq!(
+            on_plane, 1,
+            "{a_name} against {b_name} put {on_plane} coplanar faces on x=16; \
+             two of them is the z-fighting that was reported"
+        );
+    }
+}
+
+/// An opaque block beside a see-through one must keep its face — the tie-break must not reach it.
+#[test]
+fn the_see_through_tie_break_never_culls_an_opaque_face() {
+    let mut world = World::new();
+    world.insert_chunk(solid_chunk((0, 0), BlockId::STONE));
+    world.insert_chunk(solid_chunk((1, 0), BlockId::WATER));
+
+    let mut on_plane = 0usize;
+    for (_, mesh) in mesh_chunk(&world, (0, 0)) {
+        for quad in mesh.vertices().chunks_exact(4) {
+            if quad.iter().all(|v| v.position[0] == SECTION_SIZE as f32) {
+                on_plane += 1;
+            }
+        }
+    }
+    // Stone's id is lower than water's, so an id-only rule would happen to keep this face; the
+    // point is that stone occludes, so the tie-break must not consider it at all.
+    assert_eq!(on_plane, 1, "stone's face against water must survive");
+    assert!(
+        BlockId::STONE.occludes_faces() && !BlockId::WATER.occludes_faces(),
+        "the premise of this test"
+    );
+}
+
 /// A fluid's reversed copy is the one face allowed off the lattice — inward, never outward.
 ///
 /// Outward is what tore the convex edges open (see above). Inward only moves the face towards a

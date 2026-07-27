@@ -116,6 +116,9 @@ fn main() {
                 origin,
                 radius,
                 mode,
+                // Every camera this diagnostic uses is inside the world, so the layer-seeding path
+                // (for a camera under bedrock or over the build limit) is not exercised here.
+                false,
                 |key| {
                     visibility
                         .get(&key.0)

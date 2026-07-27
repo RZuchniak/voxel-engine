@@ -249,7 +249,18 @@ fn mesh_direction(
                 if neighbor == block {
                     continue;
                 }
-                if neighbor.is_full_cube() && neighbor.is_opaque() {
+                if neighbor.is_full_cube() && neighbor.occludes_faces() {
+                    continue;
+                }
+                // Two *different* non-occluding full cubes share a plane, and both are emitted
+                // double-sided, so without a tie-break each draws a face there and the pair
+                // z-fights — a shimmer that resolves in the nearer block's favour as you approach.
+                // Culling the higher id is deterministic and view-independent, and leaves exactly
+                // one face, which being double-sided still reads correctly from both sides.
+                //
+                // Only reachable when the neighbour does not occlude (the test above returned) and
+                // this block does not either — so it never touches an opaque block's face.
+                if neighbor.is_full_cube() && !block.occludes_faces() && block.0 > neighbor.0 {
                     continue;
                 }
 
