@@ -6,6 +6,7 @@ Every block texture this engine renders comes from the resource pack in `resourc
 
 Compiled and largely reworked by **@drathmorgh**.
 
+- Pack page: https://www.planetminecraft.com/texture-pack/nebula-5609045/
 - https://twitch.tv/drathmorgh
 - https://patreon.com/drathmorgh
 - https://streamelements.com/drathmorgh/tip

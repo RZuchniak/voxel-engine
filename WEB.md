@@ -29,20 +29,20 @@ Open `http://127.0.0.1:8080`. Use the startup menu to:
 
 Seed mode builds procedural overworld-style terrain for flying around. Prefer zip import when you want to view a specific saved world as stored on disk.
 
-Example zip layout:
+Example zip layout (folder name is arbitrary):
 
 ```
-Basic_World/
+MyWorld/
   region/
     r.0.0.mca
     r.0.-1.mca
     ...
 ```
 
-Zip your `saves/Basic_World` folder on Windows:
+On Windows, zip a world folder that contains `region/`:
 
 ```powershell
-Compress-Archive -Path saves/Basic_World -DestinationPath Basic_World.zip
+Compress-Archive -Path path\to\MyWorld -DestinationPath MyWorld.zip
 ```
 
 ## Production build

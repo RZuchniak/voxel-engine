@@ -21,11 +21,5 @@ terrain_preview_*.png
 # Keep the unpacked upstream archive out of history (46 MB).
 /Nebula*.zip
 
-# Personal / runtime junk from Anvil saves — keep region/ + level.dat, not player identity.
-saves/**/playerdata/
-saves/**/advancements/
-saves/**/stats/
-saves/**/session.lock
-saves/**/lunar_hosted_world_data.json
-saves/**/level.dat_old
-saves/**/save.zip
+# Local Anvil worlds for zip-import testing — never commit saves.
+/saves/

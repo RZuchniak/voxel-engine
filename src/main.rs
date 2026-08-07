@@ -43,7 +43,6 @@ use voxel_engine::{
 use voxel_engine::{OPENGL_TO_WGPU_MATRIX, Vertex};
 
 #[cfg(not(target_arch = "wasm32"))]
-use voxel_engine::source::AnvilSource;
 use streamer::ChunkStreamer;
 use voxel_engine::world::{MIN_SECTION_Y, SECTION_COUNT, SECTION_SIZE, World};
 
@@ -1798,18 +1797,19 @@ impl ApplicationHandler for App {
         );
         #[cfg(not(target_arch = "wasm32"))]
         {
-        // `VOXEL_SEED=<seed>` uses the procedural overworld generator; without it,
-        // load the bundled save.
-        let world_source: Arc<dyn source::WorldSource> = match std::env::var("VOXEL_SEED")
+        // Procedural overworld from `VOXEL_SEED`, or a fixed demo seed when unset.
+        const DEMO_SEED: i64 = 6954908675375307936;
+        let seed = std::env::var("VOXEL_SEED")
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
-        {
-            Some(seed) => {
-                println!("generating world from seed {seed}");
-                Arc::new(source::SeededProceduralSource::new(seed))
-            }
-            None => Arc::new(AnvilSource::new("saves/Basic_World")),
-        };
+            .unwrap_or(DEMO_SEED);
+        if std::env::var_os("VOXEL_SEED").is_none() {
+            println!("VOXEL_SEED unset — using demo seed {seed}");
+        } else {
+            println!("generating world from seed {seed}");
+        }
+        let world_source: Arc<dyn source::WorldSource> =
+            Arc::new(source::SeededProceduralSource::new(seed));
         let mut state = pollster::block_on(State::new(window.clone(), world_source));
         let window = Arc::clone(&state.window);
         state.window.set_maximized(true);
