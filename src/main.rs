@@ -42,7 +42,6 @@ use voxel_engine::{
 };
 use voxel_engine::{OPENGL_TO_WGPU_MATRIX, Vertex};
 
-#[cfg(not(target_arch = "wasm32"))]
 use streamer::ChunkStreamer;
 use voxel_engine::world::{MIN_SECTION_Y, SECTION_COUNT, SECTION_SIZE, World};
 
