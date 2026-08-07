@@ -34,12 +34,10 @@ pub trait WorldSource: Send + Sync {
     }
 }
 
-/// A world generated from a real Minecraft seed, using the bit-parity generator in
-/// [`crate::mc`]. This is the project's whole point: type in your seed, see your world.
+/// Procedural world from a numeric seed, using the overworld generator in [`crate::mc`].
 ///
-/// Costs roughly 45 ms per chunk (vs ~1 ms for the old approximate [`TerrainGenerator`]),
-/// which is the price of matching the real game. Generation is deterministic, so workers
-/// are handed the seed rather than chunk data.
+/// Costs roughly 45 ms per chunk (vs ~1 ms for the old approximate [`TerrainGenerator`]).
+/// Generation is deterministic, so workers are handed the seed rather than chunk data.
 pub struct SeededProceduralSource {
     seed: i64,
     overworld: crate::mc::overworld::Overworld,

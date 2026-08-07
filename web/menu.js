@@ -136,7 +136,7 @@ function normalizeSeedForWasm(seedBigInt) {
 async function generateFromSeed(set_world_from_seed) {
     const parsed = parseSeed(seedInput.value);
     if (parsed === null) {
-        setError("Enter a seed (number or text, like Minecraft).");
+        setError("Enter a seed (number or text).");
         return;
     }
     setError("");

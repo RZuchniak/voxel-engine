@@ -2,6 +2,8 @@
 
 The web build runs in the browser via **WebGPU** (Chrome/Edge recommended).
 
+**Notice:** Voxel Engine is an unofficial, non-commercial fan project. It is not affiliated with, endorsed by, or a substitute for Mojang Studios or Microsoft. Minecraft is a trademark of Mojang Synergies AB. Do not present this app as an official Minecraft product.
+
 ## Prerequisites
 
 - Rust toolchain with `wasm32-unknown-unknown` target:
@@ -21,11 +23,11 @@ trunk serve --open
 
 Open `http://127.0.0.1:8080`. Use the startup menu to:
 
-1. **Generate from seed** (recommended) — enter a number or text seed (text uses Java's `String.hashCode`, like Minecraft) and click **Generate world**. Same seed always produces the same terrain. Loads instantly; no zip or workers required.
-2. **Upload** a `.zip` of a Java world save folder (must contain `region/r.*.*.mca` files)
+1. **Generate from seed** (recommended) — enter a number or text seed (text seeds use a Java-style `String.hashCode`) and click **Generate world**. Same seed always produces the same terrain. Loads instantly; no zip or workers required.
+2. **Upload** a `.zip` of an Anvil-format world save folder (must contain `region/r.*.*.mca` files)
 3. **Load from URL** — the zip must be hosted with CORS enabled
 
-Seed mode uses Minecraft-style Perlin noise (low/high/selector octaves, sea level 63, oceans, beaches). It is **not** identical to Minecraft Java world generation — use zip import for real saves.
+Seed mode builds procedural overworld-style terrain for flying around. Prefer zip import when you want to view a specific saved world as stored on disk.
 
 Example zip layout:
 

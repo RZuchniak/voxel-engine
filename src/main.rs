@@ -1028,6 +1028,17 @@ impl State {
             // loads that then have to be generated all over again.
             request_budget = 0;
         }
+        // Same idea on the worker side: once the job queue is near capacity, further requests
+        // only return false (see `streamer::request_chunk`) and burn the frame's request loop.
+        // Stop asking until workers drain — this is what used to overflow into sync main-thread
+        // generation and freeze the tab for seconds while flying.
+        #[cfg(target_arch = "wasm32")]
+        if let Some((_ready, _total, queued, in_flight)) = self.streamer.worker_status() {
+            let cap = platform::max_worker_job_queue();
+            if queued + in_flight >= cap.saturating_sub(request_budget.max(1)) {
+                request_budget = 0;
+            }
+        }
         for (coord, _, _) in desired.iter().copied() {
             if request_budget == 0 {
                 break;
@@ -1787,14 +1798,14 @@ impl ApplicationHandler for App {
         );
         #[cfg(not(target_arch = "wasm32"))]
         {
-        // `VOXEL_SEED=<seed>` previews a real Minecraft world from its seed via the
-        // parity generator; without it, load the bundled save.
+        // `VOXEL_SEED=<seed>` uses the procedural overworld generator; without it,
+        // load the bundled save.
         let world_source: Arc<dyn source::WorldSource> = match std::env::var("VOXEL_SEED")
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
         {
             Some(seed) => {
-                println!("generating world from seed {seed} (Minecraft-parity generator)");
+                println!("generating world from seed {seed}");
                 Arc::new(source::SeededProceduralSource::new(seed))
             }
             None => Arc::new(AnvilSource::new("saves/Basic_World")),

@@ -1,11 +1,12 @@
-//! Bit-exact reimplementation of Minecraft 1.18+ (Caves & Cliffs) Java Edition overworld
-//! generation, so a real world seed can be previewed in-browser and match the game.
+//! Procedural overworld generation (1.18+ / Caves & Cliffs density-function lineage).
+//! Engineering target: high fidelity vs Minecraft 26.2 Java Edition for a given seed.
+//! User-facing copy must not claim this is official Minecraft or a game substitute.
 //!
-//! This is a *parity* target: every algorithm here mirrors a specific Java class and is
-//! validated against known-answer vectors (and, later, against chunks exported from a real
-//! world — the ground-truth oracle). It is deliberately separate from the engine's
-//! existing approximate generator (`crate::terrain` / `crate::noise`), which stays as the
-//! fast default until parity generation is complete.
+//! This is a *parity* engineering target: algorithms here mirror specific Java classes and
+//! are validated against known-answer vectors (and against chunks from a real save — the
+//! ground-truth oracle). It is deliberately separate from the engine's existing approximate
+//! generator (`crate::terrain` / `crate::noise`), which stays as the fast default until
+//! parity generation is complete.
 //!
 //! Build order (each stage gated by parity tests before the next begins):
 //!   1. `rng`          — Xoroshiro128PlusPlus + named-noise seeding.  ✓

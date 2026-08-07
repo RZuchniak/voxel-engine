@@ -64,3 +64,8 @@ Thirteen block textures the parity generator can emit are absent from the pack e
 terracottas). Those render as flat fallback colours defined in `texture::create_block_textures`.
 
 No Mojang assets are included in this repository.
+
+## Project notice
+
+Voxel Engine is an unofficial fan project and is not affiliated with, endorsed by, or a
+substitute for Mojang Studios or Microsoft. Minecraft is a trademark of Mojang Synergies AB.

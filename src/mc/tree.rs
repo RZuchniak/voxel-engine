@@ -258,8 +258,8 @@ fn is_log(block: Block) -> bool {
 }
 
 /// `TreeFeature.getMaxFreeTreeHeight` — how tall the tree can grow before hitting something.
-fn max_free_tree_height(
-    canvas: &dyn TreeCanvas,
+fn max_free_tree_height<C: TreeCanvas + ?Sized>(
+    canvas: &C,
     max_tree_height: i32,
     x: i32,
     y: i32,
@@ -284,8 +284,11 @@ fn max_free_tree_height(
 /// The draw order is the contract: tree height, foliage height, foliage radius, then the trunk,
 /// then each foliage row. `TreeFeature.doPlace` establishes it and the placers must not reorder
 /// their own sampling within it.
-pub fn place_tree(
-    canvas: &mut dyn TreeCanvas,
+///
+/// Generic over the canvas so the hot get/set path monomorphises — decoration used to pay
+/// `dyn` dispatch on every leaf cell for no semantic reason.
+pub fn place_tree<C: TreeCanvas + ?Sized>(
+    canvas: &mut C,
     random: &mut WorldgenRandom,
     x: i32,
     y: i32,
@@ -337,8 +340,8 @@ pub fn place_tree(
 
 /// The per-shape `createFoliage` bodies.
 #[allow(clippy::too_many_arguments)]
-fn create_foliage(
-    canvas: &mut dyn TreeCanvas,
+fn create_foliage<C: TreeCanvas + ?Sized>(
+    canvas: &mut C,
     random: &mut WorldgenRandom,
     x: i32,
     y: i32,
@@ -393,8 +396,8 @@ fn create_foliage(
 
 /// `FoliagePlacer.placeLeavesRow` — one square ring of leaves, corners possibly knocked out.
 #[allow(clippy::too_many_arguments)]
-fn place_leaves_row(
-    canvas: &mut dyn TreeCanvas,
+fn place_leaves_row<C: TreeCanvas + ?Sized>(
+    canvas: &mut C,
     random: &mut WorldgenRandom,
     x: i32,
     y: i32,

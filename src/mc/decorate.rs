@@ -13,8 +13,9 @@
 //!
 //! Done naively that regenerates each chunk's terrain nine times (~37.6 ms each). The terrain
 //! cache in `source::SeededProceduralSource` is what makes it affordable — see the perf table in
-//! HANDOFF.md. **Do not "optimise" this by decorating only the centre chunk and clipping**: that
-//! leaves a sawn-off half tree on every chunk border, which is far worse than no trees.
+//! HANDOFF.md. Decoration itself reads the nine columns in place (no dense 3×3 canvas copy).
+//! **Do not "optimise" this by decorating only the centre chunk and clipping**: that leaves a
+//! sawn-off half tree on every chunk border, which is far worse than no trees.
 //!
 //! # What is exact here, and what is not
 //!
@@ -208,57 +209,73 @@ pub fn tree_kind_for_biome(biome: &str) -> Option<TreeKind> {
 
 /// Chunks per side of the decoration neighbourhood.
 const NEIGHBOURHOOD: i32 = 3;
-/// Blocks per side of the canvas.
-const CANVAS_SIDE: i32 = NEIGHBOURHOOD * 16;
-
-/// A 3×3-chunk block volume that trees are grown into.
-///
-/// Reads outside the volume return [`Block::Stone`], which blocks tree growth rather than
-/// silently letting it succeed on unknown ground — the conservative direction, since a tree that
-/// fails to place leaves the world unchanged while one that places on nothing leaves it floating.
-pub struct Canvas {
-    blocks: Vec<Block>,
-    /// World coords of the canvas's minimum corner.
-    origin_x: i32,
-    origin_z: i32,
-    height: i32,
-}
-
-impl Canvas {
-    fn index(&self, x: i32, y: i32, z: i32) -> Option<usize> {
-        let lx = x - self.origin_x;
-        let lz = z - self.origin_z;
-        let ly = y - MIN_Y;
-        if lx < 0 || lz < 0 || ly < 0 || lx >= CANVAS_SIDE || lz >= CANVAS_SIDE || ly >= self.height
-        {
-            return None;
-        }
-        Some(((ly * CANVAS_SIDE + lz) * CANVAS_SIDE + lx) as usize)
-    }
-}
-
-impl TreeCanvas for Canvas {
-    fn get(&self, x: i32, y: i32, z: i32) -> Block {
-        self.index(x, y, z).map_or(Block::Stone, |i| self.blocks[i])
-    }
-    fn set(&mut self, x: i32, y: i32, z: i32, block: Block) {
-        if let Some(i) = self.index(x, y, z) {
-            self.blocks[i] = block;
-        }
-    }
-    fn min_y(&self) -> i32 {
-        MIN_Y
-    }
-    fn max_y(&self) -> i32 {
-        MIN_Y + self.height - 1
-    }
-}
 
 /// The terrain of one chunk, as decoration needs to see it.
 pub struct NeighbourTerrain<'a> {
     pub chunk_x: i32,
     pub chunk_z: i32,
     pub blocks: &'a ChunkBlocks,
+}
+
+/// Zero-copy view of the 3×3 neighbourhood's undecorated terrain.
+///
+/// Trees only *read* a handful of blocks near the surface; the old path copied all nine full
+/// columns (~885 KB) into a dense canvas and paid ~1.5 ms/chunk for it. Routing gets at the
+/// resident `ChunkBlocks` keeps the same Stone-outside-neighbourhood semantics without the copy.
+struct Neighbourhood<'a> {
+    /// Slot `(dz + 1) * 3 + (dx + 1)` relative to `(origin_cx, origin_cz)`.
+    slots: [Option<&'a ChunkBlocks>; 9],
+    origin_cx: i32,
+    origin_cz: i32,
+}
+
+impl<'a> Neighbourhood<'a> {
+    fn new(centre_x: i32, centre_z: i32, neighbours: &'a [NeighbourTerrain<'a>]) -> Self {
+        let origin_cx = centre_x - 1;
+        let origin_cz = centre_z - 1;
+        let mut slots = [None; 9];
+        for neighbour in neighbours {
+            let dx = neighbour.chunk_x - origin_cx;
+            let dz = neighbour.chunk_z - origin_cz;
+            if (0..NEIGHBOURHOOD).contains(&dx) && (0..NEIGHBOURHOOD).contains(&dz) {
+                slots[(dz * NEIGHBOURHOOD + dx) as usize] = Some(neighbour.blocks);
+            }
+        }
+        Self { slots, origin_cx, origin_cz }
+    }
+
+    #[inline]
+    fn slot(&self, chunk_x: i32, chunk_z: i32) -> Option<&'a ChunkBlocks> {
+        let dx = chunk_x - self.origin_cx;
+        let dz = chunk_z - self.origin_cz;
+        if (0..NEIGHBOURHOOD).contains(&dx) && (0..NEIGHBOURHOOD).contains(&dz) {
+            self.slots[(dz * NEIGHBOURHOOD + dx) as usize]
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn contains_block(&self, x: i32, y: i32, z: i32) -> bool {
+        let ly = y - MIN_Y;
+        if ly < 0 || ly >= super::chunk::HEIGHT {
+            return false;
+        }
+        self.slot(x.div_euclid(16), z.div_euclid(16)).is_some()
+    }
+
+    #[inline]
+    fn get(&self, x: i32, y: i32, z: i32) -> Block {
+        let ly = y - MIN_Y;
+        if ly < 0 || ly >= super::chunk::HEIGHT {
+            return Block::Stone;
+        }
+        match self.slot(x.div_euclid(16), z.div_euclid(16)) {
+            Some(chunk) => chunk.get(x.rem_euclid(16) as usize, y, z.rem_euclid(16) as usize),
+            // Outside the neighbourhood: block growth rather than float a tree on unknown ground.
+            None => Block::Stone,
+        }
+    }
 }
 
 /// Decorate the 3×3 neighbourhood around `(centre_x, centre_z)` and return the centre chunk's
@@ -272,39 +289,28 @@ pub fn decorate_centre(
     centre_z: i32,
     neighbours: &[NeighbourTerrain<'_>],
 ) -> Vec<Block> {
-    let height = super::chunk::HEIGHT;
-    let origin_x = (centre_x - 1) * 16;
-    let origin_z = (centre_z - 1) * 16;
-    let mut canvas = Canvas {
-        blocks: vec![Block::Stone; (CANVAS_SIDE * CANVAS_SIDE * height) as usize],
-        origin_x,
-        origin_z,
-        height,
+    let Some(centre) = neighbours
+        .iter()
+        .find(|n| n.chunk_x == centre_x && n.chunk_z == centre_z)
+    else {
+        return vec![Block::Air; (16 * 16 * super::chunk::HEIGHT) as usize];
     };
 
-    // Load the nine chunks' terrain into the canvas.
-    for neighbour in neighbours {
-        let base_x = neighbour.chunk_x * 16;
-        let base_z = neighbour.chunk_z * 16;
-        for lz in 0..16usize {
-            for lx in 0..16usize {
-                for y in MIN_Y..MIN_Y + height {
-                    let block = neighbour.blocks.get(lx, y, lz);
-                    canvas.set(base_x + lx as i32, y, base_z + lz as i32, block);
-                }
-            }
-        }
-    }
+    let neighbourhood = Neighbourhood::new(centre_x, centre_z, neighbours);
 
-    // Decorate every chunk of the neighbourhood.
+    // Start from the centre's pristine column and paint overlays on top. Avoids the old
+    // allocate-stone → copy-nine-in → extract-centre round trip (~1.5 ms of pure memcpy).
+    let mut out = centre.blocks.blocks.clone();
+
+    // Decorate every chunk of the neighbourhood against **pristine** terrain only.
     //
-    // ⚠️ Each chunk's trees are computed against **pristine terrain plus only its own trees so
-    // far**, never against other chunks' trees, and are merged in afterwards. That isolation is
-    // required, not tidiness: chunk N is decorated both when generating N and when generating
-    // each of its 8 neighbours, and those runs see *different* neighbourhoods. If a tree's
-    // clearance check could see a neighbouring chunk's canopy, N would grow different trees
-    // depending on which chunk was being generated — so a canopy would appear on one side of a
-    // border and not the other. That is exactly what
+    // ⚠️ Each chunk's trees are computed against pristine terrain plus only its own trees so
+    // far, never against other chunks' trees, and are merged into the centre afterwards. That
+    // isolation is required, not tidiness: chunk N is decorated both when generating N and when
+    // generating each of its 8 neighbours, and those runs see *different* neighbourhoods. If a
+    // tree's clearance check could see a neighbouring chunk's canopy, N would grow different
+    // trees depending on which chunk was being generated — so a canopy would appear on one side
+    // of a border and not the other. That is exactly what
     // `correctness_trees::a_canopy_crossing_a_chunk_border_is_not_cut_off` caught.
     //
     // This is a deliberate divergence from vanilla, which decorates chunks in world-generation
@@ -313,28 +319,25 @@ pub fn decorate_centre(
     // The visible cost is that trees from adjacent chunks may interpenetrate slightly rather
     // than yielding to each other.
     for neighbour in neighbours {
-        let overlay = decorate_chunk(seed, neighbour, &canvas);
+        let overlay = decorate_chunk(seed, neighbour, &neighbourhood);
         for ((x, y, z), block) in overlay {
-            canvas.set(x, y, z, block);
+            if x.div_euclid(16) != centre_x || z.div_euclid(16) != centre_z {
+                continue;
+            }
+            let ly = y - MIN_Y;
+            if ly < 0 || ly >= super::chunk::HEIGHT {
+                continue;
+            }
+            let lx = x.rem_euclid(16) as usize;
+            let lz = z.rem_euclid(16) as usize;
+            out[(ly as usize) * 256 + lz * 16 + lx] = block;
         }
     }
 
-    // Extract the centre column.
-    let base_x = centre_x * 16;
-    let base_z = centre_z * 16;
-    let mut out = vec![Block::Air; (16 * 16 * height) as usize];
-    for lz in 0..16usize {
-        for lx in 0..16usize {
-            for y in MIN_Y..MIN_Y + height {
-                let block = canvas.get(base_x + lx as i32, y, base_z + lz as i32);
-                out[((y - MIN_Y) as usize) * 256 + lz * 16 + lx] = block;
-            }
-        }
-    }
     out
 }
 
-/// A chunk's own tree blocks, before they are merged into the shared canvas.
+/// A chunk's own tree blocks, before they are merged into the centre column.
 ///
 /// Sparse because trees are: a chunk holds a handful of them against 98304 blocks.
 type Overlay = Vec<((i32, i32, i32), Block)>;
@@ -344,7 +347,7 @@ type Overlay = Vec<((i32, i32, i32), Block)>;
 /// The split is what makes a chunk's decoration independent of which neighbourhood it is being
 /// decorated in — see the note in [`decorate_centre`].
 struct OverlayCanvas<'a> {
-    base: &'a Canvas,
+    base: &'a Neighbourhood<'a>,
     written: std::collections::HashMap<(i32, i32, i32), Block>,
     overlay: Overlay,
 }
@@ -357,20 +360,20 @@ impl TreeCanvas for OverlayCanvas<'_> {
         }
     }
     fn set(&mut self, x: i32, y: i32, z: i32, block: Block) {
-        // Outside the canvas the write is dropped rather than recorded: it cannot belong to the
-        // centre chunk, and keeping it would let a tree at the far edge of a corner neighbour
-        // grow through terrain this canvas cannot see.
-        if self.base.index(x, y, z).is_none() {
+        // Outside the neighbourhood the write is dropped rather than recorded: it cannot belong
+        // to the centre chunk, and keeping it would let a tree at the far edge of a corner
+        // neighbour grow through terrain this view cannot see.
+        if !self.base.contains_block(x, y, z) {
             return;
         }
         self.written.insert((x, y, z), block);
         self.overlay.push(((x, y, z), block));
     }
     fn min_y(&self) -> i32 {
-        self.base.min_y()
+        MIN_Y
     }
     fn max_y(&self) -> i32 {
-        self.base.max_y()
+        MIN_Y + super::chunk::HEIGHT - 1
     }
 }
 
@@ -378,7 +381,7 @@ impl TreeCanvas for OverlayCanvas<'_> {
 ///
 /// Mirrors `applyBiomeDecoration`'s inner loop: seed once per chunk from the block origin, then
 /// per feature re-seed with `setFeatureSeed` before running its placement chain.
-fn decorate_chunk(seed: i64, neighbour: &NeighbourTerrain<'_>, base: &Canvas) -> Overlay {
+fn decorate_chunk(seed: i64, neighbour: &NeighbourTerrain<'_>, base: &Neighbourhood<'_>) -> Overlay {
     let origin_x = neighbour.chunk_x * 16;
     let origin_z = neighbour.chunk_z * 16;
 

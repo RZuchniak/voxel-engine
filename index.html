@@ -115,23 +115,24 @@
     <div id="startup-menu">
         <div class="panel">
             <h1>Voxel Engine</h1>
-            <p>Generate infinite terrain from a seed (Minecraft-style Perlin hills), or import a Java Edition world zip.</p>
+            <p>Fly through procedural voxel terrain from a seed, or import an Anvil-format world save zip.</p>
             <div id="webgpu-warning" class="hidden" style="color:#ffb4b4;margin-bottom:1rem;"></div>
             <label for="world-seed">World seed (fast — recommended)</label>
-            <input id="world-seed" type="text" placeholder="e.g. 12345 or herobrine" autocomplete="off" />
+            <input id="world-seed" type="text" placeholder="e.g. 12345 or my-world" autocomplete="off" />
             <div class="row">
                 <button id="generate-seed-btn" type="button">Generate world</button>
                 <button id="random-seed-btn" type="button" class="secondary">Random</button>
             </div>
             <div class="divider"></div>
-            <label for="world-file">Import Java world zip</label>
+            <label for="world-file">Import world zip</label>
             <input id="world-file" type="file" accept=".zip,application/zip" />
             <label for="world-url">Or load zip from URL</label>
             <input id="world-url" type="url" placeholder="https://example.com/my-world.zip" />
             <button id="load-url-btn" type="button" class="secondary">Load from URL</button>
             <div id="menu-status">Waiting for WASM…</div>
             <div id="menu-error"></div>
-            <p class="hint">Seed mode generates hills instantly. Zip import loads real saves from <code>region/*.mca</code> files.</p>
+            <p class="hint">Seed mode generates terrain instantly. Zip import reads <code>region/*.mca</code> from a saved world folder.</p>
+            <p class="hint">Unofficial fan project — not affiliated with, endorsed by, or a substitute for Mojang Studios or Microsoft. Minecraft is a trademark of Mojang Synergies AB.</p>
         </div>
     </div>
     <div id="click-to-play" class="hidden">Click to play · WASD move · Mouse look · P release cursor</div>

@@ -122,7 +122,9 @@ impl ChunkStreamer {
         });
     }
 
-    /// Generate on the main thread. Only used when no worker bridge is available.
+    /// Generate on the main thread. Last resort when no worker bridge exists at all.
+    ///
+    /// Must not be used merely because the worker queue is full — see `request_chunk`.
     #[cfg(target_arch = "wasm32")]
     fn send_loaded_chunk_sync(&self, coord: (i32, i32)) {
         let chunk = match self.source.load_chunk(coord) {
@@ -195,9 +197,12 @@ impl ChunkStreamer {
         for failure in take_failures() {
             if failure.is_remesh {
                 self.remesh_in_flight.remove(&failure.coord);
-            } else if self.worker_bridge.is_some() {
-                self.in_flight.insert(failure.coord);
-                self.spawn_main_thread_load(failure.coord);
+            } else if let Some(bridge) = self.worker_bridge.as_mut() {
+                // Re-queue on a worker. An earlier version fell back to
+                // `spawn_main_thread_load`, which still runs `load_chunk` on the browser's UI
+                // thread — with trees that is a 3×3 terrain gen and shows up as a multi-second
+                // freeze. If the queue is full the streaming loop will ask again next frame.
+                let _ = bridge.try_request_load(failure.coord);
             } else {
                 self.in_flight.remove(&failure.coord);
             }
@@ -245,11 +250,17 @@ impl ChunkStreamer {
                     if bridge.try_request_load(coord) {
                         return true;
                     }
-                    // Fall through to the synchronous path below. An earlier version bailed
-                    // out here so bootstrap would wait for the workers, but if the workers
-                    // never become ready that loads nothing at all and the screen stays
-                    // blank. Degrading to main-thread generation keeps this change strictly
-                    // non-regressive: worst case is today's behaviour.
+                    // Workers exist but are saturated, still booting, or already hold this
+                    // coord. Do **not** fall through to main-thread generation.
+                    //
+                    // Before trees that fallback was merely slow; with trees each sync
+                    // `load_chunk` walks a 3×3 neighbourhood (~2× terrain gens on a warm
+                    // worker cache, up to 9× on a cold one). The streamer can request up to
+                    // `procedural_max_new_requests_per_frame` chunks per frame, so a full
+                    // worker queue turned into a multi-second UI freeze — exactly the hitch
+                    // felt while flying into unloaded terrain. Returning false leaves the
+                    // chunk for a later frame once a worker has room.
+                    return false;
                 }
             }
 
