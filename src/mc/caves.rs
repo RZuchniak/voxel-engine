@@ -11,7 +11,7 @@
 //! This module ports `entrances`, `underground`, `noodle`, `pillars`, `spaghetti2D`, the
 //! spaghetti-roughness function, and `QuantizedSpaghettiRarity`. Only the selected branch
 //! of each `rangeChoice`/`intervalSelect` is evaluated (matching Java's laziness), so this
-//! stays cheap. Everything is transcribed from decompiled 26.2 `NoiseRouterData.java`.
+//! stays cheap.
 
 use std::sync::Arc;
 

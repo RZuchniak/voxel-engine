@@ -5,8 +5,8 @@
 //! These constants are the `NoiseParameters` registered by Minecraft's worldgen
 //! bootstrap (`net.minecraft.data.worldgen.NoiseData`). In 26.2 they are code-registered
 //! (no longer shipped as JSON in the client jar), but the values are unchanged from the
-//! 1.18–1.20 lineage — pure numeric data, transcribed here so the port needs no runtime
-//! access to the game files.
+//! 1.18–1.20 lineage — pure numeric data, listed here so generation needs no runtime
+//! access to game files.
 //!
 //! Seeding (per `RandomState`): a world seed builds `XoroshiroRandom::from_seed(seed)`,
 //! whose `fork_positional()` factory then seeds each named noise via

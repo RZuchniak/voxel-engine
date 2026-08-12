@@ -20,9 +20,6 @@
 //! `BlendedNoise` (`base_3d_noise`) and `Spline` (`TerrainProvider` + `CubicSpline`). Terrain
 //! height needs both, so this module alone can't yet produce a full column — it's the
 //! backbone the remaining pieces plug into.
-//!
-//! Every arithmetic here is transcribed from decompiled 26.2 `DensityFunctions.java` /
-//! `Mth.java`; see the per-node comments for the source method.
 
 use std::sync::Arc;
 

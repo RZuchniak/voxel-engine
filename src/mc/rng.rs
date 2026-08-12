@@ -12,7 +12,7 @@
 
 use md5::{Digest, Md5};
 
-// Named to match Mojang's `RandomSupport` constants (verified against decompiled 26.2):
+// Named to match Mojang's `RandomSupport` constants:
 //   GOLDEN_RATIO_64 = -7046029254386353131, SILVER_RATIO_64 = 7640891576956012809.
 const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
 const SILVER_RATIO_64: u64 = 0x6A09_E667_F3BC_C909;

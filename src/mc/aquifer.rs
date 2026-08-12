@@ -8,11 +8,6 @@
 //! barrier is computed between their fluid levels and — where the barrier wins — the block
 //! becomes stone instead of fluid. That is what seals underground lakes off from each other.
 //!
-//! Transcribed from decompiled 26.2 `Aquifer.java`, with the supporting bits from
-//! `NoiseBasedChunkGenerator.createFluidPicker`, `NoiseChunk.preliminarySurfaceLevel` /
-//! `maxPreliminarySurfaceLevel`, `RandomState.aquiferRandom`, and
-//! `OverworldBiomeBuilder.isDeepDarkRegion`.
-//!
 //! ## Chunk scope
 //!
 //! The real aquifer is constructed per chunk, and it is not purely positional: the

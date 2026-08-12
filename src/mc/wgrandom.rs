@@ -24,9 +24,6 @@
 //! - [`Self::next_int_bound`] is Java's classic rejection loop over `next(31)`, *not*
 //!   `XoroshiroRandom::next_int_bound`. Using the xoroshiro one here would give a different
 //!   value for the same state, and the tree would land somewhere else.
-//!
-//! Validated against decompiled 26.2 `WorldgenRandom.java`, `LegacyRandomSource.java` and
-//! `BitRandomSource.java`.
 
 use super::rng::XoroshiroRandom;
 

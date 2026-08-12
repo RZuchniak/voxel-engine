@@ -15,9 +15,9 @@
 //!
 //! # ⚠️ These colours are hand-authored, not ported
 //!
-//! Everything in `mc::` is validated against decompiled 26.2 and is bit-exact. **This table is
-//! not**, and it is the only part of the render path that claims a Minecraft number without a
-//! parity harness behind it. The values below are the widely-published vanilla colours.
+//! **This table is not bit-exact**, and it is the only part of the render path that claims a
+//! Minecraft number without a parity harness behind it. The values below are the
+//! widely-published vanilla colours.
 //!
 //! Getting these bit-exact would mean porting two more things:
 //!
