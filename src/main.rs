@@ -1807,6 +1807,9 @@ impl ApplicationHandler for App {
         } else {
             println!("generating world from seed {seed}");
         }
+        if autopilot_forward() {
+            println!("VOXEL_AUTOPILOT=forward — holding W after the world is revealed");
+        }
         let world_source: Arc<dyn source::WorldSource> =
             Arc::new(source::SeededProceduralSource::new(seed));
         let mut state = pollster::block_on(State::new(window.clone(), world_source));
@@ -1848,6 +1851,10 @@ impl ApplicationHandler for App {
                         .as_micros();
                     state.last_frame_time = current_time;
                     if state.world_ready {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if autopilot_forward() {
+                            state.camera_controller.forward = true;
+                        }
                         state
                             .camera_controller
                             .update(state.delta, &mut state.camera);
@@ -1977,6 +1984,23 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Hold W after the loading screen, so a samply recording of the live app can fly without
+/// a captured keyboard. `VOXEL_AUTOPILOT=forward` (or `1` / `true`). Pair with `VOXEL_CAMERA`
+/// to point at a known forest — `examples/profile_fly` prints a ready-to-paste pair.
+#[cfg(not(target_arch = "wasm32"))]
+fn autopilot_forward() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VOXEL_AUTOPILOT")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("forward")
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

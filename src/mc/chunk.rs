@@ -5,9 +5,21 @@
 //! chunk's highest preliminary surface, and the `steep` surface condition compares
 //! heightmap neighbours *clamped to the chunk*, so it changes at chunk borders.
 
+use std::time::Instant;
+
 use super::aquifer::Substance;
 use super::overworld::{CellSampler, Overworld};
 use super::surface::{Block, SurfaceSystem};
+
+/// Wall-clock split of [`generate_chunk`], for `examples/profile_fly` and samply-adjacent
+/// console reports. Cheap stages (heightmaps, the 4×4 tint grid) are folded into `surface_ms`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChunkGenTimings {
+    /// Density sampling + aquifer substance, the nested x/y/z loop.
+    pub density_aquifer_ms: f64,
+    /// Surface rules, plus the heightmaps and tint grid that read the finished column.
+    pub surface_ms: f64,
+}
 
 /// Vertical extent of the overworld (`NoiseSettings.OVERWORLD_NOISE_SETTINGS`).
 pub const MIN_Y: i32 = -64;
@@ -72,7 +84,35 @@ pub fn generate_chunk(
     chunk_x: i32,
     chunk_z: i32,
 ) -> ChunkBlocks {
-    generate_range(ow, surface, chunk_x, chunk_z, MIN_Y, MIN_Y + HEIGHT - 1)
+    generate_range(
+        ow,
+        surface,
+        chunk_x,
+        chunk_z,
+        MIN_Y,
+        MIN_Y + HEIGHT - 1,
+        None,
+    )
+}
+
+/// Same as [`generate_chunk`], with a density-vs-surface split for the fly profiler.
+pub fn generate_chunk_timed(
+    ow: &Overworld,
+    surface: &SurfaceSystem,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> (ChunkBlocks, ChunkGenTimings) {
+    let mut timings = ChunkGenTimings::default();
+    let blocks = generate_range(
+        ow,
+        surface,
+        chunk_x,
+        chunk_z,
+        MIN_Y,
+        MIN_Y + HEIGHT - 1,
+        Some(&mut timings),
+    );
+    (blocks, timings)
 }
 
 /// How far above the *preliminary* surface estimate to start generating. That estimate
@@ -117,12 +157,12 @@ pub fn generate_chunk_surface(
     // `lowest` is already the minimum over the chunk, so `depth` below it is conservative.
     let floor = (lowest - depth).max(MIN_Y);
 
-    let mut generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling);
+    let mut generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling, None);
     // If terrain actually reached the ceiling the margin was too small and the column was
     // truncated. Raise it and redo rather than silently render a flat-topped mountain.
     while ceiling < MIN_Y + HEIGHT - 1 && generated.has_solid_at(ceiling) {
         ceiling = (ceiling + CEILING_MARGIN).min(MIN_Y + HEIGHT - 1);
-        generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling);
+        generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling, None);
     }
     generated
 }
@@ -135,12 +175,14 @@ fn generate_range(
     chunk_z: i32,
     y_lo: i32,
     y_hi: i32,
+    mut timings: Option<&mut ChunkGenTimings>,
 ) -> ChunkBlocks {
     let mut sampler = CellSampler::new(ow);
     let mut aquifer = ow.aquifer_for_chunk(chunk_x, chunk_z);
     let mut blocks = vec![Block::Air; (16 * 16 * HEIGHT) as usize];
 
     // Stage 1+2: density and aquifer, which together decide stone/water/lava/air.
+    let t_density = timings.is_some().then(Instant::now);
     for lz in 0..16usize {
         for lx in 0..16usize {
             let x = chunk_x * 16 + lx as i32;
@@ -158,6 +200,9 @@ fn generate_range(
             }
         }
     }
+    if let (Some(tm), Some(t0)) = (timings.as_mut(), t_density) {
+        tm.density_aquifer_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    }
 
     // The WORLD_SURFACE_WG heightmap: highest non-air block per column (fluids count).
     let mut heights = [MIN_Y - 1; 256];
@@ -173,6 +218,7 @@ fn generate_range(
     }
 
     // Stage 3: surface rules, walking each column top-down.
+    let t_surface = timings.is_some().then(Instant::now);
     let mut biome_cache = BiomeCache::new(chunk_x, chunk_z);
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -280,6 +326,10 @@ fn generate_range(
                 }
             }
         }
+    }
+
+    if let (Some(tm), Some(t0)) = (timings.as_mut(), t_surface) {
+        tm.surface_ms = t0.elapsed().as_secs_f64() * 1000.0;
     }
 
     ChunkBlocks { blocks, surface_biomes, world_surface, ocean_floor }

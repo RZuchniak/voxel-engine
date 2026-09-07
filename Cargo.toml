@@ -72,3 +72,11 @@ serde_json = "1.0"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# Same as release, with full debuginfo so samply / Firefox Profiler can name
+# inlined frames and show source. Fat LTO still inlines aggressively;
+# `examples/profile_fly` keeps the terrain / decorate / mesh stages in
+# `#[inline(never)]` wrappers so they survive even without inlined stacks.
+[profile.profiling]
+inherits = "release"
+debug = true
