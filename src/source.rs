@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use std::{
@@ -42,54 +42,42 @@ pub struct SeededProceduralSource {
     seed: i64,
     overworld: crate::mc::overworld::Overworld,
     surface: crate::mc::surface::SurfaceSystem,
-    terrain_cache: Mutex<TerrainCache>,
+    terrain_cache: Mutex<OnceCache<crate::mc::chunk::ChunkBlocks>>,
+    overlay_cache: Mutex<OnceCache<crate::mc::decorate::ChunkOverlay>>,
 }
 
-/// Undecorated terrain, keyed by chunk coord.
+/// Bounded memo of expensive per-chunk work, with in-flight coalescing.
 ///
-/// **This exists to make trees affordable.** Trees cross chunk boundaries, so producing chunk C
-/// requires decorating its whole 3×3 neighbourhood, which without a cache would generate every
-/// chunk's terrain nine times (~37.6 ms each → ~340 ms/chunk). The streamer requests chunks in a
-/// spiral, so a neighbour is almost always still resident from a nearby request.
+/// Insertion-order eviction, not LRU: the access pattern is a moving front, so the oldest
+/// entry is also the one furthest from where generation is working.
 ///
-/// Bounded and evicted in insertion order rather than by true LRU: the access pattern is a
-/// moving front, so the oldest entry is also the one furthest from where generation is working.
-/// A real LRU would cost a touch on every hit to defend against an access pattern this workload
-/// does not have.
-struct TerrainCache {
-    entries: HashMap<(i32, i32), std::sync::Arc<crate::mc::chunk::ChunkBlocks>>,
+/// `pending` is the vanilla-shaped part. Two worker threads asking for the same coord share
+/// one `OnceLock` instead of both generating it — the previous cache generated outside the
+/// mutex and let them race, which is what a straight-line flight paid extra for.
+struct OnceCache<T> {
+    entries: HashMap<(i32, i32), Arc<T>>,
     order: std::collections::VecDeque<(i32, i32)>,
+    pending: HashMap<(i32, i32), Arc<OnceLock<Arc<T>>>>,
     capacity: usize,
     hits: u64,
     misses: u64,
 }
 
-impl TerrainCache {
+impl<T> OnceCache<T> {
     fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
             order: std::collections::VecDeque::new(),
+            pending: HashMap::new(),
             capacity,
             hits: 0,
             misses: 0,
         }
     }
 
-    fn get(&mut self, coord: (i32, i32)) -> Option<std::sync::Arc<crate::mc::chunk::ChunkBlocks>> {
-        match self.entries.get(&coord) {
-            Some(entry) => {
-                self.hits += 1;
-                Some(std::sync::Arc::clone(entry))
-            }
-            None => {
-                self.misses += 1;
-                None
-            }
-        }
-    }
-
-    fn insert(&mut self, coord: (i32, i32), blocks: std::sync::Arc<crate::mc::chunk::ChunkBlocks>) {
-        if self.entries.insert(coord, blocks).is_none() {
+    fn publish(&mut self, coord: (i32, i32), value: Arc<T>) {
+        self.pending.remove(&coord);
+        if self.entries.insert(coord, value).is_none() {
             self.order.push_back(coord);
             while self.order.len() > self.capacity {
                 if let Some(oldest) = self.order.pop_front() {
@@ -100,11 +88,59 @@ impl TerrainCache {
     }
 }
 
+/// Look up `coord`, coalescing concurrent misses onto one `create` call.
+///
+/// `create` runs **outside** the mutex. Holding it across ~37 ms of terrain gen would
+/// serialise the whole worker pool onto one thread.
+fn cache_get<T>(
+    cache: &Mutex<OnceCache<T>>,
+    coord: (i32, i32),
+    create: impl FnOnce() -> T,
+) -> Arc<T> {
+    let slot = {
+        let mut cache = match cache.lock() {
+            Ok(cache) => cache,
+            Err(_) => return Arc::new(create()),
+        };
+        if let Some(hit) = cache.entries.get(&coord) {
+            let hit = Arc::clone(hit);
+            cache.hits += 1;
+            return hit;
+        }
+        cache
+            .pending
+            .entry(coord)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    };
+
+    let mut produced = false;
+    let value = Arc::clone(slot.get_or_init(|| {
+        produced = true;
+        Arc::new(create())
+    }));
+
+    if let Ok(mut cache) = cache.lock() {
+        if produced {
+            cache.misses += 1;
+        } else {
+            cache.hits += 1;
+        }
+        cache.publish(coord, Arc::clone(&value));
+    }
+    value
+}
+
 /// How many undecorated chunks to keep. A chunk column is ~885 KB as `ChunkBlocks` (one byte per
 /// block over the full −64..320 range), so 256 entries is roughly **220 MB** — chosen to comfortably
-/// cover the 3×3 working set of several concurrently-generating worker threads without becoming a
-/// second memory budget to manage. Lower it before raising the load distance.
+/// cover the 5×5 working set of several concurrently-generating worker threads (each overlay
+/// needs its own 3×3 of terrain) without becoming a second memory budget to manage. Lower it
+/// before raising the load distance.
 const TERRAIN_CACHE_CAPACITY: usize = 256;
+
+/// Tree overlays are a handful of blocks. Keep more of them than terrain columns: recomputing
+/// an overlay is cheap only when the 3×3 of terrain is still resident.
+const OVERLAY_CACHE_CAPACITY: usize = 512;
 
 impl SeededProceduralSource {
     pub fn new(seed: i64) -> Self {
@@ -112,7 +148,8 @@ impl SeededProceduralSource {
             seed,
             overworld: crate::mc::overworld::Overworld::new(seed),
             surface: crate::mc::surface::SurfaceSystem::new(seed),
-            terrain_cache: Mutex::new(TerrainCache::new(TERRAIN_CACHE_CAPACITY)),
+            terrain_cache: Mutex::new(OnceCache::new(TERRAIN_CACHE_CAPACITY)),
+            overlay_cache: Mutex::new(OnceCache::new(OVERLAY_CACHE_CAPACITY)),
         }
     }
 
@@ -120,32 +157,50 @@ impl SeededProceduralSource {
         self.seed
     }
 
-    /// Undecorated terrain for one chunk, from the cache when possible.
-    fn terrain(&self, coord: (i32, i32)) -> std::sync::Arc<crate::mc::chunk::ChunkBlocks> {
-        if let Ok(mut cache) = self.terrain_cache.lock() {
-            if let Some(hit) = cache.get(coord) {
-                return hit;
-            }
-        }
-        // Generated **outside** the lock: this is ~37 ms of pure CPU and holding the mutex across
-        // it would serialise the whole worker pool onto one thread. Two threads racing on the
-        // same coord will both generate it, which wastes work once but is far cheaper than
-        // serialising every generation in the process.
-        let blocks = std::sync::Arc::new(crate::mc::chunk::generate_chunk(
-            &self.overworld,
-            &self.surface,
-            coord.0,
-            coord.1,
-        ));
-        if let Ok(mut cache) = self.terrain_cache.lock() {
-            cache.insert(coord, std::sync::Arc::clone(&blocks));
-        }
-        blocks
+    /// Undecorated terrain for one chunk. Concurrent requests for the same coord wait on the
+    /// in-flight generation instead of racing.
+    fn terrain(&self, coord: (i32, i32)) -> Arc<crate::mc::chunk::ChunkBlocks> {
+        cache_get(&self.terrain_cache, coord, || {
+            crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, coord.0, coord.1)
+        })
     }
 
-    /// Cache hit/miss counters, for `examples/bench_mc_chunk`.
+    /// One chunk's tree overlay, computed against **that** chunk's own 3×3 of pristine terrain.
+    ///
+    /// This is vanilla's FEATURES stage: run once per coord, including writes that spill into
+    /// neighbours. Assembling a column then applies every overlay in the 3×3 that lands there.
+    fn overlay(&self, coord: (i32, i32)) -> Arc<crate::mc::decorate::ChunkOverlay> {
+        cache_get(&self.overlay_cache, coord, || {
+            let (cx, cz) = coord;
+            let mut held = Vec::with_capacity(9);
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    held.push(((cx + dx, cz + dz), self.terrain((cx + dx, cz + dz))));
+                }
+            }
+            let neighbours: Vec<crate::mc::decorate::NeighbourTerrain<'_>> = held
+                .iter()
+                .map(|((nx, nz), blocks)| crate::mc::decorate::NeighbourTerrain {
+                    chunk_x: *nx,
+                    chunk_z: *nz,
+                    blocks: blocks.as_ref(),
+                })
+                .collect();
+            crate::mc::decorate::decorate_one(self.seed, cx, cz, &neighbours)
+        })
+    }
+
+    /// Terrain cache hit/miss counters, for `examples/diag_trees`.
     pub fn cache_stats(&self) -> (u64, u64) {
         self.terrain_cache
+            .lock()
+            .map(|cache| (cache.hits, cache.misses))
+            .unwrap_or((0, 0))
+    }
+
+    /// Overlay cache hit/miss counters. A miss is one `decorate_one` call.
+    pub fn overlay_stats(&self) -> (u64, u64) {
+        self.overlay_cache
             .lock()
             .map(|cache| (cache.hits, cache.misses))
             .unwrap_or((0, 0))
@@ -160,28 +215,21 @@ impl WorldSource for SeededProceduralSource {
         // (`platform::section_occlusion_culling`), not by omitting it — a surface band is a
         // stand-in for that algorithm, and it shows: caves cut off in mid-air, a hollow shell
         // from below, and terrain that falls out of the band on slopes.
-        // Terrain for the whole 3×3 neighbourhood, because decoration is a 3×3 pass: a tree's
-        // trunk sits in one chunk and its foliage routinely lands in the next, so this chunk's
-        // final contents depend on its neighbours' trees as much as its own. The cache is what
-        // keeps that from costing nine generations — see `TerrainCache`.
-        let mut terrain = Vec::with_capacity(9);
+        //
+        // Vanilla FEATURES writes tree overflow into neighbour proto-chunks and never re-runs
+        // that chunk's decoration. The overlay cache is that proto-chunk: each coord is
+        // decorated once against its own 3×3 of terrain, and assembling C paints every overlay
+        // in C's 3×3 that lands in C. The 5×5 of terrain that implies is generated once per
+        // coord (and coalesced if several workers need it at once).
+        let generated = self.terrain(coord);
+        let mut decorated = generated.blocks.clone();
         for dz in -1..=1 {
             for dx in -1..=1 {
-                terrain.push(((cx + dx, cz + dz), self.terrain((cx + dx, cz + dz))));
+                let overlay = self.overlay((cx + dx, cz + dz));
+                crate::mc::decorate::apply_overlay(&mut decorated, cx, cz, overlay.as_ref());
             }
         }
-        let neighbours: Vec<crate::mc::decorate::NeighbourTerrain<'_>> = terrain
-            .iter()
-            .map(|((nx, nz), blocks)| crate::mc::decorate::NeighbourTerrain {
-                chunk_x: *nx,
-                chunk_z: *nz,
-                blocks: blocks.as_ref(),
-            })
-            .collect();
-        let decorated = crate::mc::decorate::decorate_centre(self.seed, cx, cz, &neighbours);
 
-        let generated = &terrain[4].1; // the centre, for its biome grid
-        debug_assert_eq!(terrain[4].0, coord, "index 4 must be the centre of the 3x3");
         let mut out = Chunk::new(coord);
         // 16 bytes of biome index per chunk — what makes grass, leaves and water take their
         // biome's colour instead of one global green. Free: the generator already resolved these

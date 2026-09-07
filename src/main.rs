@@ -512,6 +512,18 @@ impl State {
         } else {
             surface_caps.present_modes[0]
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cap = platform::native_fps_cap();
+            platform::log_line(&format!(
+                "present mode {present_mode:?}, fps cap {}",
+                if cap == 0 {
+                    "off".to_string()
+                } else {
+                    cap.to_string()
+                }
+            ));
+        }
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -797,30 +809,32 @@ impl State {
         ];
         self.queue
             .write_buffer(&self.sky_buffer, 0, bytemuck::cast_slice(&[self.sky_uniform]));
-        self.profile_accum += self.delta;
-        if self.profile_accum > 1_000_000 {
-            println!(
-                "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={} smart_cull={} stream_scale={:.2}",
-                self.started_at.elapsed().as_secs_f64(),
-                self.world_ready,
-                self.fps_ema,
-                self.visible_draw_calls_last_frame,
-                self.visible_chunks_last_frame,
-                self.uploaded_meshes_last_frame,
-                self.drained_new_last_frame,
-                self.drained_remesh_last_frame,
-                self.phase_stream_us,
-                self.phase_mesh_us,
-                self._world.chunks().count(),
-                self.pending_ready.len(),
-                self.chunk_requests_issued,
-                self.chunks_meshed,
-                self.resident_quads(),
-                self.reachable_sections_last_frame,
-                self.smart_cull_last_frame,
-                self.streaming_scale_last_frame,
-            );
-            self.profile_accum = 0;
+        if platform::logging_enabled() {
+            self.profile_accum += self.delta;
+            if self.profile_accum > 1_000_000 {
+                platform::log_line(&format!(
+                    "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={} smart_cull={} stream_scale={:.2}",
+                    self.started_at.elapsed().as_secs_f64(),
+                    self.world_ready,
+                    self.fps_ema,
+                    self.visible_draw_calls_last_frame,
+                    self.visible_chunks_last_frame,
+                    self.uploaded_meshes_last_frame,
+                    self.drained_new_last_frame,
+                    self.drained_remesh_last_frame,
+                    self.phase_stream_us,
+                    self.phase_mesh_us,
+                    self._world.chunks().count(),
+                    self.pending_ready.len(),
+                    self.chunk_requests_issued,
+                    self.chunks_meshed,
+                    self.resident_quads(),
+                    self.reachable_sections_last_frame,
+                    self.smart_cull_last_frame,
+                    self.streaming_scale_last_frame,
+                ));
+                self.profile_accum = 0;
+            }
         }
     }
 
@@ -952,12 +966,12 @@ impl State {
             }
             self.world_ready = true;
             self.bootstrap_ready_cache.clear();
-            println!(
+            platform::log_line(&format!(
                 "world revealed after {:.1}s ({} chunks built, loading radius {})",
                 self.started_at.elapsed().as_secs_f64(),
                 Self::bootstrap_tile_count(),
                 platform::bootstrap_chunk_radius(),
-            );
+            ));
         }
     }
 
@@ -1688,6 +1702,9 @@ struct App {
     state_loading: bool,
     #[cfg(target_arch = "wasm32")]
     needs_redraw: bool,
+    /// Next time a native frame is allowed to start. See [`platform::native_min_frame_time`].
+    #[cfg(not(target_arch = "wasm32"))]
+    next_redraw: Option<std::time::Instant>,
 }
 
 impl App {
@@ -1700,6 +1717,8 @@ impl App {
             state_loading: false,
             #[cfg(target_arch = "wasm32")]
             needs_redraw: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            next_redraw: None,
         }
     }
 
@@ -1773,8 +1792,28 @@ impl ApplicationHandler for App {
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(state) = self.state.as_ref() {
-            state.window.request_redraw();
+        {
+            // Cap native FPS by waiting between redraws. Requesting a redraw here
+            // unconditionally — which is what `ControlFlow::Poll` used to do — is what
+            // ran the loop at 800–1500 FPS and starved the rest of the machine.
+            if let Some(budget) = platform::native_min_frame_time() {
+                let now = std::time::Instant::now();
+                let due = self.next_redraw.unwrap_or(now);
+                if now >= due {
+                    self.next_redraw = Some(now + budget);
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    self.next_redraw.unwrap_or(now + budget),
+                ));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -1803,9 +1842,9 @@ impl ApplicationHandler for App {
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(DEMO_SEED);
         if std::env::var_os("VOXEL_SEED").is_none() {
-            println!("VOXEL_SEED unset — using demo seed {seed}");
+            platform::log_line(&format!("VOXEL_SEED unset — using demo seed {seed}"));
         } else {
-            println!("generating world from seed {seed}");
+            platform::log_line(&format!("generating world from seed {seed}"));
         }
         let world_source: Arc<dyn source::WorldSource> =
             Arc::new(source::SeededProceduralSource::new(seed));
@@ -1857,6 +1896,11 @@ impl ApplicationHandler for App {
                             .update_look_only(&mut state.camera);
                     }
                     state.update();
+                    // Native pacing lives in `about_to_wait` (`WaitUntil` + one redraw per
+                    // budget). Requesting another redraw here would queue the next frame
+                    // immediately and ignore the cap. Wasm is paced by the browser and still
+                    // needs this to keep the loop alive.
+                    #[cfg(target_arch = "wasm32")]
                     state.window.request_redraw();
                     match state.render() {
                         Ok(_) => {}

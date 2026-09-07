@@ -116,6 +116,51 @@ fn a_canopy_crossing_a_chunk_border_is_not_cut_off() {
     );
 }
 
+/// Each chunk's trees must run once, even though assembling a column reads a 3×3 of overlays.
+///
+/// The first `load_chunk` pulls a 5×5 of terrain (each of the 9 overlays needs its own 3×3).
+/// Reloading the same coord, and then the neighbour, must reuse those overlays rather than
+/// decorate again.
+#[test]
+fn a_chunk_is_decorated_only_once() {
+    let source = SeededProceduralSource::new(SEED);
+    let _ = source.load_chunk((0, 0)).expect("gen");
+    let (terrain_hits, terrain_misses) = source.cache_stats();
+    let (overlay_hits, overlay_misses) = source.overlay_stats();
+    assert_eq!(
+        overlay_misses, 9,
+        "assembling (0,0) should decorate its 3×3 once each, got {overlay_misses} overlay misses"
+    );
+    assert_eq!(
+        terrain_misses, 25,
+        "those 9 overlays need a 5×5 of terrain, got {terrain_misses} terrain misses \
+         ({terrain_hits} hits)"
+    );
+
+    let _ = source.load_chunk((0, 0)).expect("gen");
+    let (_, overlay_misses_again) = source.overlay_stats();
+    assert_eq!(
+        overlay_misses_again, 9,
+        "reloading the same chunk must not decorate again, got {overlay_misses_again} overlay misses"
+    );
+    assert!(
+        source.overlay_stats().0 > overlay_hits,
+        "reloading should hit the overlay cache"
+    );
+
+    let _ = source.load_chunk((1, 0)).expect("gen");
+    let (_, overlay_misses_neighbour) = source.overlay_stats();
+    let (_, terrain_misses_neighbour) = source.cache_stats();
+    assert_eq!(
+        overlay_misses_neighbour, 12,
+        "the neighbour's 3×3 adds three new overlays, got {overlay_misses_neighbour}"
+    );
+    assert_eq!(
+        terrain_misses_neighbour, 30,
+        "the neighbour's 5×5 adds a 5-chunk strip, got {terrain_misses_neighbour}"
+    );
+}
+
 /// The same chunk must generate identically however many times it is asked for.
 ///
 /// Decoration reads a shared, mutable terrain cache across threads, so this guards the obvious

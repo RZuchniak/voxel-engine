@@ -180,6 +180,7 @@ fn main() {
     }
 
     let (hits, misses) = source.cache_stats();
+    let (overlay_hits, overlay_misses) = source.overlay_stats();
     println!("\n=== what does it cost? ===");
     println!("generation total       : {elapsed:.0} ms for {chunks} chunks (analysis excluded)");
     println!("per chunk              : {:.1} ms", elapsed / chunks as f64);
@@ -188,9 +189,14 @@ fn main() {
         100.0 * hits as f64 / (hits + misses).max(1) as f64
     );
     println!(
-        "terrain generations    : {misses} for {chunks} chunks ({:.2}x — 1.00x means the cache \
-         is doing its job, 9.00x means it is not)",
+        "terrain generations    : {misses} for {chunks} chunks ({:.2}x — ~1.1x is a filled \
+         square with the 5×5 overlay neighbourhood, 5×+ means the cache is not sharing work)",
         misses as f64 / chunks as f64
+    );
+    println!(
+        "tree overlays          : {overlay_hits} hits / {overlay_misses} misses ({:.2}x — 1.00x \
+         means each chunk's trees ran once)",
+        overlay_misses as f64 / chunks as f64
     );
 
     // The browser does not look like the run above. Native shares ONE source — and therefore one

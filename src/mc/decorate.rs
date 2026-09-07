@@ -8,14 +8,17 @@
 //!
 //! `InSquarePlacement` puts a trunk anywhere in a chunk's own 16×16, and foliage reaches about
 //! three blocks past it. So a chunk's final contents depend on its **neighbours'** decoration as
-//! well as its own, and generating chunk C means running decoration for all nine chunks of its
-//! neighbourhood and keeping only the writes that land in C.
+//! well as its own. Vanilla runs each chunk's FEATURES stage **once** and writes overflow into
+//! neighbour proto-chunks (`blockStateWriteRadius(1)`). This engine is a stateless parallel
+//! `WorldSource`, so the equivalent is: compute each chunk's overlay once against its own 3×3
+//! of pristine terrain, cache it, and when assembling C apply every overlay in C's 3×3 that
+//! lands in C.
 //!
-//! Done naively that regenerates each chunk's terrain nine times (~37.6 ms each). The terrain
-//! cache in `source::SeededProceduralSource` is what makes it affordable — see the perf table in
-//! HANDOFF.md. Decoration itself reads the nine columns in place (no dense 3×3 canvas copy).
-//! **Do not "optimise" this by decorating only the centre chunk and clipping**: that leaves a
-//! sawn-off half tree on every chunk border, which is far worse than no trees.
+//! The terrain / overlay caches in `source::SeededProceduralSource` are what make that
+//! affordable — without them, assembling C would regenerate nine columns (~37.6 ms each) and
+//! re-place nine chunks' trees. **Do not "optimise" this by decorating only the centre chunk
+//! and clipping**: that leaves a sawn-off half tree on every chunk border, which is far worse
+//! than no trees.
 //!
 //! # What is exact here, and what is not
 //!
@@ -278,11 +281,62 @@ impl<'a> Neighbourhood<'a> {
     }
 }
 
+/// A chunk's own tree blocks, including those that spill into neighbours.
+///
+/// Sparse because trees are: a chunk holds a handful of them against 98304 blocks.
+pub type ChunkOverlay = Vec<((i32, i32, i32), Block)>;
+
+/// Paint every overlay write that lands in `(dest_cx, dest_cz)` onto that chunk's column.
+pub fn apply_overlay(out: &mut [Block], dest_cx: i32, dest_cz: i32, overlay: &ChunkOverlay) {
+    for &((x, y, z), block) in overlay {
+        if x.div_euclid(16) != dest_cx || z.div_euclid(16) != dest_cz {
+            continue;
+        }
+        let ly = y - MIN_Y;
+        if ly < 0 || ly >= super::chunk::HEIGHT {
+            continue;
+        }
+        let lx = x.rem_euclid(16) as usize;
+        let lz = z.rem_euclid(16) as usize;
+        out[(ly as usize) * 256 + lz * 16 + lx] = block;
+    }
+}
+
+/// One chunk's FEATURES stage: trees placed against that chunk's own 3×3 of pristine terrain.
+///
+/// `neighbours` should be the 3×3 centred on `(chunk_x, chunk_z)`. Writes that land outside
+/// that neighbourhood are dropped — they cannot belong to a chunk this view can see.
+///
+/// ⚠️ Trees are computed against pristine terrain plus only this chunk's own trees so far,
+/// never against other chunks' trees. That isolation is required, not tidiness: chunk N is
+/// assembled both when generating N and when generating each of its 8 neighbours, and those
+/// runs must produce the *same* overlay or a canopy appears on one side of a border and not
+/// the other. Vanilla decorates in world-generation order and does let a later chunk see an
+/// earlier one's trees; reproducing that needs generation *order* as an input, which a
+/// stateless parallel `WorldSource` does not have.
+pub fn decorate_one(
+    seed: i64,
+    chunk_x: i32,
+    chunk_z: i32,
+    neighbours: &[NeighbourTerrain<'_>],
+) -> ChunkOverlay {
+    let Some(chunk) = neighbours
+        .iter()
+        .find(|n| n.chunk_x == chunk_x && n.chunk_z == chunk_z)
+    else {
+        return Vec::new();
+    };
+    let neighbourhood = Neighbourhood::new(chunk_x, chunk_z, neighbours);
+    decorate_chunk(seed, chunk, &neighbourhood)
+}
+
 /// Decorate the 3×3 neighbourhood around `(centre_x, centre_z)` and return the centre chunk's
 /// blocks with trees written in.
 ///
 /// `neighbours` must contain all nine chunks; anything missing is simply not decorated, which
-/// loses that chunk's trees rather than producing wrong ones.
+/// loses that chunk's trees rather than producing wrong ones. The live path caches each
+/// [`decorate_one`] result instead of going through here; this remains the headless/bench
+/// entry so a pre-warmed 3×3 can be measured without the source caches.
 pub fn decorate_centre(
     seed: i64,
     centre_x: i32,
@@ -296,60 +350,24 @@ pub fn decorate_centre(
         return vec![Block::Air; (16 * 16 * super::chunk::HEIGHT) as usize];
     };
 
-    let neighbourhood = Neighbourhood::new(centre_x, centre_z, neighbours);
-
     // Start from the centre's pristine column and paint overlays on top. Avoids the old
     // allocate-stone → copy-nine-in → extract-centre round trip (~1.5 ms of pure memcpy).
     let mut out = centre.blocks.blocks.clone();
-
-    // Decorate every chunk of the neighbourhood against **pristine** terrain only.
-    //
-    // ⚠️ Each chunk's trees are computed against pristine terrain plus only its own trees so
-    // far, never against other chunks' trees, and are merged into the centre afterwards. That
-    // isolation is required, not tidiness: chunk N is decorated both when generating N and when
-    // generating each of its 8 neighbours, and those runs see *different* neighbourhoods. If a
-    // tree's clearance check could see a neighbouring chunk's canopy, N would grow different
-    // trees depending on which chunk was being generated — so a canopy would appear on one side
-    // of a border and not the other. That is exactly what
-    // `correctness_trees::a_canopy_crossing_a_chunk_border_is_not_cut_off` caught.
-    //
-    // This is a deliberate divergence from vanilla, which decorates chunks in world-generation
-    // order and does let a later chunk see an earlier one's trees. Reproducing that needs
-    // generation *order* as an input, which a stateless parallel `WorldSource` does not have.
-    // The visible cost is that trees from adjacent chunks may interpenetrate slightly rather
-    // than yielding to each other.
     for neighbour in neighbours {
-        let overlay = decorate_chunk(seed, neighbour, &neighbourhood);
-        for ((x, y, z), block) in overlay {
-            if x.div_euclid(16) != centre_x || z.div_euclid(16) != centre_z {
-                continue;
-            }
-            let ly = y - MIN_Y;
-            if ly < 0 || ly >= super::chunk::HEIGHT {
-                continue;
-            }
-            let lx = x.rem_euclid(16) as usize;
-            let lz = z.rem_euclid(16) as usize;
-            out[(ly as usize) * 256 + lz * 16 + lx] = block;
-        }
+        let overlay = decorate_one(seed, neighbour.chunk_x, neighbour.chunk_z, neighbours);
+        apply_overlay(&mut out, centre_x, centre_z, &overlay);
     }
-
     out
 }
-
-/// A chunk's own tree blocks, before they are merged into the centre column.
-///
-/// Sparse because trees are: a chunk holds a handful of them against 98304 blocks.
-type Overlay = Vec<((i32, i32, i32), Block)>;
 
 /// Reads pristine terrain plus this chunk's own trees; writes only to the overlay.
 ///
 /// The split is what makes a chunk's decoration independent of which neighbourhood it is being
-/// decorated in — see the note in [`decorate_centre`].
+/// decorated in — see the note in [`decorate_one`].
 struct OverlayCanvas<'a> {
     base: &'a Neighbourhood<'a>,
     written: std::collections::HashMap<(i32, i32, i32), Block>,
-    overlay: Overlay,
+    overlay: ChunkOverlay,
 }
 
 impl TreeCanvas for OverlayCanvas<'_> {
@@ -381,7 +399,7 @@ impl TreeCanvas for OverlayCanvas<'_> {
 ///
 /// Mirrors `applyBiomeDecoration`'s inner loop: seed once per chunk from the block origin, then
 /// per feature re-seed with `setFeatureSeed` before running its placement chain.
-fn decorate_chunk(seed: i64, neighbour: &NeighbourTerrain<'_>, base: &Neighbourhood<'_>) -> Overlay {
+fn decorate_chunk(seed: i64, neighbour: &NeighbourTerrain<'_>, base: &Neighbourhood<'_>) -> ChunkOverlay {
     let origin_x = neighbour.chunk_x * 16;
     let origin_z = neighbour.chunk_z * 16;
 

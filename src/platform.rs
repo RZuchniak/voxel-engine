@@ -1,5 +1,37 @@
 /// Runtime tuning — tighter on wasm for browser memory and single-threaded meshing.
 
+/// Whether diagnostic logging is on. Off by default — the profile line and startup chatter
+/// otherwise flood stdout every second while you play.
+///
+/// Native: **`VOXEL_LOG=1`** or **`--log`** / **`-v`**. `0` forces it off.
+/// Wasm: **`?log=1`** in the page URL (console, not stdout).
+#[inline]
+pub fn logging_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            url_query_param("log")
+                .map(|v| v.trim() != "0" && !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            if std::env::args().any(|arg| arg == "--log" || arg == "-v") {
+                return true;
+            }
+            std::env::var("VOXEL_LOG")
+                .map(|v| v.trim() != "0" && !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// One diagnostic line, on whichever target this is running.
 ///
 /// ⚠️ **`println!` reaches nobody in a browser.** The wasm build installs
@@ -9,6 +41,9 @@
 /// build prints simply do not exist in a tab. Anything that has to be readable on both targets
 /// must go through here.
 pub fn log_line(message: &str) {
+    if !logging_enabled() {
+        return;
+    }
     #[cfg(target_arch = "wasm32")]
     {
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(message));
@@ -394,6 +429,44 @@ pub const PENDING_BACKLOG_EXTRA_PRI_REMESH: usize = 4;
 pub const PENDING_BACKLOG_EXTRA_NEIGHBOR_REMESH: usize = 3;
 pub const MIN_SECTION_DRAW_DISTANCE_CHUNKS: f32 = 4.0;
 
+/// Native render-loop ceiling, in frames per second. `0` means uncapped.
+///
+/// The event loop otherwise spins as fast as the GPU will take frames
+/// (`ControlFlow::Poll` + redraw-on-wait), which is what pegs a whole machine at the
+/// 800–1500 FPS the profile line has historically printed. 300 is high enough that
+/// look/move still feel instant and low enough to leave CPU for the generator pool
+/// and the rest of the OS. The browser build is paced by `requestAnimationFrame`
+/// and ignores this.
+///
+/// Native override: **`VOXEL_FPS_CAP=<n>`**; `0` removes the cap.
+#[inline]
+pub fn native_fps_cap() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static CAP: OnceLock<u32> = OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("VOXEL_FPS_CAP")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(300)
+        })
+    }
+}
+
+/// Minimum time between native frames, or `None` when uncapped.
+#[inline]
+pub fn native_min_frame_time() -> Option<std::time::Duration> {
+    match native_fps_cap() {
+        0 => None,
+        fps => Some(std::time::Duration::from_nanos(1_000_000_000 / u64::from(fps))),
+    }
+}
+
 /// The frame time streaming is allowed to cost before it starts giving budget back.
 ///
 /// Wasm is stricter (50 FPS vs 30) because everything that costs frame time there — meshing,
@@ -518,6 +591,33 @@ mod tests {
         // `max_section_draw_distance_chunks` is what `[` / `]` clamp to. If an override pushed the
         // start above the ceiling, the first keypress would yank it back down.
         assert!(max_section_draw_distance_chunks() >= default_section_draw_distance_chunks());
+    }
+
+    #[test]
+    fn diagnostic_logging_defaults_off() {
+        // Same OnceLock caveat as the fps-cap test: only asserts the compiled default.
+        if cfg!(not(target_arch = "wasm32"))
+            && std::env::var_os("VOXEL_LOG").is_none()
+            && !std::env::args().any(|arg| arg == "--log" || arg == "-v")
+        {
+            assert!(!logging_enabled());
+        }
+    }
+
+    #[test]
+    fn native_frame_pacing_defaults_to_300_on_native() {
+        // The env override is a OnceLock and tests must not depend on it being unset after
+        // another test has already read it; this only asserts the compiled default.
+        if cfg!(target_arch = "wasm32") {
+            assert_eq!(native_fps_cap(), 0);
+            assert!(native_min_frame_time().is_none());
+        } else if std::env::var_os("VOXEL_FPS_CAP").is_none() {
+            assert_eq!(native_fps_cap(), 300);
+            assert_eq!(
+                native_min_frame_time(),
+                Some(std::time::Duration::from_nanos(1_000_000_000 / 300))
+            );
+        }
     }
 }
 

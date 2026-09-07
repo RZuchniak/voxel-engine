@@ -254,8 +254,8 @@ impl ChunkStreamer {
                     // coord. Do **not** fall through to main-thread generation.
                     //
                     // Before trees that fallback was merely slow; with trees each sync
-                    // `load_chunk` walks a 3×3 neighbourhood (~2× terrain gens on a warm
-                    // worker cache, up to 9× on a cold one). The streamer can request up to
+                    // `load_chunk` walks the overlay neighbourhood (a 5×5 of terrain on a
+                    // cold cache). The streamer can request up to
                     // `procedural_max_new_requests_per_frame` chunks per frame, so a full
                     // worker queue turned into a multi-second UI freeze — exactly the hitch
                     // felt while flying into unloaded terrain. Returning false leaves the

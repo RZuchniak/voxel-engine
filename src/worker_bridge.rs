@@ -157,10 +157,11 @@ impl WorkerBridgeInner {
     /// Which worker should generate this chunk.
     ///
     /// **Not round-robin, and that matters a lot.** Generating a chunk requires the terrain of
-    /// its whole 3×3 neighbourhood (trees cross chunk borders — see `mc::decorate`), and every
-    /// web worker has its **own** `SeededProceduralSource` with its own `TerrainCache`; nothing
-    /// is shared between them. Under round-robin a worker receives every Nth chunk of the
-    /// streaming spiral, so it almost never already holds a neighbour and regenerates all nine.
+    /// its overlay neighbourhood (trees cross chunk borders — see `mc::decorate`), and every
+    /// web worker has its **own** `SeededProceduralSource` with its own caches; nothing is
+    /// shared between them. Under round-robin a worker receives every Nth chunk of the
+    /// streaming spiral, so it almost never already holds a neighbour and regenerates the
+    /// whole 5×5.
     ///
     /// Measured by `examples/diag_trees`'s dispatch simulation — terrain generations per chunk,
     /// where 1.00× means the cache is doing its job and 9.00× means it is not:
