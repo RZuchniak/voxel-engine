@@ -4,6 +4,8 @@
 /// otherwise flood stdout every second while you play.
 ///
 /// Native: **`VOXEL_LOG=1`** or **`--log`** / **`-v`**. `0` forces it off.
+/// Also on when **`VOXEL_AUTOPILOT`** is set, so a live profiling flight still prints
+/// the `profile` line.
 /// Wasm: **`?log=1`** in the page URL (console, not stdout).
 #[inline]
 pub fn logging_enabled() -> bool {
@@ -23,6 +25,17 @@ pub fn logging_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             if std::env::args().any(|arg| arg == "--log" || arg == "-v") {
+                return true;
+            }
+            // Autopilot is the live-app profiling path (`examples/profile_fly` prints
+            // `VOXEL_AUTOPILOT=forward`). The engine `profile` line is behind this gate.
+            if std::env::var("VOXEL_AUTOPILOT")
+                .map(|v| {
+                    let v = v.trim();
+                    !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+                })
+                .unwrap_or(false)
+            {
                 return true;
             }
             std::env::var("VOXEL_LOG")
@@ -51,6 +64,36 @@ pub fn log_line(message: &str) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         println!("{message}");
+    }
+}
+
+/// Copyable on-screen streaming HUD. Off by default so play is uncluttered.
+///
+/// Wasm: **`?debug=1`** (F3 also toggles it). Native: **`VOXEL_DEBUG=1`** or **`--debug`**.
+#[inline]
+pub fn debug_overlay_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            url_query_param("debug")
+                .map(|v| v.trim() != "0" && !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            if std::env::args().any(|arg| arg == "--debug") {
+                return true;
+            }
+            std::env::var("VOXEL_DEBUG")
+                .map(|v| v.trim() != "0" && !v.trim().is_empty())
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -145,12 +188,11 @@ pub fn max_section_draw_distance_chunks() -> f32 {
 /// world is revealed, so raising it trades a longer wait for a cleaner arrival — fewer
 /// frame-time dips and less pop-in while the rest streams in behind you.
 ///
-/// **On wasm this is the whole render distance**, deliberately. It used to be 3 (49 chunks)
-/// against a load radius of 12 (625), so the reveal was followed by ~576 chunks arriving at
-/// once — generated off-thread, but meshed and uploaded on the main thread, which is what made
-/// the first stretch of play choppy until the queue reached zero. Building the full radius up
-/// front moves that work behind the loading screen, where frame time is free. It costs a
-/// 10–20 s wait; `?loading_radius=<chunks>` in the page URL overrides it (0 disables the wait).
+/// Wasm defaults to **4** (81 chunks) of a 12-chunk stream radius. It used to wait on the
+/// whole 12 (625 chunks), which made the loading screen the slowest part of opening a
+/// world. The rest streams in after reveal; workers mesh on load and skip empty sky
+/// (caves still generate). `?loading_radius=<chunks>` in the page URL overrides it
+/// (0 disables the wait).
 ///
 /// Native default stays 12 of a 20 radius, overridable with `VOXEL_LOADING_RADIUS=<chunks>`:
 /// native meshes on a worker pool, so its post-reveal burst is far cheaper.
@@ -164,7 +206,7 @@ pub fn bootstrap_chunk_radius() -> i32 {
             url_query_param("loading_radius")
                 .and_then(|v| v.trim().parse::<i32>().ok())
                 .map(|v| v.clamp(0, load_distance_chunks()))
-                .unwrap_or_else(load_distance_chunks)
+                .unwrap_or(4)
         })
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -370,12 +412,12 @@ pub const fn bootstrap_extra_neighbor_remesh_per_frame() -> usize {
     }
 }
 
-/// Scale with the machine, leaving a core for the main thread. The bridge clamps to 4.
+/// Scale with the machine, leaving a core for the main thread. The bridge clamps to 6.
 #[cfg(target_arch = "wasm32")]
 pub fn wasm_worker_count() -> usize {
     web_sys::window()
         .map(|window| window.navigator().hardware_concurrency() as usize)
-        .map(|cores| cores.saturating_sub(1).clamp(1, 4))
+        .map(|cores| cores.saturating_sub(1).clamp(1, 6))
         .unwrap_or(2)
 }
 
@@ -384,7 +426,7 @@ pub const fn wasm_worker_count() -> usize {
     2
 }
 
-/// Web chunk workers are fixed; load + mesh run off the main thread.
+/// Web workers generate terrain and the first mesh; the main thread uploads.
 #[inline]
 pub const fn use_wasm_chunk_workers() -> bool {
     true
@@ -565,11 +607,12 @@ mod tests {
     }
 
     #[test]
-    fn the_loading_screen_covers_the_whole_render_distance_on_wasm() {
-        // The point of the change: nothing is left to stream in when the world is revealed, so
-        // there is no post-reveal burst of main-thread meshing and uploading.
+    fn the_loading_screen_is_inside_the_stream_radius() {
+        // Wasm used to wait on the whole stream radius (625 chunks) and that *was* the
+        // loading-screen stall. It now starts smaller and streams the rest after reveal.
         if cfg!(target_arch = "wasm32") {
-            assert_eq!(bootstrap_chunk_radius(), load_distance_chunks());
+            assert!(bootstrap_chunk_radius() < load_distance_chunks());
+            assert_eq!(bootstrap_chunk_radius(), 4);
         } else {
             assert!(bootstrap_chunk_radius() <= load_distance_chunks());
         }
@@ -598,6 +641,7 @@ mod tests {
         // Same OnceLock caveat as the fps-cap test: only asserts the compiled default.
         if cfg!(not(target_arch = "wasm32"))
             && std::env::var_os("VOXEL_LOG").is_none()
+            && std::env::var_os("VOXEL_AUTOPILOT").is_none()
             && !std::env::args().any(|arg| arg == "--log" || arg == "-v")
         {
             assert!(!logging_enabled());
@@ -621,19 +665,41 @@ mod tests {
     }
 }
 
-/// How much of an imported Anvil chunk to decode, below its lowest column top.
+/// Whether seeded wasm worlds skip empty sky above the terrain.
 ///
-/// **This no longer touches the procedural path or the mesher** — seeded worlds generate the
-/// full `-64..320` column and every populated section is meshed. It survives only as a memory
-/// bound on zip imports, where a full NBT decode of every chunk in the load radius is real
-/// browser memory (see `surface_only_chunk_load`).
+/// Native keeps the full `-64..320` column. Wasm still generates **down to bedrock** (caves
+/// exist) but stops a little above the surface instead of sampling ~200 blocks of air.
+/// `?full_column=1` restores the native-style full column.
+#[inline]
+pub fn procedural_surface_band() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::sync::OnceLock;
+        static BANDED: OnceLock<bool> = OnceLock::new();
+        *BANDED.get_or_init(|| {
+            !url_query_param("full_column").is_some_and(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+/// How far below the preliminary surface to decode for **zip imports**.
+///
+/// Seeded wasm worlds no longer use this — they generate down to bedrock and only skip
+/// empty sky (`procedural_surface_band`). Zip NBT decode still bands to bound browser memory.
 ///
 /// `VOXEL_MESH_DEPTH=<blocks>` overrides it on native.
 #[inline]
 pub fn surface_band_depth_blocks() -> i32 {
     #[cfg(target_arch = "wasm32")]
     {
-        24
+        48
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

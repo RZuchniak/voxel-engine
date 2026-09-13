@@ -57,11 +57,11 @@ Deploy the contents of `dist/` to any static host (GitHub Pages, Cloudflare Page
 
 On `wasm32`, the engine uses a reduced profile:
 
-- **Seed worlds** — chunks generated on the main thread (fast bootstrap, no workers)
-- **Zip import** — optional **2 Web Workers** load chunks off the main thread during streaming (after bootstrap)
-- Stream distance: **16 chunks** (desktop: 40)
-- Section draw distance: **16 chunks** (desktop: 40)
-- Bootstrap radius: **3 chunks** (desktop: 8)
+- **Seed worlds** — chunks generated **and meshed** on Web Workers (up to 6)
+- Stream distance: **12 chunks** (desktop: 20)
+- Section draw distance: **12 chunks** (desktop: 20)
+- Loading screen: **4 chunks** (81 tiles; desktop: 12 of 20). Override with `?loading_radius=<n>`
+- Terrain: generate **down to bedrock**, skip empty sky. `?full_column=1` samples the whole `-64..320` column.
 
 Use a **release build** for playable performance:
 
@@ -71,9 +71,20 @@ trunk serve --release --open
 
 Adjust draw distance at runtime with `[` and `]` after the world loads.
 
+### Browser debug overlay
+
+Native is too fast to show streaming problems. In the tab:
+
+- Open `http://127.0.0.1:8080/?debug=1` (or press **F3** in-game)
+- Press **P** to release the mouse, then select the overlay text and paste it
+- `?log=1` also prints the same `profile` line to the browser console once a second
+
+The overlay's `new=/s` is the number to watch: that is how fast chunks actually appear. `workers queued / in_flight` stuck high with a low `new=/s` means generation, not FPS.
+
 ## Controls
 
 - Click the canvas to capture the mouse (web only)
 - **WASD** — move, **Space/Shift** — up/down
 - **P** — release mouse
+- **F3** — toggle the copyable debug overlay
 - Mouse — look

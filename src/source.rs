@@ -132,15 +132,15 @@ fn cache_get<T>(
 }
 
 /// How many undecorated chunks to keep. A chunk column is ~885 KB as `ChunkBlocks` (one byte per
-/// block over the full −64..320 range), so 256 entries is roughly **220 MB** — chosen to comfortably
-/// cover the 5×5 working set of several concurrently-generating worker threads (each overlay
-/// needs its own 3×3 of terrain) without becoming a second memory budget to manage. Lower it
-/// before raising the load distance.
-const TERRAIN_CACHE_CAPACITY: usize = 256;
+/// block over the full −64..320 range). Native 256 is ~220 MB, shared across the pool. Wasm
+/// gives **each worker** its own cache, so 256×4 was nearly a gigabyte of copies — enough to
+/// stall a tab after flying for a while. 96 still covers an 8-chunk affinity tile plus the
+/// 5×5 overlay neighbourhood.
+const TERRAIN_CACHE_CAPACITY: usize = if cfg!(target_arch = "wasm32") { 96 } else { 256 };
 
 /// Tree overlays are a handful of blocks. Keep more of them than terrain columns: recomputing
 /// an overlay is cheap only when the 3×3 of terrain is still resident.
-const OVERLAY_CACHE_CAPACITY: usize = 512;
+const OVERLAY_CACHE_CAPACITY: usize = if cfg!(target_arch = "wasm32") { 192 } else { 512 };
 
 impl SeededProceduralSource {
     pub fn new(seed: i64) -> Self {
@@ -161,7 +161,19 @@ impl SeededProceduralSource {
     /// in-flight generation instead of racing.
     fn terrain(&self, coord: (i32, i32)) -> Arc<crate::mc::chunk::ChunkBlocks> {
         cache_get(&self.terrain_cache, coord, || {
-            crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, coord.0, coord.1)
+            if crate::platform::procedural_surface_band() {
+                // Down to bedrock, skip empty sky. A shallow depth leaves a hollow shell —
+                // floating slabs if you fly underneath.
+                crate::mc::chunk::generate_chunk_surface(
+                    &self.overworld,
+                    &self.surface,
+                    coord.0,
+                    coord.1,
+                    i32::MAX,
+                )
+            } else {
+                crate::mc::chunk::generate_chunk(&self.overworld, &self.surface, coord.0, coord.1)
+            }
         })
     }
 
@@ -210,17 +222,11 @@ impl SeededProceduralSource {
 impl WorldSource for SeededProceduralSource {
     fn load_chunk(&self, coord: (i32, i32)) -> Result<Chunk> {
         let (cx, cz) = coord;
-        // The **whole** column, `-64..320`, exactly as Minecraft generates it. The renderer
-        // avoids drawing the underground with the section occlusion graph
-        // (`platform::section_occlusion_culling`), not by omitting it — a surface band is a
-        // stand-in for that algorithm, and it shows: caves cut off in mid-air, a hollow shell
-        // from below, and terrain that falls out of the band on slopes.
-        //
-        // Vanilla FEATURES writes tree overflow into neighbour proto-chunks and never re-runs
-        // that chunk's decoration. The overlay cache is that proto-chunk: each coord is
-        // decorated once against its own 3×3 of terrain, and assembling C paints every overlay
-        // in C's 3×3 that lands in C. The 5×5 of terrain that implies is generated once per
-        // coord (and coalesced if several workers need it at once).
+        // On wasm this is a surface band (`platform::procedural_surface_band`); native is the
+        // whole `-64..320` column. Trees still run against that terrain: each coord is decorated
+        // once against its own 3×3, and assembling C paints every overlay in C's 3×3 that
+        // lands in C. The 5×5 of terrain that implies is generated once per coord (and coalesced
+        // if several workers need it at once).
         let generated = self.terrain(coord);
         let mut decorated = generated.blocks.clone();
         for dz in -1..=1 {

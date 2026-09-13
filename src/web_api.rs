@@ -254,3 +254,23 @@ pub fn hide_click_to_play() {
     }
     hide_load_overlay();
 }
+
+/// Selectable streaming stats. `None` hides the panel.
+#[cfg(target_arch = "wasm32")]
+pub fn set_perf_overlay(text: Option<&str>) {
+    let Some(document) = document() else {
+        return;
+    };
+    let Some(el) = document.get_element_by_id("perf-overlay") else {
+        return;
+    };
+    match text {
+        Some(text) => {
+            el.set_text_content(Some(text));
+            let _ = el.class_list().remove_1("hidden");
+        }
+        None => {
+            let _ = el.class_list().add_1("hidden");
+        }
+    }
+}

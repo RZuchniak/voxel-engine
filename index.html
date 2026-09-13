@@ -111,6 +111,23 @@
         #load-overlay.hidden { display: none; }
         #load-status { color: #9fb0d0; font-size: 0.9rem; }
         #load-error { color: #ff8a8a; font-size: 0.9rem; margin-top: 0.25rem; min-height: 1rem; }
+        #perf-overlay {
+            position: fixed;
+            top: 8px;
+            right: 8px;
+            z-index: 40;
+            max-width: min(36rem, 92vw);
+            padding: 0.6rem 0.75rem;
+            border-radius: 8px;
+            background: rgba(8, 10, 16, 0.88);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            color: #d5deea;
+            font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+            white-space: pre-wrap;
+            user-select: text;
+            pointer-events: auto;
+        }
+        #perf-overlay.hidden { display: none; }
         .hint { font-size: 0.82rem; color: #8a96ad; margin-top: 0.75rem; }
         .hint strong { color: #b8c4d9; font-weight: 600; }
         .controls-hint code {
@@ -153,16 +170,21 @@
             <button id="load-url-btn" type="button" class="secondary">Load from URL</button>
             <div id="menu-status">Waiting for WASM…</div>
             <div id="menu-error"></div>
+            <p class="hint">
+                Slow streaming? Open with <code>?debug=1</code> or press <code>F3</code> in-game
+                for a copyable overlay (press <code>P</code> first so you can select the text).
+            </p>
             <p class="hint">Seed mode builds terrain in the browser. Zip import reads <code>region/*.mca</code> from a saved world folder.</p>
             <p class="hint">Unofficial fan project — not affiliated with, endorsed by, or a substitute for Mojang Studios or Microsoft. Minecraft is a trademark of Mojang Synergies AB.</p>
         </div>
     </div>
-    <div id="click-to-play" class="hidden">Click to play · WASD move · Mouse look · P release cursor · [ ] draw distance (square brackets)</div>
+    <div id="click-to-play" class="hidden">Click to play · WASD move · Mouse look · P release cursor · [ ] draw distance · F3 debug</div>
     <canvas id="voxel-canvas" class="hidden"></canvas>
     <div id="load-overlay" class="hidden">
         <div id="load-status"></div>
         <div id="load-error"></div>
     </div>
+    <pre id="perf-overlay" class="hidden"></pre>
     <script type="module">
         function loadMenu() {
             if (window.__voxelMenuLoaded) return;

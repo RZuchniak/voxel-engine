@@ -80,3 +80,10 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# Release-speed numbers without fat LTO. Use this for `diag_trees` /
+# `profile_fly` when iterating on gen-time bugs; `profiling` is for samply.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16

@@ -264,6 +264,12 @@ struct State {
     /// Seed-mode world: chunks are generated rather than read from a save, which is far more
     /// expensive per chunk and gets larger streaming budgets.
     procedural_world: bool,
+    /// F3 / `?debug=1` — extra HUD lines and the copyable HTML overlay.
+    debug_hud: bool,
+    debug_new_per_sec: f32,
+    debug_remesh_per_sec: f32,
+    debug_sec_new: usize,
+    debug_sec_remesh: usize,
 }
 
 impl State {
@@ -775,6 +781,11 @@ impl State {
             smart_cull_last_frame: true,
             reachable_sections_last_frame: 0,
             procedural_world,
+            debug_hud: platform::debug_overlay_enabled(),
+            debug_new_per_sec: 0.0,
+            debug_remesh_per_sec: 0.0,
+            debug_sec_new: 0,
+            debug_sec_remesh: 0,
         };
     }
 
@@ -809,33 +820,113 @@ impl State {
         ];
         self.queue
             .write_buffer(&self.sky_buffer, 0, bytemuck::cast_slice(&[self.sky_uniform]));
-        if platform::logging_enabled() {
-            self.profile_accum += self.delta;
-            if self.profile_accum > 1_000_000 {
-                platform::log_line(&format!(
-                    "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={} smart_cull={} stream_scale={:.2}",
-                    self.started_at.elapsed().as_secs_f64(),
-                    self.world_ready,
-                    self.fps_ema,
-                    self.visible_draw_calls_last_frame,
-                    self.visible_chunks_last_frame,
-                    self.uploaded_meshes_last_frame,
-                    self.drained_new_last_frame,
-                    self.drained_remesh_last_frame,
-                    self.phase_stream_us,
-                    self.phase_mesh_us,
-                    self._world.chunks().count(),
-                    self.pending_ready.len(),
-                    self.chunk_requests_issued,
-                    self.chunks_meshed,
-                    self.resident_quads(),
-                    self.reachable_sections_last_frame,
-                    self.smart_cull_last_frame,
-                    self.streaming_scale_last_frame,
-                ));
-                self.profile_accum = 0;
+        self.tick_streaming_stats();
+    }
+
+    fn tick_streaming_stats(&mut self) {
+        self.profile_accum += self.delta;
+        self.debug_sec_new += self.drained_new_last_frame;
+        self.debug_sec_remesh += self.drained_remesh_last_frame;
+        if self.profile_accum <= 1_000_000 {
+            if self.debug_hud && self.profile_accum == self.delta {
+                self.publish_debug_overlay();
             }
+            return;
         }
+        let secs = self.profile_accum as f32 / 1_000_000.0;
+        self.debug_new_per_sec = self.debug_sec_new as f32 / secs;
+        self.debug_remesh_per_sec = self.debug_sec_remesh as f32 / secs;
+        if platform::logging_enabled() {
+            platform::log_line(&self.profile_line());
+        }
+        self.publish_debug_overlay();
+        self.profile_accum = 0;
+        self.debug_sec_new = 0;
+        self.debug_sec_remesh = 0;
+    }
+
+    fn profile_line(&self) -> String {
+        format!(
+            "profile t={:.1}s ready={} fps={:.0} visible_draws={} visible_chunks={} uploaded_meshes={} (new={} remesh={}) stream={}us mesh={}us loaded_chunks={} pending={} requests={} meshed={} quads={} reachable_sections={} smart_cull={} stream_scale={:.2} new_per_s={:.1} remesh_per_s={:.1}",
+            self.started_at.elapsed().as_secs_f64(),
+            self.world_ready,
+            self.fps_ema,
+            self.visible_draw_calls_last_frame,
+            self.visible_chunks_last_frame,
+            self.uploaded_meshes_last_frame,
+            self.drained_new_last_frame,
+            self.drained_remesh_last_frame,
+            self.phase_stream_us,
+            self.phase_mesh_us,
+            self._world.chunks().count(),
+            self.pending_ready.len(),
+            self.chunk_requests_issued,
+            self.chunks_meshed,
+            self.resident_quads(),
+            self.reachable_sections_last_frame,
+            self.smart_cull_last_frame,
+            self.streaming_scale_last_frame,
+            self.debug_new_per_sec,
+            self.debug_remesh_per_sec,
+        )
+    }
+
+    fn debug_overlay_text(&self) -> String {
+        #[cfg(target_arch = "wasm32")]
+        let workers = self
+            .streamer
+            .worker_status()
+            .map(|(ready, total, queued, in_flight)| {
+                format!("workers {ready}/{total}  queued={queued}  in_flight={in_flight}")
+            })
+            .unwrap_or_else(|| "workers: none (main thread)".to_string());
+        #[cfg(not(target_arch = "wasm32"))]
+        let workers = "workers: native rayon pool".to_string();
+        format!(
+            "F3 hide · P then select to copy\n\
+t={:.1}s  fps={:.0}  ready={}\n\
+loaded={}  visible={}  pending={}\n\
+new={:.1}/s  remesh={:.1}/s\n\
+requests={}  meshed={}  scale={:.2}\n\
+stream={}us  mesh={}us  quads={}\n\
+{workers}\n\
+band={}  load={}  boot={}",
+            self.started_at.elapsed().as_secs_f64(),
+            self.fps_ema,
+            self.world_ready,
+            self._world.chunks().count(),
+            self.visible_chunks_last_frame,
+            self.pending_ready.len(),
+            self.debug_new_per_sec,
+            self.debug_remesh_per_sec,
+            self.chunk_requests_issued,
+            self.chunks_meshed,
+            self.streaming_scale_last_frame,
+            self.phase_stream_us,
+            self.phase_mesh_us,
+            self.resident_quads(),
+            platform::procedural_surface_band(),
+            platform::load_distance_chunks(),
+            platform::bootstrap_chunk_radius(),
+        )
+    }
+
+    fn publish_debug_overlay(&self) {
+        if !self.debug_hud {
+            #[cfg(target_arch = "wasm32")]
+            web_api::set_perf_overlay(None);
+            return;
+        }
+        let text = self.debug_overlay_text();
+        #[cfg(target_arch = "wasm32")]
+        web_api::set_perf_overlay(Some(&text));
+        #[cfg(not(target_arch = "wasm32"))]
+        println!("{text}");
+    }
+
+    fn toggle_debug_hud(&mut self) {
+        self.debug_hud = !self.debug_hud;
+        self.publish_debug_overlay();
     }
 
     fn chunk_has_any_gpu_section(&self, coord: (i32, i32)) -> bool {
@@ -1149,6 +1240,10 @@ impl State {
                 continue;
             }
             if let Some(chunk) = meshed.chunk {
+                if meshed.visibility.is_none() {
+                    self.chunk_visibility
+                        .insert(coord, visibility::chunk_visibility(&chunk));
+                }
                 self._world.insert_chunk(chunk);
             }
             if let Some(visibility) = meshed.visibility {
@@ -1527,17 +1622,30 @@ impl State {
         };
         let boot_total = Self::bootstrap_tile_count();
         let hud_text = if self.world_ready {
+            #[cfg(target_arch = "wasm32")]
+            let worker_line = self
+                .streamer
+                .worker_status()
+                .map(|(ready, total, queued, in_flight)| {
+                    format!("\nWorkers: {ready}/{total} q={queued} fly={in_flight}")
+                })
+                .unwrap_or_default();
+            #[cfg(not(target_arch = "wasm32"))]
+            let worker_line = String::new();
             format!(
-                "FPS: {:.0}\nChunks loaded: {}\nVisible chunks: {}\nSection draws: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {:.1} chunks ({} blocks)\nMesh upload queue: {}\n[ / ] adjust draw distance",
+                "FPS: {:.0}\nChunks loaded: {}\nVisible chunks: {}\nNew chunks/s: {:.0} (remesh {:.0}/s)\nSection draws: {}\nStream radius: {} chunks ({} blocks)\nSection draw radius: {:.1} chunks ({} blocks)\nMesh upload queue: {}{}\n[ / ] draw distance · F3 debug",
                 self.fps_ema,
                 self._world.chunks().count(),
                 self.visible_chunks_last_frame,
+                self.debug_new_per_sec,
+                self.debug_remesh_per_sec,
                 self.visible_draw_calls_last_frame,
                 platform::load_distance_chunks(),
                 stream_blocks,
                 self.section_draw_distance_chunks,
                 section_cull_blocks,
                 self.pending_ready.len(),
+                worker_line,
             )
         } else {
             #[cfg(target_arch = "wasm32")]
@@ -1847,7 +1955,7 @@ impl ApplicationHandler for App {
             platform::log_line(&format!("generating world from seed {seed}"));
         }
         if autopilot_forward() {
-            println!("VOXEL_AUTOPILOT=forward — holding W after the world is revealed");
+            platform::log_line("VOXEL_AUTOPILOT=forward — holding W after the world is revealed");
         }
         let world_source: Arc<dyn source::WorldSource> =
             Arc::new(source::SeededProceduralSource::new(seed));
@@ -1971,6 +2079,11 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::KeyP) => {
                             if key_state == ElementState::Pressed {
                                 state.set_mouse_capture(!state.mouse_captured);
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::F3) => {
+                            if key_state == ElementState::Pressed {
+                                state.toggle_debug_hud();
                             }
                         }
                         PhysicalKey::Code(KeyCode::BracketLeft) => {

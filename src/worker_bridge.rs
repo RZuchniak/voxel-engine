@@ -342,7 +342,7 @@ pub enum WorkerSource<'a> {
 impl WorkerBridge {
     pub fn start(source: WorkerSource<'_>, worker_count: usize) -> Result<Self, String> {
         let (wasm_js, wasm_module) = wasm_urls()?;
-        let worker_count = worker_count.clamp(1, 4);
+        let worker_count = worker_count.clamp(1, 6);
         let inner = Rc::new(RefCell::new(WorkerBridgeInner {
             workers: Vec::with_capacity(worker_count),
             next_worker: 0,
@@ -678,8 +678,7 @@ fn reply_to_meshed(reply: WorkerReply) -> Option<MeshedChunk> {
                 section_meshes,
                 is_remesh: false,
                 // Section connectivity is not on the worker wire yet. Absent visibility reads
-                // as "fully transparent", which only ever draws too much — and section
-                // occlusion culling is off on wasm regardless.
+                // as "fully transparent", which only ever draws too much.
                 visibility: None,
             })
         }

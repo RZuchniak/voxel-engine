@@ -121,14 +121,11 @@ pub fn generate_chunk_timed(
 /// performance guess, not a correctness assumption.
 const CEILING_MARGIN: i32 = 32;
 
-/// Generate only the band near the surface: everything from the terrain top down to
-/// `depth` blocks below it. Blocks outside the band are left as air.
+/// Generate a column that always includes the underground, but skips empty sky.
 ///
-/// This is the streaming path. It exists because the renderer already refuses to mesh
-/// anything more than [`crate::platform::surface_band_depth_blocks`] below a chunk's top
-/// (24 on wasm, 48 native) — so generating the other ~300 blocks was work that could never
-/// be seen. **It is a rendering optimisation, not a parity one**: deep terrain and caves
-/// genuinely are not generated, so never point a parity harness at this function.
+/// `depth` is how far below the preliminary surface to go. Pass [`i32::MAX`] to generate
+/// down to [`MIN_Y`] (real caves; only air above the terrain ceiling is skipped). A small
+/// depth is the old hollow-shell path and will look like floating slabs from below.
 pub fn generate_chunk_surface(
     ow: &Overworld,
     surface: &SurfaceSystem,
@@ -154,8 +151,11 @@ pub fn generate_chunk_surface(
     // Sea level matters even where the ground is far below it — ocean columns must still
     // reach the water surface.
     ceiling = ceiling.max(super::aquifer::SEA_LEVEL + 1);
-    // `lowest` is already the minimum over the chunk, so `depth` below it is conservative.
-    let floor = (lowest - depth).max(MIN_Y);
+    let floor = if depth == i32::MAX {
+        MIN_Y
+    } else {
+        (lowest - depth).max(MIN_Y)
+    };
 
     let mut generated = generate_range(ow, surface, chunk_x, chunk_z, floor, ceiling, None);
     // If terrain actually reached the ceiling the margin was too small and the column was
@@ -446,6 +446,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn generating_to_bedrock_keeps_the_world_floor() {
+        let ow = Overworld::new(SEED);
+        let surface = SurfaceSystem::new(SEED);
+        let chunk = generate_chunk_surface(&ow, &surface, 0, 0, i32::MAX);
+        assert_eq!(chunk.get(0, MIN_Y, 0), Block::Bedrock);
+        // A shallow band would be air down here; that is the floating-slab artifact.
+        let solid_deep = (0..16).any(|x| {
+            !matches!(chunk.get(x, MIN_Y + 8, 0), Block::Air | Block::Water)
+        });
+        assert!(solid_deep, "bedrock-depth generation must fill the underground");
     }
 
     #[test]

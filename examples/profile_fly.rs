@@ -1,8 +1,10 @@
 //! Headless fly-forward generation profile.
 //!
 //! Holds a heading, requests chunks in the same distance-then-facing order the streamer
-//! uses, and times terrain / decorate / mesh separately. Designed to be recorded with
-//! samply so those stages show up as named frames:
+//! uses, and times terrain / decorate / mesh separately. Decoration follows the live
+//! engine: each coord's overlay is computed once (`decorate_one`) and assembling a column
+//! applies the 3×3 of overlays. Designed to be recorded with samply so those stages show
+//! up as named frames:
 //!
 //! ```text
 //! cargo build --profile profiling --example profile_fly
@@ -18,7 +20,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use voxel_engine::mc::chunk::{generate_chunk_timed, ChunkBlocks, ChunkGenTimings, HEIGHT, MIN_Y};
-use voxel_engine::mc::decorate::{decorate_centre, tree_kind_for_biome, NeighbourTerrain, TreeKind};
+use voxel_engine::mc::decorate::{
+    apply_overlay, decorate_one, tree_kind_for_biome, ChunkOverlay, NeighbourTerrain, TreeKind,
+};
 use voxel_engine::mc::overworld::Overworld;
 use voxel_engine::mc::surface::{Block, SurfaceSystem};
 use voxel_engine::mesh::mesh_chunk;
@@ -100,6 +104,7 @@ struct StageAcc {
     surface_ms: f64,
     terrain_misses: usize,
     decorate_ms: f64,
+    overlay_misses: usize,
     assemble_ms: f64,
     mesh_ms: f64,
     tree_blocks: usize,
@@ -114,6 +119,7 @@ impl StageAcc {
         self.surface_ms += sample.surface_ms;
         self.terrain_misses += sample.terrain_misses;
         self.decorate_ms += sample.decorate_ms;
+        self.overlay_misses += sample.overlay_misses;
         self.assemble_ms += sample.assemble_ms;
         self.mesh_ms += sample.mesh_ms;
         self.tree_blocks += sample.tree_blocks;
@@ -146,9 +152,10 @@ impl StageAcc {
             self.surface_ms / n
         );
         println!(
-            "  decorate (trees, 3×3)    : {:>7.2} ms/chunk   ({:.0} ms total)",
+            "  decorate (cached overlay): {:>7.2} ms/chunk   ({:.0} ms total, {:.2} overlays/chunk)",
             self.decorate_ms / n,
-            self.decorate_ms
+            self.decorate_ms,
+            self.overlay_misses as f64 / n
         );
         println!(
             "  assemble column          : {:>7.2} ms/chunk",
@@ -178,6 +185,7 @@ struct ChunkSample {
     surface_ms: f64,
     terrain_misses: usize,
     decorate_ms: f64,
+    overlay_misses: usize,
     assemble_ms: f64,
     mesh_ms: f64,
     tree_blocks: usize,
@@ -189,7 +197,17 @@ struct FlyWorld {
     ow: Overworld,
     surface: SurfaceSystem,
     terrain: HashMap<(i32, i32), Arc<ChunkBlocks>>,
+    overlays: HashMap<(i32, i32), Arc<ChunkOverlay>>,
     world: World,
+}
+
+struct StageSink<'a> {
+    density_ms: &'a mut f64,
+    surface_ms: &'a mut f64,
+    terrain_ms: &'a mut f64,
+    terrain_misses: &'a mut usize,
+    decorate_ms: &'a mut f64,
+    overlay_misses: &'a mut usize,
 }
 
 impl FlyWorld {
@@ -199,40 +217,38 @@ impl FlyWorld {
             ow,
             surface,
             terrain: HashMap::new(),
+            overlays: HashMap::new(),
             world: World::new(),
         }
     }
 
-    fn terrain_at(&mut self, coord: (i32, i32)) -> (Arc<ChunkBlocks>, Option<ChunkGenTimings>) {
+    fn terrain_at(&mut self, coord: (i32, i32), sink: &mut StageSink<'_>) -> Arc<ChunkBlocks> {
         if let Some(hit) = self.terrain.get(&coord) {
-            return (Arc::clone(hit), None);
+            return Arc::clone(hit);
         }
+        let t = Instant::now();
         let (blocks, timings) = stage_terrain(&self.ow, &self.surface, coord.0, coord.1);
+        *sink.terrain_ms += t.elapsed().as_secs_f64() * 1000.0;
+        *sink.density_ms += timings.density_aquifer_ms;
+        *sink.surface_ms += timings.surface_ms;
+        *sink.terrain_misses += 1;
         let blocks = Arc::new(blocks);
         self.terrain.insert(coord, Arc::clone(&blocks));
-        (blocks, Some(timings))
+        blocks
     }
 
-    fn generate(&mut self, coord: (i32, i32)) -> ChunkSample {
-        let mut density_ms = 0.0;
-        let mut surface_ms = 0.0;
-        let mut terrain_misses = 0usize;
+    fn overlay_at(&mut self, coord: (i32, i32), sink: &mut StageSink<'_>) -> Arc<ChunkOverlay> {
+        if let Some(hit) = self.overlays.get(&coord) {
+            return Arc::clone(hit);
+        }
         let mut held = Vec::with_capacity(9);
-        let t_terrain = Instant::now();
         for dz in -1..=1 {
             for dx in -1..=1 {
                 let ncoord = (coord.0 + dx, coord.1 + dz);
-                let (blocks, timings) = self.terrain_at(ncoord);
-                if let Some(t) = timings {
-                    density_ms += t.density_aquifer_ms;
-                    surface_ms += t.surface_ms;
-                    terrain_misses += 1;
-                }
+                let blocks = self.terrain_at(ncoord, sink);
                 held.push((ncoord, blocks));
             }
         }
-        let terrain_ms = t_terrain.elapsed().as_secs_f64() * 1000.0;
-
         let neighbours: Vec<NeighbourTerrain<'_>> = held
             .iter()
             .map(|((nx, nz), blocks)| NeighbourTerrain {
@@ -241,7 +257,39 @@ impl FlyWorld {
                 blocks: blocks.as_ref(),
             })
             .collect();
-        let (decorated, decorate_ms) = stage_decorate(self.seed, coord.0, coord.1, &neighbours);
+        let (overlay, ms) = stage_decorate_one(self.seed, coord.0, coord.1, &neighbours);
+        *sink.decorate_ms += ms;
+        *sink.overlay_misses += 1;
+        let overlay = Arc::new(overlay);
+        self.overlays.insert(coord, Arc::clone(&overlay));
+        overlay
+    }
+
+    fn generate(&mut self, coord: (i32, i32)) -> ChunkSample {
+        let mut density_ms = 0.0;
+        let mut surface_ms = 0.0;
+        let mut terrain_ms = 0.0;
+        let mut terrain_misses = 0usize;
+        let mut decorate_ms = 0.0;
+        let mut overlay_misses = 0usize;
+        let mut sink = StageSink {
+            density_ms: &mut density_ms,
+            surface_ms: &mut surface_ms,
+            terrain_ms: &mut terrain_ms,
+            terrain_misses: &mut terrain_misses,
+            decorate_ms: &mut decorate_ms,
+            overlay_misses: &mut overlay_misses,
+        };
+
+        let centre = self.terrain_at(coord, &mut sink);
+        let mut decorated = centre.blocks.clone();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let overlay = self.overlay_at((coord.0 + dx, coord.1 + dz), &mut sink);
+                apply_overlay(&mut decorated, coord.0, coord.1, overlay.as_ref());
+            }
+        }
+        drop(sink);
 
         let mut tree_blocks = 0usize;
         let mut log_blocks = 0usize;
@@ -254,12 +302,6 @@ impl FlyWorld {
             }
         }
 
-        let centre = held
-            .iter()
-            .find(|(c, _)| *c == coord)
-            .expect("centre of 3×3")
-            .1
-            .clone();
         let t_assemble = Instant::now();
         let chunk = assemble_chunk(coord, &decorated, &centre.surface_biomes);
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
@@ -273,6 +315,7 @@ impl FlyWorld {
             surface_ms,
             terrain_misses,
             decorate_ms,
+            overlay_misses,
             assemble_ms,
             mesh_ms,
             tree_blocks,
@@ -305,14 +348,14 @@ fn stage_terrain(
 }
 
 #[inline(never)]
-fn stage_decorate(
+fn stage_decorate_one(
     seed: i64,
     cx: i32,
     cz: i32,
     neighbours: &[NeighbourTerrain<'_>],
-) -> (Vec<Block>, f64) {
+) -> (ChunkOverlay, f64) {
     let t = Instant::now();
-    let out = decorate_centre(seed, cx, cz, neighbours);
+    let out = decorate_one(seed, cx, cz, neighbours);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     (std::hint::black_box(out), ms)
 }

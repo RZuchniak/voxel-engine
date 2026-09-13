@@ -45,22 +45,35 @@ fn with_source<R>(f: impl FnOnce(&dyn WorldSource) -> R) -> Result<R, String> {
     Ok(f(engine.source.as_ref()))
 }
 
-fn load_chunk(cx: i32, cz: i32) -> Result<ChunkWire, String> {
+fn load_chunk(cx: i32, cz: i32) -> Result<(ChunkWire, Vec<SectionMeshWire>), String> {
     with_source(|source| {
         let coord = (cx, cz);
         let chunk = match source.load_chunk(coord) {
             Ok(chunk) => chunk,
             Err(err) => {
                 eprintln!("worker chunk load failed at ({cx},{cz}): {err:#}");
-                return ChunkWire {
-                    cx,
-                    cz,
-                    sections: Vec::new(),
-                    biomes: None,
-                };
+                return (
+                    ChunkWire {
+                        cx,
+                        cz,
+                        sections: Vec::new(),
+                        biomes: None,
+                    },
+                    Vec::new(),
+                );
             }
         };
-        ChunkWire::from_chunk(&chunk)
+        let wire = ChunkWire::from_chunk(&chunk);
+        // Mesh here so the chunk is drawable on the same round-trip. Neighbours are omitted
+        // on purpose: loading them would steal 5×5 terrain gens from other workers' tiles.
+        // Border faces get an extra wall until the main-thread neighbor remesh lands.
+        let mut world = World::new();
+        world.insert_chunk(chunk);
+        let section_meshes = mesh_chunk(&world, coord)
+            .into_iter()
+            .map(|(section_index, mesh)| SectionMeshWire::from_mesh(section_index, &mesh))
+            .collect();
+        (wire, section_meshes)
     })
 }
 
@@ -86,10 +99,10 @@ fn remesh_chunk(cx: i32, cz: i32) -> Result<Vec<SectionMeshWire>, String> {
 pub fn handle_job(job: WorkerJob) -> WorkerReply {
     match job {
         WorkerJob::LoadChunk { id, cx, cz } => match load_chunk(cx, cz) {
-            Ok(chunk) => WorkerReply::LoadChunk {
+            Ok((chunk, section_meshes)) => WorkerReply::LoadChunk {
                 id,
                 chunk,
-                section_meshes: Vec::new(),
+                section_meshes,
             },
             Err(message) => WorkerReply::Error { id, message },
         },
